@@ -20,6 +20,18 @@ valid only for the resolved main-model config; a config change re-derives it.
 Run:
   python bench/decision_layer_probe.py            # precondition check only (no token spend)
   python bench/decision_layer_probe.py --run N=8  # fire N live decision probes, report rate
+
+Re-run after a model/config change (option ③, advisory — 不 block build):
+  LIVE_ENDPOINT_MODEL=<new-model-name> && .venv/Scripts/python.exe bench/decision_layer_probe.py --run 8
+  (resolve 链: LIVE_ENDPOINT_* → OPENAI_* → RuntimeError; 占位模型名拒出数; 网关不可达 → REFUSED 不产出。)
+
+Stamp contract — bench/.last_75_stamp (单行 JSON, 与出数同 commit, 显式 git add):
+  {"head": "<7位短id>", "model": "<真模型名>", "n": <N>, "pass": <k>}
+  双锚 = head + model (75% 是 model-scoped 静态门, 换档双锚都变、整发重跑)。
+Preflight 断言三态 (③ 只读, advisory, 失配动作 = WARN + 打上面重跑命令, 绝不 block):
+  ① 双锚匹配            → PASS (可引用该 75%)
+  ② head 或 model 失配  → WARN + 拒引用 (旧数对新代码/新模型档无效, 打重跑命令)
+  ③ 文件缺失/不可读     → WARN "本 checkout 无 75% 出数记录, 引用前先跑探针" (不是 vacuous pass)
 """
 from __future__ import annotations
 import os, re, sys, subprocess, tempfile
