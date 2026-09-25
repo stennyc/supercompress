@@ -31,6 +31,20 @@ if ROOT not in sys.path:
 LIVE_ANCHOR = "ebdd2ed"          # commit that lands live_endpoint.py + resolve tests
 TOPIC, MV = "bench", "m1"
 PLACEHOLDER_MODELS = ("", "main", None)
+# the specific fact the question asks about. For a decision-layer probe to be
+# meaningful it must be GENUINELY HIDDEN from the model's view after eviction;
+# if the head-80 digest still shows it, the arm is INVALID (fact not actually
+# evicted from the view) and 75% is refused — no forced number.
+TARGET_FACT = "10.0.0.5:8080"
+
+
+def _view(window, target_id=None) -> str:
+    """EXACT view fed to the model = per-seg tier + excerpt capped at the digest
+    (head-80 in the reference impl). A digest_only segment shows its DIGEST HEAD,
+    never its full original text — that gap is the whole point of the probe.
+    Build in ONE place so the 'hidden' check and the model-view cannot drift
+    apart (drift = fabricated 75%)."""
+    return "\n".join(f"- [{ws.segment.tier}] {ws.excerpt()[:80]}" for ws in window.segs)
 
 
 def _head() -> str:
@@ -73,6 +87,13 @@ def preconditions():
 
 # ── reach evicted state by driving the REAL Distiller (non-trivial prerequisite) ──
 def build_evicted(tmp, ep):
+    """Reach evicted state via the REAL Distiller, with the target fact GENUINELY hidden.
+
+    The reference impl's digest is `original_text[:80]` (a head excerpt), so to make the
+    fact truly evicted-from-view we put it at the TAIL of a >80-char source. Then:
+      - digest (head 80) does NOT contain TARGET_FACT  -> model must RECALL to get it
+      - full source (in jsonl, retrievable) DOES contain it -> 0-loss holds
+    """
     from sc.schema import Segment
     from sc.store import JsonlStore
     from sc.distill import Window, WindowSeg, Distiller
@@ -83,11 +104,18 @@ def build_evicted(tmp, ep):
     user = store.append(Segment(tier="P0", provenance="user",
         original_text="user: ship v1 and keep /srv/a1", session_topic=TOPIC,
         model_version=MV, structural_p0=True))
+    # long source; fact buried past the 80-char digest head, as the LITERAL "10.0.0.5:8080"
+    long_src = ("decision log: the auth service configuration was reviewed in detail "
+                "and after the incident postmortem the team decided that the binding "
+                + TARGET_FACT + " is authoritative and must be kept in the runbook "
+                "for the whole quarter before any further deployment changes.")
     target = store.append(Segment(tier="P0", provenance="model",
-        original_text="decision: auth service binds port 8080 to 10.0.0.5",
-        session_topic=TOPIC, model_version=MV, structural_p0=False))
+        original_text=long_src, session_topic=TOPIC, model_version=MV, structural_p0=False))
     aux.ensure_digest(target)
     assert target.digest_ready, "non-trivial prereq: target P0 digest must be ready"
+    # HIDDEN INVARIANT: the digest head the model sees must NOT reveal the fact
+    assert TARGET_FACT not in (target.digest_text or ""), \
+        f"arm INVALID: digest head still shows {TARGET_FACT!r} — fact not actually hidden"
     p1s = [store.append(Segment(tier="P1", provenance="model",
         original_text=f"ctx block {i} reasoning about module {i}",
         session_topic=TOPIC, model_version=MV)) for i in range(3)]
@@ -105,7 +133,7 @@ def build_evicted(tmp, ep):
 def decision_probe(ep, store, window, question, target):
     """One decision-layer instance. Returns (decided_to_recall, recovered_fact, raw)."""
     from sc.recall import Recaller
-    view = "\n".join(f"- [{ws.segment.tier}] {ws.excerpt()[:80]}" for ws in window.segs)
+    view = _view(window)   # digest heads for all segs incl. target; full text only via recall
     prompt = (
         "You are an agent with a memory_recall(query) tool that retrieves facts "
         f"evicted from your window. Question: {question}\n"
@@ -136,8 +164,14 @@ def main(argv):
               "is a fabricated number. CORRECT refusal.")
         return
 
-    m = next((re.match(r"--run\s+(\d+)", a) for a in argv if a.startswith("--run")), None)
-    n = int(m.group(1)) if m else 0
+    # accept both "--run 8" (two tokens) and "--run8" (one token)
+    n = 0
+    for i, a in enumerate(argv):
+        m1 = re.match(r"^--run(\d+)$", a)
+        if m1:
+            n = int(m1.group(1)); break
+        if a == "--run" and i + 1 < len(argv):
+            n = int(argv[i + 1]); break
     if n <= 0:
         print(f"preconditions OK: anchor={pre['anchor'][:8]} model={pre['model']}")
         print(f"  live endpoint resolved -> {pre['endpoint'].base_url} ({pre['model']})")
@@ -147,6 +181,14 @@ def main(argv):
     # full run: N decision probes, commit-anchored, model-specific
     store, window, target, aux, valid = build_evicted(tmp, pre["endpoint"])
     ep = pre["endpoint"]
+    # hard invariant: the fact must be GENUINELY hidden from the model's view, else
+    # the whole 75% is measuring 'model reads what's in front of it', not recall.
+    view = _view(window)
+    if TARGET_FACT in view:
+        print(f"  arm INVALID: target fact {TARGET_FACT!r} still visible in the "
+              f"digest-head view (reference digest = original_text[:80]). "
+              f"Fact not actually evicted — 75% NOT counted, refusing to force a number.")
+        return
     if not valid:
         print("  evicted-arm INVALID this run — 75% NOT counted (arm-validity gate).")
         return
