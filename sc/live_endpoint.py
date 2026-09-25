@@ -10,9 +10,10 @@
 skip + 下事件自愈链原样复用，零新故障面）。
 
 解析顺序（显式、可复现，不猜）：
-1. `LIVE_ENDPOINT_URL` + `LIVE_ENDPOINT_KEY`（+ 可选 `LIVE_ENDPOINT_MODEL`）——部署侧
-   把 Hermes 现路由填进来即可（本机 = Sub2API 的 /v1 + x-api-key）；
-2. OpenAI 兼容默认：`OPENAI_BASE_URL` + `OPENAI_API_KEY`；
+1. `LIVE_ENDPOINT_URL` + `LIVE_ENDPOINT_KEY` + `LIVE_ENDPOINT_MODEL`（必填真实模型名，
+   占位 "main" 拒出数——@reviewer 口径②）——部署侧把 Hermes 现路由填进来即可
+   （本机 = Sub2API 的 /v1 + x-api-key + agnes 模型名）；
+2. OpenAI 兼容默认：`OPENAI_BASE_URL` + `OPENAI_API_KEY` + `OPENAI_MODEL`（同上必填）；
 3. 都没有 → RuntimeError（显式失败：活端点缺失 = 决策层 75% 不可出数，不静默落回
    FakeEndpoint——对替身出 75% 是循环论证，@researcher 纪律）。
 
