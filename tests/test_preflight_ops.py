@@ -12,10 +12,15 @@
 
 跑法（repo 根，用 repo 自带 .venv）：
   .venv\\Scripts\\python.exe -m pytest tests/ -v
-KPI #3 决策层 75% 在 @researcher 车道、需活主模型端点，不在本 preflight 范围。
+KPI #3 决策层 75% 的出数在 @researcher 车道（需活主模型端点）。本 preflight 收 ③ 的
+advisory 半边：只读 stamp 三态检查（bench/.last_75_stamp 双锚 head+model）——
+  双锚匹配 → PASS / 任一失配 → WARN + 打重跑命令 / 文件缺失或坏 JSON → WARN 无记录
+纯 advisory：永不 block build、无常驻，只在「引用 75% 那一刻」提醒 stamp 对不上。
 """
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -185,3 +190,80 @@ def test_commit_anchor_recorded():
                          capture_output=True, text=True)
     assert out.returncode == 0 and len(out.stdout.strip()) == 40, "repo HEAD 缺失"
     print(f"[preflight] gate⑤ ops 半跑于 commit {out.stdout.strip()}")
+
+
+# ── ③ advisory 半边：stamp 三态检查（只读、不 block、无常驻）──
+# 双锚 = head + model。三态：
+#   PASS          双锚全匹配
+#   WARN          head 或 model 任一失配（75% 数锚在旧 head / 旧 model，需重跑）
+#   WARN-no-record 文件缺失或坏 JSON（vacuous pass 的同款病，绝不当静默通过）
+def _stamp_state(stamp_text, *, current_head, current_model):
+    """纯分类：给定 stamp 原始文本 + 当前 head/model，返回三态之一。"""
+    if stamp_text is None:
+        return "WARN-no-record"
+    try:
+        rec = json.loads(stamp_text)
+        assert set(("head", "model")) <= set(rec), "stamp 缺 head/model 双锚字段"
+    except (ValueError, AssertionError):
+        return "WARN-no-record"
+    if rec["head"] == current_head and rec["model"] == current_model:
+        return "PASS"
+    return "WARN"
+
+
+def check_stamp_advisory(stamp_path=None, *, live_env=True):
+    """advisory wrapper：读仓内 stamp，取当前 head/model，打印三态 + 失配时打重跑命令。
+    纯只读、永不 raise（advisory 不 block build）。"""
+    p = Path(stamp_path) if stamp_path else ROOT / "bench" / ".last_75_stamp"
+    text = p.read_text(encoding="utf-8") if p.exists() else None
+    if live_env:
+        head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        model = os.environ.get("LIVE_ENDPOINT_MODEL") or os.environ.get("OPENAI_MODEL", "")
+    else:
+        head, model = "", ""
+    state = _stamp_state(text, current_head=head, current_model=model)
+    if state == "PASS":
+        print(f"[preflight-③] PASS stamp 双锚匹配 head={head[:7]} model={model!r} → 75% 数可用")
+    elif state == "WARN-no-record":
+        print(f"[preflight-③] WARN 无记录: {p.name} 缺失/不可解析, 引用 75% 前先跑探针")
+    else:  # WARN（head 或 model 任一失配）
+        print(f"[preflight-③] WARN stamp 双锚失配 (head/model 至少一个 ≠ 当前), 75% 数可能过期。重跑: "
+              f"LIVE_ENDPOINT_MODEL={model or '<新模型名>'} && .venv/Scripts/python.exe bench/decision_layer_probe.py --run 8")
+    return state
+
+
+def test_stamp_state_tristate():
+    # 纯分类的三态各给确定输入，不依赖活端点、不被 commit 推进搞挂
+    assert _stamp_state(None, current_head="h", current_model="m") == "WARN-no-record"
+    assert _stamp_state("{not json", current_head="h", current_model="m") == "WARN-no-record"
+    assert _stamp_state('{"head":"h"}', current_head="h", current_model="m") == "WARN-no-record"  # 缺 model
+    assert _stamp_state('{"head":"h","model":"m"}', current_head="h", current_model="m") == "PASS"
+    # 任一锚失配即 WARN（@reviewer 的 🔴：只查 model 会放过旧 head）
+    assert _stamp_state('{"head":"OLD","model":"m"}', current_head="h", current_model="m") == "WARN"
+    assert _stamp_state('{"head":"h","model":"M2"}', current_head="h", current_model="m") == "WARN"
+
+
+def test_stamp_match_is_self_consistent():
+    """PASS 分支：把 stamp.head 指到当前 HEAD、model 指到当前 env → 必须 PASS（自洽）。"""
+    cur_head = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+    stamp = json.dumps({"head": cur_head, "model": "agnes-3.0-flash", "n": 8, "pass": 6})
+    assert _stamp_state(stamp, current_head=cur_head, current_model="agnes-3.0-flash") == "PASS"
+
+
+def test_stamp_missing_is_not_vacuous(tmp_path):
+    """文件缺失 = WARN-no-record，绝不允许『读不到 = 静默通过』（@data-engineer 的三态纪律）。"""
+    missing = tmp_path / "nope.jsonl"
+    assert _stamp_state(missing.read_text(encoding="utf-8") if missing.exists() else None,
+                        current_head="h", current_model="m") == "WARN-no-record"
+    # advisory wrapper 对缺失路径也只读、不 raise
+    assert check_stamp_advisory(stamp_path=str(missing), live_env=False) == "WARN-no-record"
+
+
+def test_inrepo_stamp_advisory_does_not_block():
+    """仓内真实 stamp 的 wrapper 调用：无论它落在哪个三态，都必须干净返回（advisory 不 block build）。
+    首跑预期 = WARN（stamp.head=7940f29 ≠ 现 HEAD，doc-only commit 推进了 head）——这是 ③ 正常工作，
+    不是断言写挂（@reviewer 时序判读）；此测试只证『不 raise、返回一个合法三态』。"""
+    state = check_stamp_advisory(live_env=True)
+    assert state in ("PASS", "WARN", "WARN-no-record"), f"非三态返回值: {state!r}"
