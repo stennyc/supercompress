@@ -219,6 +219,16 @@ def main(argv):
     print(f"  GATE 75%: {'PASS' if rate >= 0.75 else 'NOT MET'} @ evicted, self-consistency precondition holds "
           f"(probe+digest share one LiveEndpoint).")
 
+    # ③: persist the model-specific stamp (HEAD + model double-anchored, same chain as the number).
+    # ONLY reachable on a VALID full run — REFUSED / arm-invalid paths return before this,
+    # so a stamp can never be written for a number that was never actually produced.
+    import json
+    stamp_path = os.path.join(ROOT, "bench", ".last_75_stamp")
+    with open(stamp_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"head": pre["anchor"], "model": pre["model"],
+                            "n": n, "pass": recovered}) + "\n")
+    print(f"  stamp written -> bench/.last_75_stamp (head={pre['anchor'][:8]}, model={pre['model']})")
+
 
 if __name__ == "__main__":
     main(sys.argv[1:])
