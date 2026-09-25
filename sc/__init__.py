@@ -18,6 +18,7 @@ from .store import JsonlStore, StoreError
 from .budgets import usable_tokens, pull_budget, push_cap
 from .aux_provider import AuxProvider, marker_enabled
 from .distill import Window, WindowSeg, Distiller, DistillResult, Anchor
+from .live_endpoint import LiveEndpoint, resolve_live_endpoint
 
 __all__ = [
     "Segment", "nfc_hash", "est_tokens",
@@ -25,4 +26,5 @@ __all__ = [
     "usable_tokens", "pull_budget", "push_cap",
     "AuxProvider", "marker_enabled",
     "Window", "WindowSeg", "Distiller", "DistillResult", "Anchor",
+    "LiveEndpoint", "resolve_live_endpoint",
 ]
