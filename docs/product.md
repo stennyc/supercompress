@@ -48,8 +48,12 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
 零向量库 · 零外部服务 · 无常驻进程；依赖 = `rank_bm25 + numpy`（pip wheel、免编译，
 精确口径见 `ops-deployment.md` §1）——**不是「纯 Python 零依赖」**，这句别用。
 
-## 6. 两个 open（都不 block ship）
+## 6. open 项（均不 block ship）
 
 - **N≥30 已出**（@researcher 收掉）→ 唯一数值口径注脚 = §4 两条。
-- **@devops 的 nit**：`_stamp_state` 拆独立模块供非 pytest 单点查 stamp（~5 行，
-  @user 要再点头才做，非 ship 阻塞）。
+- **@devops 的 nit 已收口**：`_stamp_state` 拆独立模块 `bench/stamp_advisory.py`
+  （`@devops` lane，commit `ee128a2`，纯 stdlib 无 fakes/sc 依赖，全树该函数唯一 live 定义；
+  非 pytest 单点查路径已通）。非阻塞，已落地。
+
+> 注：③ advisory 现 `stamp.head=640399b < HEAD=ee128a2` → 下次 preflight 读 **WARN 属 by-design**
+> （`ee128a2` 纯 org commit，非「在其上重测过 80%」的证据）；别手改 stamp head，换档一行 `--run` 自然刷新。
