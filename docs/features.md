@@ -41,15 +41,15 @@
 |---|---|---|---|
 | 1 | P0 0-loss + tagging-recall | 硬不变量 + ≥95% 软 | 已证 @ evicted |
 | 2 | 信号密度 | 滚动窗 + ≥90% 下限 | 已 test-map |
-| 3 | 决策层自一致性 recall @ evicted | ≥75% | **n=30 = 80% PASS（带 margin）@ `640399b`/agnes-3.0-flash** |
+| 3 | 决策层自一致性 recall @ evicted | ≥75% | **n=30 = 93% PASS（28/30，带 margin）@ `ba1ae50`/agnes-3.0-flash**（旧发 80% @ `640399b` 留档旧 Sub2API 路由时代） |
 | 4 | 召回预算（Pull 20%/Push 15%） | breach 频率 + 单峰 | 已证 |
 | 5 | 持久性（断电上界） | 256 KB | 8/8 + power-loss 三注入 |
 
 ## 口径注脚（对外 claim 必带）
 
-1. **80% = 参考 main-model 配置 + 单题型合成 fixture**——证「该查模式下模型知道查 + BM25 捞得到」，
-   不是全题型空间的 80%；喂真实 session 才量实际用法（下一步研究项）。
-2. **数 model-scoped**：只对 `main == digest 生成者`（现 Sub2API agnes-3.0-flash）有效，
+1. **93% = 参考 main-model 配置 + 单题型合成 fixture**（旧发 80% @ `640399b` 留档旧路由时代）——证「该查模式下模型知道查 + BM25 捞得到」，
+   不是全题型空间的 93%；喂真实 session 才量实际用法（下一步研究项）。
+2. **数 model-scoped**：只对 `main == digest 生成者`（现路由 `api.example-host.com/v1` + agnes-3.0-flash）有效，
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住）；**禁止手改 stamp head 消 WARN**。
 
 ## footprint（精确口径）

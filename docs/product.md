@@ -2,7 +2,7 @@
 
 > 装配页 `docs/features.md` 的源段之一。实现面见 `docs/implementation.md`，
 > 部署面见 `docs/ops-deployment.md`，设计依据见 `docs/design-rationale.md`。
-> 本文只讲「它是什么、承诺什么、KPI 怎么量、对外话术红线」。锚定 @ `0dde91b`。
+> 本文只讲「它是什么、承诺什么、KPI 怎么量、对外话术红线」。最后一次全量验证 @ `ba1ae50`（docs-only 同步至 93% 数据点）。
 
 ## 1. 一句话定位（产品层）
 
@@ -30,17 +30,17 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
 |---|---|---|---|
 | 1 | P0 0-loss + P0 tagging-recall | 硬不变量 + ≥95%（软） | 已证 @ evicted 态 |
 | 2 | 信号密度（事实数/1K + 锚点命中率） | 滚动窗 + 绝对下限 ≥90% | 已 test-map |
-| 3 | 决策层自一致性 recall @ evicted | ≥75% | **n=30 = 80% PASS（带 margin）@ `640399b` / agnes-3.0-flash** |
+| 3 | 决策层自一致性 recall @ evicted | ≥75% | **n=30 = 93% PASS（28/30，带 margin）@ `ba1ae50` / agnes-3.0-flash**（旧发 80% @ `640399b` 留档旧路由时代） |
 | 4 | 召回预算（Pull 20% / Push 15%，P0 豁免记 breach） | breach 频率 + 单峰 | 已证（recall@3 顶回 evicted P0 + breach 日志正确） |
 | 5 | 持久性（进程≈0 / 断电≤256KB+in-flight） | 上界 256 KB（默认可配）+ ms fsync 窗口 | 8/8 @ HEAD + power-loss 三注入点 |
 
 ## 4. 两条对外注脚（签字，@researcher 口径我认）
 
-1. **80% 是「参考 main-model 配置 + 单题型合成 fixture」的数**——它证的是
-   「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 80%**。
+1. **93% 是「参考 main-model 配置 + 单题型合成 fixture」的数**（旧发 80% @ `640399b` 留档旧 Sub2API 路由时代）——它证的是
+   「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 93%**。
    喂真实长 dev session 才量实际用法（下一步研究项，见 `design-rationale.md` §4）。
    对外 claim 必须带「参考配置 + 单题型」定语。
-2. **数 model-scoped**：只对 `main == digest 生成者`（现 Sub2API agnes-3.0-flash 这档）有效。
+2. **数 model-scoped**：只对 `main == digest 生成者`（现路由 `api.example-host.com/v1` + agnes-3.0-flash 这档）有效。
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住，过期数引用时可见、不静默失效）。
 
 ## 5. footprint（产品可说的版本）
@@ -55,5 +55,5 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
   （`@devops` lane，commit `ee128a2`，纯 stdlib 无 fakes/sc 依赖，全树该函数唯一 live 定义；
   非 pytest 单点查路径已通）。非阻塞，已落地。
 
-> 注：③ advisory 现 `stamp.head=640399b < HEAD=ee128a2` → 下次 preflight 读 **WARN 属 by-design**
-> （`ee128a2` 纯 org commit，非「在其上重测过 80%」的证据）；别手改 stamp head，换档一行 `--run` 自然刷新。
+> 注：③ advisory 现 `stamp.head=ba1ae50 < HEAD`（fresh 93% 出数后的 docs-only commit）→ 下次 preflight 读
+> **WARN 属 by-design**；别手改 stamp head，换档/换路由一行 `--run` 自然刷新。
