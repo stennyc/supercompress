@@ -3,7 +3,7 @@
 > 装配页 `docs/features.md` 的源段之一。实现面见 `docs/implementation.md`，
 > 部署面见 `docs/ops-deployment.md`，KPI/用户文案见产品节。本文只讲
 > 「每个关键决定为什么成立」+「哪些数是实测的、口径边界在哪」。
-> 全部锚定 @ `76810d3`（可 ship 码态）；文献为设计期输入，非运行依赖。
+> 全部锚定 @ `bb1f41f`（可 ship 码态，中位数 follow-up 已出）；文献为设计期输入，非运行依赖。
 
 ## 1. 关键决定与依据（不是拍脑袋）
 
@@ -24,15 +24,16 @@
   成功 `--run` 尾部自动写 `bench/.last_75_stamp`（双锚 head+model，与数同 commit/链），
   未产出数的路径永不写 stamp。
 - `bench/recall_bench.py` — 检索层 recall@3 evicted 臂。
-- `bench/.last_75_stamp` — 现值 `{"head":"119374a","model":"agnes-3.0-flash","n":30,"pass":26}`（fresh 87% 出数后自动写入，随数同 commit；历史数 93% @ `ba1ae50`、80% @ `640399b` 以 commit 锚留档，非删改）。
+- `bench/.last_75_stamp` — 现值 `{"head":"9dead01","model":"agnes-3.0-flash","n":30,"pass":24}`（`bb1f41f` 中位数 follow-up 的**最后一发 RUN3** 自动写入，随数同 commit）。**注意：磁盘 stamp = 最后一发（RUN3 的 80%，pass:24），不是中位数 93%**——中位数只在 commit message + 本 §3，防后人拿 stamp 当现行数误判。历史单发 93%@`ba1ae50` / 87%@`119374a` / 80%@`640399b` 以 commit 锚留档，非删改。
 
 ## 3. 实测数与口径边界（对外 claim 必须带定语）
 
 | 数 | 锚 | 口径边界（诚实注脚） |
 |---|---|---|
-| 决策层 n=30 = 87%（26/30 ≥ 75% gate，带 margin） | `119374a` / agnes-3.0-flash（key 放行后 https canonical） | **单一题型合成 fixture**：30 样本同问一个 IP:port 事实。它证「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 87%**。喂真实长 dev session 语料 = 下一步研究项。 |
-| 决策层 n=30 = 93%（28/30）｜留档 | `ba1ae50` / agnes-3.0-flash | 同模型三发抽样点之一（80/93/87），非「被 87% 推翻」——同数多次抽样、非稳定属性。 |
-| 决策层 n=30 = 80%（24/30）｜留档 | `640399b` / agnes-3.0-flash | 留档：Sub2API 旧路由（10.1.1.116:8080）时代的数。 |
+| **稳定数 = 3 发中位数 93%**（93/93/80，各 n=30）｜参考带中心，**非 CI 硬 claim** | `bb1f41f` @ `9dead01` / agnes-3.0-flash（https canonical） | 真扛审的稳定数仍是**单发 n≥50**（v1 follow-up、非门）；中位数 93% 只是把 3×n=30 的抽样带中心指出来，对外写「~80–93% band + 中位数 93%」，**不写「可复现的 93%」**。 |
+| 决策层 n=30 = 87%（26/30 ≥ 75% gate，带 margin）｜band 点 | `119374a` / agnes-3.0-flash（key 放行后 https canonical） | **单一题型合成 fixture**：30 样本同问一个 IP:port 事实。它证「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 87%**。 |
+| 决策层 n=30 = 93%（28/30）｜band 点 | `ba1ae50` / agnes-3.0-flash | 同模型多次抽样点之一（80/93/87/93），非「被别的发推翻」——同数多次抽样、非稳定属性。 |
+| 决策层 n=30 = 80%（24/30）｜band 点 | `640399b` / agnes-3.0-flash | 留档：Sub2API 旧路由（10.1.1.116:8080）时代的数。 |
 | 检索层 recall@3 / 断电半边 | 各 commit 锚 | 确定性量（非活模型随机量），重跑数不变。 |
 
 **model-scoped 注脚**：所有活模型出的数只对 `main == digest 生成者` 那档有效
@@ -44,4 +45,4 @@
 
 1. 多题型 / 真实 session 语料重测决策层（80% → 全题型空间的数）；
 2. semantic-gap 遥测数据攒到 >15% 时评估 v2 语义臂（届时才引 embedding，且默认关）；
-3. N≥30 已出；若换 main-model 档位，按 stamp 双锚重推而非外推。
+3. N≥30 已出、3 发中位数 follow-up 已出（`bb1f41f`，93/93/80 → 中位数 93%）；若换 main-model 档位，按 stamp 双锚重推而非外推。
