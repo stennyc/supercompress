@@ -49,6 +49,20 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 - `sc/store.py:1` docstring「filememory 式」= 设计措辞致敬（jsonl 单一事实源存储借用 file-memory 的 row/replay/materialize 习惯），**非活依赖**——全仓零共享 schema / 零 import / 零配置耦合，`filememory`（无连字符）源面恰此一处 + 2 个 `.pyc` 二进制副产（`sc/__pycache__/store.cpython-311/312.pyc`）。supercompress（会话内 P0/P1/P2 保真，热层）与 file-memory 插件（跨会话 L0/L1/L2 沉淀，冷层）为「热层丢给冷层」互补两层，不重叠、不合并。
 - `docs/supercompress-mechanism.html:43-44` grep 到的 2 条 `L0` 是 SVG marker 坐标（`M0,0 L0,6 L8,3`），**非 tier（L0/L1/L2）引用**；代码面 `grep \bL0\b|\bL1\b|\bL2\b` 在 `sc/`+`scdata.py` 零命中，supercompress 无 L 级概念。
 
+**TCM 退役删除门（切片③，@devops own，物理删 commit 的验收锚）：** file-memory 插件把 TCM 晋升管线（`TCMPromotionEngine`）退役、让位给 Gold 知识层时，物理删 commit 必须整条带走以下活消费者面，**漏一条 = 下个 240m cron tick 打半迁移树 → 500/脏写**：
+- **cron job `92ae706bd44e`**（`profiles/coder/cron/jobs.json`，no_agent、240m、`file-memory-consolidation` → wrapper `filememory_consolidation.py` → `run.py --incremental`）：活写消费者，写 `pending_upgrades.jsonl`。删除 commit 前**先 `hermes -p coder cron pause 92ae706bd44e`**（用 hermes CLI 改活 scheduler，**不手改 live `jobs.json`**——有 active `.jobs.lock` + ticker，手改竞态）；flag 周期证零调用后，物理删 commit 再 `hermes -p coder cron remove 92ae706bd44e` 整条带走。
+- **代码 5 模式 grep 门（删完全 0 命中，含 CamelCase）：** `TCMPromotionEngine`（`__init__.py:364` 类 + `:2448,2469,2474,2479` call form）｜`promotion_engine`（`:1223` 热循环 + `:2349` `_tool_check_promotion` 内）｜`check_promotion`（`:2156,:2183` 工具 def + dispatch）｜`promote_to_tcm`（`:105` L2 config knob，随引擎同 commit 删、不留 inert config）｜`user_requested_promotion`（`:387` 规则 + `:2144` review_drafts promote enum）。
+- **`consolidation/run.py:21` 的 `from __init__ import … TCMPromotionEngine` import + `:90` 实例化**（M6 巡检入口，cron 独立调用腿；`--full` 是读全 4 类 memory 逐条 evaluate 的独立宿主，删除腿一并带）。
+- **删除注记跟 commit 走（回滚锚）：** 插件 `plugins/file-memory/` 与 `profiles/` **都不是 git repo**——"删除即落盘、无回滚锚"。唯一可回滚仓是本 supercompress 仓，故 TCM 删除的根因（`pg_` 前缀 pending key 从未对齐 memory id 形制、`upgraded_from` 才是真 provenance 终点）+ 上面 5 模式 grep 门 + cron job 移除，全部写在本注记里，跟物理删 commit 同仓同 commit，删错时靠这条找锚。
+- **build 半（Gold 知识层）canonical 验收 recipe（@devops 双跑裁决，@coder 的 Hermes-venv 写跑不通）：**
+  ```
+  cd C:/Users/user/.hermes/plugins/file-memory
+  PYTHONPATH="C:/Users/user/AppData/Local/hermes/hermes-agent;C:/Users/user/.hermes/plugins/file-memory" \
+    /c/Users/user/supercompress/.venv/Scripts/python.exe -m pytest tests/test_gold_knowledge_red.py -v
+  ```
+  （双路 PYTHONPATH = hermes-agent 源目录供 `from agent.memory_provider import …` + 插件目录；解释器用真正带 pytest 的那个。全插件套件 26/26 同 recipe。）
+- **ops 前向脆弱性（登记不建）：** 上面 proof 的解释器 = 兄弟工程 `supercompress/.venv`，file-memory 插件自身无 venv；该 `.venv` 一旦被盘清删掉，flag 周期"零调用"证明就无解释器。触发条件 = 切片③ 证明卡在这缺解释器时，才起专用 env / 装 pytest 进插件自身 env，现不预建（无消费者不建）。
+
 ## 6. 未落项（如实标注，不进 ship 口径）
 
 - 归档/retention **路径与策略是部署约定，不是 prod 代码**——超压缩仓库本身不替你建 `~/.hermes/sessions/`，接入方（Hermes）落地时按 §2 约束实现。
