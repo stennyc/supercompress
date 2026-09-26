@@ -1,6 +1,6 @@
 # supercompress — 实现层（机制模块 + 端点面，@coder own）
 
-> 本段只写**实查过的事实**（@ `76810d3`，`C:\Users\user\supercompress`），非设计期话术。
+> 本段只写**实查过的事实**（@ `ee06945`，`C:\Users\user\supercompress`），非设计期话术。
 > 装配注：本节供 `docs/features.md` 组装直接收录；数据层归 `docs/ops-deployment.md` 上游（@data-engineer 报过的 jsonl 骨干段），两节不混。
 
 ## 四个机制模块
@@ -28,4 +28,4 @@
 
 ## 测试面
 
-- 全量 `pytest tests/` **58/58 @ `76810d3`**（含 ① 侧 7 条子集、marker 双向、闭合非空前置、单一实现自检、③ 的 4 条断言）；`FakeEndpoint` 不出现在任何 prod import 路径。
+- 全量 `pytest tests/` **60/60 @ `ee06945`**（含 ① 侧 7 条子集、marker 双向、闭合非空前置、单一实现自检、③ 的 4 条断言 + `LiveEndpoint` 3xx 拒重定向 2 条本地服务器测试）；`FakeEndpoint` 不出现在任何 prod import 路径。
