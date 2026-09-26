@@ -64,3 +64,72 @@ def test_resolve_missing_endpoint_raises_no_silent_fallback(monkeypatch):
         raise AssertionError("端点缺失必须显式失败，不静默落回 FakeEndpoint")
     except RuntimeError as e:
         assert "活主模型端点" in str(e)
+
+
+def _http_server(handler):
+    from http.server import ThreadingHTTPServer
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    import threading
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, srv.server_address[1]
+
+
+def test_call_refuses_redirect_not_silently_followed():
+    """@user GO + @reviewer 隔离的坑：`http://` 端点被 307 到 https 时，urllib 跟随重定向
+    （跨 scheme/host 丢 Bearer key）→ 静默 401。LiveEndpoint 遇**任何**重定向直接
+    RuntimeError 显式拒出——「静默丢 key」变「显式报错」，本地 307 服务器真跑复现。"""
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/v1/chat/completions":
+                self.send_response(307)
+                self.send_header("Location", f"http://127.0.0.1:{self.server.server_address[1]}/target")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                body = b'{"choices":[{"message":{"content":"X"}}]}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv, port = _http_server(H)
+    try:
+        ep = LiveEndpoint(f"http://127.0.0.1:{port}/v1", "k", "agnes-3.0-flash")
+        try:
+            ep.call("x", "y")
+            raise AssertionError("重定向必须显式拒出，不静默跟随（防静默丢 key）")
+        except RuntimeError as e:
+            assert "重定向" in str(e), "报错须点明是重定向"
+            assert "/target" in str(e), "报错须带重定向目的地，便于直接改 canonical URL"
+    finally:
+        srv.shutdown()
+
+
+def test_call_plain_200_still_works():
+    """重定向守卫不得误伤正常路径：无重定向的 200 直返照常出内容。"""
+    from http.server import BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = b'{"choices":[{"message":{"content":"ok-content"}}]}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv, port = _http_server(H)
+    try:
+        ep = LiveEndpoint(f"http://127.0.0.1:{port}/v1", "k", "agnes-3.0-flash")
+        assert ep.call("x", "y") == "ok-content"
+    finally:
+        srv.shutdown()

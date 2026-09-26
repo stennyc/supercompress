@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import urllib.error
 import urllib.request
 
 
@@ -49,8 +50,20 @@ class LiveEndpoint:
             url, data=body, method="POST",
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {self.api_key}"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            # 重定向（3xx）显式拒出，不静默跟随：跨 scheme/host 的重定向丢 Bearer key
+            # （`http://` 被 307 到 `https://` = 落地 401 的经典坑，@reviewer 隔离、@devops curl 复现）。
+            # 报错带目的地，让人直接改成 canonical https URL，而非对着 401 瞎猜。
+            if 300 <= e.code < 400:
+                loc = e.headers.get("Location", "?")
+                raise RuntimeError(
+                    f"LiveEndpoint: 端点重定向（HTTP {e.code} -> {loc}）——不跟随重定向"
+                    f"（跨 scheme/host 会静默丢 Bearer key → 401）。"
+                    f"把 base_url 直接指向 canonical URL（如 https://…/v1）。") from e
+            raise  # 4xx/5xx 原样向上抛（限流/鉴权/超时 → AuxProvider transient_fail 自愈链）
         return data["choices"][0]["message"]["content"]
 
 
