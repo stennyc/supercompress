@@ -49,7 +49,7 @@
 
 1. **93% = 参考 main-model 配置 + 单题型合成 fixture**（旧发 80% @ `640399b` 留档旧路由时代）——证「该查模式下模型知道查 + BM25 捞得到」，
    不是全题型空间的 93%；喂真实 session 才量实际用法（下一步研究项）。
-2. **数 model-scoped**：只对 `main == digest 生成者`（现路由 `api.example-host.com/v1` + agnes-3.0-flash）有效，
+2. **数 model-scoped**：只对 `main == digest 生成者`（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，路由随 Hermes provider 走、**不锚实例 IP**；当前实例 = `api.example-host.com/v1`）有效，
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住）；**禁止手改 stamp head 消 WARN**。
 
 ## footprint（精确口径）
