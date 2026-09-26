@@ -40,7 +40,7 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 | 全量套件 | `.venv\Scripts\python.exe -m pytest tests/` | 58/58 @ HEAD（42 实现 + 8 数据 ref + 8 ops/preflight，含 ③ 四条） |
 | gate⑤ 断电半边 | `tests/test_preflight_ops.py` power-loss 三注入 | 断电上界、零悬空锚点、marker 双向 |
 | ③ stamp advisory | 同文件 `check_stamp_advisory`（随 pytest 出三态） | 75% 数双锚（HEAD + model）失配即 WARN，不 block build |
-| 网关健康 | `curl /v1/models` 200 才放行决策层出数 | Sub2API 不可达 → 探针 REFUSED、不产数、不写 stamp |
+| 网关健康 | 团队真路由 `LIVE_ENDPOINT_URL`（现 = `api.example-host.com/v1`，随 Hermes provider 走，**勿写死某台实例 IP**）`/v1/models` 回 200 才放行决策层出数 | 网关不可达/陈旧路由 → 探针 REFUSED、不产数、不写 stamp；换路由 = 换 `LIVE_ENDPOINT_*` 三件套，非代码项 |
 | 换模型档位 | `LIVE_ENDPOINT_MODEL=<新模型名> && .venv\Scripts\python.exe bench/decision_layer_probe.py --run 30` | 一行重推，stamp 自动刷新（**别手改 stamp head 消 WARN**） |
 
 ## 6. 未落项（如实标注，不进 ship 口径）
