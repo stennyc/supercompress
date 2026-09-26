@@ -34,7 +34,7 @@ Preflight 断言三态 (③ 只读, advisory, 失配动作 = WARN + 打上面重
   ③ 文件缺失/不可读     → WARN "本 checkout 无 75% 出数记录, 引用前先跑探针" (不是 vacuous pass)
 """
 from __future__ import annotations
-import os, re, sys, subprocess, tempfile
+import os, re, sys, subprocess, tempfile, time, urllib.error
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -123,8 +123,21 @@ def build_evicted(tmp, ep):
                 "for the whole quarter before any further deployment changes.")
     target = store.append(Segment(tier="P0", provenance="model",
         original_text=long_src, session_topic=TOPIC, model_version=MV, structural_p0=False))
-    aux.ensure_digest(target)
-    assert target.digest_ready, "non-trivial prereq: target P0 digest must be ready"
+    # bounded transient-retry on digest generation (@reviewer's structural finding:
+    # Sub2API intermittently force-closes cold connections, so the FIRST ensure_digest
+    # in a fresh process can hit a reset; AuxProvider._generate swallows it (transient=True)
+    # and digest_ready stays False. Retry while transient; stop on success or hard fail.
+    for _attempt in range(3):
+        aux.ensure_digest(target)
+        if target.digest_ready:
+            break
+        if not aux.transient:
+            break                      # not transient -> retrying won't help
+        time.sleep(2.0)
+    if not target.digest_ready:
+        raise RuntimeError(
+            "digest 生成 3 次重试后仍未 ready（网关瞬态持续）——本发 abort、不写 stamp；"
+            "网关稳了重跑即可（REFUSED 正确行为，非故障）")
     # HIDDEN INVARIANT: the digest head the model sees must NOT reveal the fact
     assert TARGET_FACT not in (target.digest_text or ""), \
         f"arm INVALID: digest head still shows {TARGET_FACT!r} — fact not actually hidden"
@@ -142,6 +155,32 @@ def build_evicted(tmp, ep):
     return store, w, target, aux, valid
 
 
+def _call_retry(ep, task, prompt, tries=3, delay=2.0):
+    """Bounded retry for TRANSIENT gateway errors only (@reviewer's structural finding:
+    Sub2API intermittently force-closes cold connections -> ConnectionResetError/TimeoutError).
+
+    - HTTP 5xx / 429 -> transient, sleep + retry;
+    - HTTP 4xx (auth/param) -> FATAL, re-raise immediately (no retry, no silent 'miss');
+    - OSError family (ConnectionReset / Timeout / URLError) -> transient, sleep + retry;
+    - all retries exhausted -> raise last, caller aborts the run (stamp NOT written).
+    This is bench-face only: zero production impact (LiveEndpoint/aux_provider unchanged)."""
+    import urllib.error
+    last = None
+    for _ in range(tries):
+        try:
+            return ep.call(task, prompt)
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504):
+                last = e
+                time.sleep(delay)
+                continue
+            raise                     # 4xx = not transient, do not retry
+        except OSError as e:         # ConnectionReset / Timeout / URLError (transient)
+            last = e
+            time.sleep(delay)
+    raise last
+
+
 def decision_probe(ep, store, window, question, target):
     """One decision-layer instance. Returns (decided_to_recall, recovered_fact, raw)."""
     from sc.recall import Recaller
@@ -153,7 +192,7 @@ def decision_probe(ep, store, window, question, target):
         "If the answer is NOT in the visible context, reply exactly: RECALL <query>. "
         "If you can answer without recalling, reply exactly: ANSWER <answer>."
     )
-    raw = ep.call("decision_probe", prompt).strip()
+    raw = _call_retry(ep, "decision_probe", prompt).strip()
     decided = raw.upper().startswith("RECALL")
     recovered = False
     if decided:
@@ -191,7 +230,12 @@ def main(argv):
         return
 
     # full run: N decision probes, commit-anchored, model-specific
-    store, window, target, aux, valid = build_evicted(tmp, pre["endpoint"])
+    try:
+        store, window, target, aux, valid = build_evicted(tmp, pre["endpoint"])
+    except RuntimeError as e:
+        print(f"ABORTED — {e}")
+        print(f"  75% NOT emitted, stamp NOT written (no-fabrication discipline holds).")
+        return
     ep = pre["endpoint"]
     # hard invariant: the fact must be GENUINELY hidden from the model's view, else
     # the whole 75% is measuring 'model reads what's in front of it', not recall.
