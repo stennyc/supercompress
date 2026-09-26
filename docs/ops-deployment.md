@@ -43,6 +43,8 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 | 网关健康 | 团队真路由 `LIVE_ENDPOINT_URL`（**必须 https canonical**——`http://` 会被网关 307 到 https、urllib 跨 scheme 丢 Bearer key → 401；现 = `https://api.example-host.com/v1`，随 Hermes provider 走，**勿写死某台实例 IP**）`/v1/models` 回 200 才放行决策层出数 | 网关不可达/陈旧路由/误写 http:// → 探针 REFUSED、不产数、不写 stamp；换路由 = 换 `LIVE_ENDPOINT_*` 三件套（scheme 一并换对），非代码项 |
 | 换模型档位 | `LIVE_ENDPOINT_MODEL=<新模型名> && .venv\Scripts\python.exe bench/decision_layer_probe.py --run 30` | 一行重推，stamp 自动刷新（**别手改 stamp head 消 WARN**） |
 
+**端点面边界注（防误读）：** `sc/live_endpoint.py` 的 `resolve_live_endpoint()` 虽物理住在生产树 `sc/` 里、自己读 `LIVE_ENDPOINT_*`/`OPENAI_*`，但全仓 caller 只有 `bench/decision_layer_probe.py` + 其测试——**没有任何生产调用路径触达它**。prod 端点 = 调用方（Hermes）注入的构造参数（`AuxProvider(main_endpoint)`），零配置跟随默认模型。正确说法不是「`sc/` 里无端点 env 读取」（有），而是「生产路径从不读」——`LIVE_ENDPOINT_URL` 仅活在 bench 出数那一下 shell env，跑完即弃。
+
 ## 6. 未落项（如实标注，不进 ship 口径）
 
 - 归档/retention **路径与策略是部署约定，不是 prod 代码**——超压缩仓库本身不替你建 `~/.hermes/sessions/`，接入方（Hermes）落地时按 §2 约束实现。
