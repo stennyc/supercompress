@@ -2,7 +2,7 @@
 
 > 装配页 `docs/features.md` 的源段之一。实现面见 `docs/implementation.md`，
 > 部署面见 `docs/ops-deployment.md`，设计依据见 `docs/design-rationale.md`。
-> 本文只讲「它是什么、承诺什么、KPI 怎么量、对外话术红线」。最后一次全量验证 @ `119374a`（docs-only 同步至 87% 数据点；同模型三发 80/93/87）。
+> 本文只讲「它是什么、承诺什么、KPI 怎么量、对外话术红线」。最后数据点锚 `9dead01`（3 发 n=30，中位数 93%，@ `bb1f41f` 落仓；全量 60/60 绿）。
 
 ## 1. 一句话定位（产品层）
 
@@ -30,7 +30,7 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
 |---|---|---|---|
 | 1 | P0 0-loss + P0 tagging-recall | 硬不变量 + ≥95%（软） | 已证 @ evicted 态 |
 | 2 | 信号密度（事实数/1K + 锚点命中率） | 滚动窗 + 绝对下限 ≥90% | 已 test-map |
-| 3 | 决策层自一致性 recall @ evicted | ≥75% | **同模型三发抽样：87%（26/30）@ `119374a`、93%（28/30）@ `ba1ae50`、80%（24/30）@ `640399b`**，全 ≥75% gate PASS（单发参考点；对外写 **~80–93% band**，见 §4 注脚 1） |
+| 3 | 决策层自一致性 recall @ evicted | ≥75% | **稳定数 = 3 发中位数 93%（93/93/80，各 n=30 @ `9dead01`，@ `bb1f41f`，参考带中心非 CI 硬 claim）；全量 band 留档 80%@`640399b` / 93%@`ba1ae50` / 87%@`119374a` / 93%/93%/80%@`9dead01`**，全 ≥75% gate PASS（对外写 band + 中位数，不写单点，见 §4 注脚 1） |
 | 4 | 召回预算（Pull 20% / Push 15%，P0 豁免记 breach） | breach 频率 + 单峰 | 已证（recall@3 顶回 evicted P0 + breach 日志正确） |
 | 5 | 持久性（进程≈0 / 断电≤256KB+in-flight） | 上界 256 KB（默认可配）+ ms fsync 窗口 | 8/8 @ HEAD + power-loss 三注入点 |
 
@@ -40,10 +40,11 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
    「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的任何单点数**。
    喂真实长 dev session 才量实际用法（下一步研究项，见 `design-rationale.md` §4）。
    对外 claim 必须带「参考配置 + 单题型」定语。
-   **抽样 band 纪律（@researcher 观察）**：同模型三发独立抽样 80%（@ `640399b`，旧路由时代）/
-   93%（@ `ba1ae50`）/ 87%（@ `119374a`，key 放行后 https canonical），波动 13pp，
-   实证**单发数不是稳定属性、是参考点**——对外 claim 框成 **~80–93%（同模型多次抽样带）**，
-   不写任何单点；要扛审的稳定数 = 研究 follow-up（小多次抽样取中位数 / 单发 n≥50），非 v1 门。
+   **抽样 band 纪律（@researcher 观察）**：同模型多轮独立抽样 80%（@ `640399b`，旧路由时代）/
+   93%（@ `ba1ae50`）/ 87%（@ `119374a`）/ 93%,93%,80%（3 发 @ `9dead01`）波动 13pp，
+   实证**单发数不是稳定属性、是参考点**——**稳定数 = 3 发中位数 93%（参考带中心，非 CI 硬 claim）**，
+   对外 claim 框成 **~80–93% band + 中位数 93%**，不写「可复现的单点 93%」；
+   真扛审稳定数 = 单发 n≥50（v1 follow-up 研究项，非 v1 门）。
 2. **数 model-scoped**：只对 `main == digest 生成者`（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，
    路由随 Hermes provider 走、**不锚实例 IP**；当前实例 = `api.example-host.com/v1`，换路由 = 换 `LIVE_ENDPOINT_*` 三件套）有效。
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住，过期数引用时可见、不静默失效）。
@@ -55,10 +56,12 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
 
 ## 6. open 项（均不 block ship）
 
-- **N≥30 已出**（@researcher 收掉）→ 唯一数值口径注脚 = §4 两条。
+- **N≥30 已出 + 3 发中位数 follow-up 已出**（@researcher 收掉，`bb1f41f`）→ 唯一数值口径注脚 = §4 两条。
 - **@devops 的 nit 已收口**：`_stamp_state` 拆独立模块 `bench/stamp_advisory.py`
   （`@devops` lane，commit `ee128a2`，纯 stdlib 无 fakes/sc 依赖，全树该函数唯一 live 定义；
   非 pytest 单点查路径已通）。非阻塞，已落地。
 
-> 注：③ advisory 现 `stamp.head=119374a < HEAD`（fresh 87% 出数后的 docs-only commit）→ 下次 preflight 读
-> **WARN 属 by-design**；别手改 stamp head，换档/换路由一行 `--run` 自然刷新。
+> 注：③ advisory 现 `stamp.head=9dead01 < HEAD`（`bb1f41f` 之上的 docs-only commit）→ 下次 preflight 读
+> **WARN 属 by-design**。⚠️ **读 stamp 别误判现行数**：磁盘 stamp 记的是**最后一发成功 `--run`**（RUN3 = 80%，pass:24），
+> **不是 3 发中位数 93%**（中位数只在 `bb1f41f` commit message + 本文 §3/§4）——stamp = 最后一发落点、非稳定数，
+> 防误读那条纪律照旧：别手改 stamp head，换档/换路由一行 `--run` 自然刷新。
