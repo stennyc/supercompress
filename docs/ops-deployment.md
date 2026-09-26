@@ -45,6 +45,10 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 
 **端点面边界注（防误读）：** `sc/live_endpoint.py` 的 `resolve_live_endpoint()` 虽物理住在生产树 `sc/` 里、自己读 `LIVE_ENDPOINT_*`/`OPENAI_*`，但全仓 caller 只有 `bench/decision_layer_probe.py` + 其测试——**没有任何生产调用路径触达它**。prod 端点 = 调用方（Hermes）注入的构造参数（`AuxProvider(main_endpoint)`），零配置跟随默认模型。正确说法不是「`sc/` 里无端点 env 读取」（有），而是「生产路径从不读」——`LIVE_ENDPOINT_URL` 仅活在 bench 出数那一下 shell env，跑完即弃。
 
+**术语致敬注（防误读，file-memory 互补判定 ①②）：**
+- `sc/store.py:1` docstring「filememory 式」= 设计措辞致敬（jsonl 单一事实源存储借用 file-memory 的 row/replay/materialize 习惯），**非活依赖**——全仓零共享 schema / 零 import / 零配置耦合，`filememory`（无连字符）源面恰此一处 + 2 个 `.pyc` 二进制副产（`sc/__pycache__/store.cpython-311/312.pyc`）。supercompress（会话内 P0/P1/P2 保真，热层）与 file-memory 插件（跨会话 L0/L1/L2 沉淀，冷层）为「热层丢给冷层」互补两层，不重叠、不合并。
+- `docs/supercompress-mechanism.html:43-44` grep 到的 2 条 `L0` 是 SVG marker 坐标（`M0,0 L0,6 L8,3`），**非 tier（L0/L1/L2）引用**；代码面 `grep \bL0\b|\bL1\b|\bL2\b` 在 `sc/`+`scdata.py` 零命中，supercompress 无 L 级概念。
+
 ## 6. 未落项（如实标注，不进 ship 口径）
 
 - 归档/retention **路径与策略是部署约定，不是 prod 代码**——超压缩仓库本身不替你建 `~/.hermes/sessions/`，接入方（Hermes）落地时按 §2 约束实现。
