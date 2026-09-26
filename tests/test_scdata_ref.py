@@ -4,8 +4,9 @@ Covers the data-side slice of gate ⑤: single replay path, byte-stable material
 zero-dangling-anchors via verify_anchor_closure, and two-level idempotent keys.
 
 Hermetic：工件写进 per-run temp dir（不写 cwd、不留 t_*.jsonl 残骸）——
-同目录二次跑不再见旧行，8/8 结果对 commit 可复现（@reviewer 非 stale 纪律）。
+同目录二次跑不再见旧行，12/12 结果对 commit 可复现（@reviewer 非 stale 纪律）。
 """
+import hashlib
 import json
 import os
 import shutil
@@ -126,6 +127,93 @@ def test_digest_regen_key_idempotent():
     k3 = digest_regen_key(s, "m-2", "topic-pin")
     assert k1 == k2 != k3  # pure in (content, model_version, topic); version bump = intentional regen
     print("OK digest key: same triple idempotent; model_version bump regens; topic pinned at startup")
+
+
+# ---- feature-logic coverage (round-trip / model_version default / boundaries) ----
+
+def test_round_trip_content_hash_converges_across_equivalent_forms():
+    p = path("roundtrip")
+    nfd = "cafe\u0301"                                  # decomposed e + combining acute
+    nfc = unicodedata.normalize("NFC", nfd)             # composed form
+    emoji = "\U0001F3F3\uFE0F\u200D\u0001F308"          # flag + ZWJ sequence
+    cjk = "工作目录是 C:\\project"
+    texts = [nfd, nfc, emoji, cjk]
+    segs = [seg(i, t) for i, t in enumerate(texts)]
+    for s in segs:
+        append_line(p, s)
+    # equivalent Unicode forms converge on ONE dedup key
+    assert segs[0]["content_hash"] == segs[1]["content_hash"]
+    idx = replay(p)
+    assert len(idx) == 3, len(idx)                       # 4 lines, 1 dup skip
+    assert idx.dropped[-1][1] == "dup_skip_idempotent"
+    first = {}
+    for s in segs:
+        first.setdefault(s["content_hash"], s)
+    for h, s in first.items():
+        got = idx.lookup(h)
+        assert got is not None and got["original_text"] == s["original_text"]
+    # level-2 key inherits the convergence: NFD/NFD-identical text -> same regen triple
+    assert digest_regen_key(segs[0], "m-1", "t") == digest_regen_key(segs[1], "m-1", "t")
+    # materialize -> replay: byte-stable, hash set + texts identical
+    act = path("roundtrip_active")
+    idx2 = materialize(p, act)
+    assert set(idx2.by_hash) == set(idx.by_hash)
+    for h in idx2.by_hash:
+        assert idx2.by_hash[h]["original_text"] == idx.by_hash[h]["original_text"]
+    print("OK round-trip: NFC/NFD + emoji + CJK converge on one key; replay & materialize recover byte-exact text")
+
+
+def test_model_version_default_behavior():
+    s = seg(9, "默认版本探针")
+    assert s["model_version"] == "none"                  # schema default; caller supplies a real version otherwise
+    p = path("defver")
+    append_line(p, s)
+    got = replay(p).lookup(sha256_nfc("默认版本探针"))
+    assert got is not None and got["model_version"] == "none"   # default survives append -> replay
+    k1 = digest_regen_key(s, "none", "topic")
+    k2 = digest_regen_key(seg(9, "默认版本探针"), "none", "topic")
+    assert k1 == k2                                        # default-version key idempotent across rebuild
+    assert k1 != digest_regen_key(s, "m-9", "topic")      # explicit bump = intentional regen
+    print("OK model_version default: 'none' default + replay-stable; regen key idempotent on (hash, 'none', topic)")
+
+
+def test_empty_input_boundaries():
+    missing = os.path.join(_WORKDIR, "no_such_file.jsonl")
+    idx0 = replay(missing)
+    assert len(idx0) == 0 and idx0.dropped == []          # missing file: empty index, NOT an error
+    e1, e2 = seg(0, ""), seg(1, "")
+    assert e1["content_hash"] == e2["content_hash"] == hashlib.sha256(b"").hexdigest()
+    p = path("empty")
+    append_line(p, e1)
+    append_line(p, e2)
+    idx = replay(p)
+    assert idx.dropped[0][1] == "dup_skip_idempotent"
+    got = idx.lookup(e1["content_hash"])
+    assert got is not None and got["original_text"] == ""
+    assert len(materialize(p, path("empty_active"))) == 1
+    print("OK empty input: missing file -> empty index; empty text has well-defined hash; two empty segments dedup to one")
+
+
+def test_long_input_boundaries():
+    big_ascii = "x" * (1024 * 1024)                       # 1 MiB
+    big_cjk = "压缩边界测试" * 100_000                    # 600k chars
+    p = path("long")
+    segs = [seg(0, big_ascii, tier="P1"), seg(1, big_cjk, tier="P2")]
+    for s in segs:
+        append_line(p, s)
+    idx = replay(p)
+    assert len(idx) == 2
+    for s in segs:
+        got = idx.lookup(s["content_hash"])
+        assert got is not None and got["original_text"] == s["original_text"]
+    idx2 = materialize(p, path("long_active"))
+    assert set(idx2.by_hash) == set(idx.by_hash)
+    for h in idx2.by_hash:
+        assert idx2.by_hash[h]["original_text"] == idx.by_hash[h]["original_text"]
+    # NFC over a long combining-char tail stays deterministic
+    long_nfd = "目标" * 50_000 + "e" * 1000 + "\u0301" * 1000
+    assert sha256_nfc(long_nfd) == sha256_nfc(unicodedata.normalize("NFC", long_nfd))
+    print("OK long input: 1 MiB ASCII + 600k CJK round-trip append/replay/materialize; NFC stable on 50k-char combining tail")
 
 
 if __name__ == "__main__":
