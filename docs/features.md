@@ -10,7 +10,7 @@
 > | [`docs/ops-deployment.md`](ops-deployment.md) | 部署 / 运行面：足迹 / 路径 / IO / 崩溃边界 / ops 入口 | @devops |
 > | [`docs/design-rationale.md`](design-rationale.md) | 设计依据：WHY + 证据工件 + 实测数口径边界 | @researcher |
 >
-> 所有实测数字锚定 commit（非工作树），全量 **58/58 绿**，全链 commit-锚定、零 working-tree 漂移。
+> 所有实测数字锚定 commit（非工作树），全量 **60/60 绿**（`ee06945` 起，含 LiveEndpoint 3xx 拒重定向 2 条测试），全链 commit-锚定、零 working-tree 漂移。
 
 ## 定位（一句话）
 
@@ -68,5 +68,5 @@ Lost-in-the-Middle U 形注意力、BM25-vs-embedding 规模论证）——详�
 
 ## ship 入口（机械五条）
 
-见 [`ops-deployment.md`](ops-deployment.md) §5：全量 `pytest tests/` 58/58 @ HEAD / 断电半边 /
+见 [`ops-deployment.md`](ops-deployment.md) §5：全量 `pytest tests/` 60/60 @ HEAD（`ee06945` 起，含 LiveEndpoint 3xx 拒重定向 2 条）/ 断电半边 /
 ③ stamp advisory 随套件出三态 / 网关 `/v1/models` 200 才放行决策层出数 / 换档一行 `--run` 重推。
