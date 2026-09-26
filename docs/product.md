@@ -30,7 +30,7 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
 |---|---|---|---|
 | 1 | P0 0-loss + P0 tagging-recall | 硬不变量 + ≥95%（软） | 已证 @ evicted 态 |
 | 2 | 信号密度（事实数/1K + 锚点命中率） | 滚动窗 + 绝对下限 ≥90% | 已 test-map |
-| 3 | 决策层自一致性 recall @ evicted | ≥75% | **n=30 = 93% PASS（28/30，带 margin）@ `ba1ae50` / agnes-3.0-flash**（旧发 80% @ `640399b` 留档旧路由时代） |
+| 3 | 决策层自一致性 recall @ evicted | ≥75% | **n=30 = 93% PASS（28/30，带 margin）@ `ba1ae50` / agnes-3.0-flash**（单发参考点；对外写 **~80–93% band**，见 §4 注脚 1） |
 | 4 | 召回预算（Pull 20% / Push 15%，P0 豁免记 breach） | breach 频率 + 单峰 | 已证（recall@3 顶回 evicted P0 + breach 日志正确） |
 | 5 | 持久性（进程≈0 / 断电≤256KB+in-flight） | 上界 256 KB（默认可配）+ ms fsync 窗口 | 8/8 @ HEAD + power-loss 三注入点 |
 
@@ -40,6 +40,9 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
    「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 93%**。
    喂真实长 dev session 才量实际用法（下一步研究项，见 `design-rationale.md` §4）。
    对外 claim 必须带「参考配置 + 单题型」定语。
+   **抽样 band 纪律（@researcher 13pp 观察）**：同模型两发抽样（80% @ 旧路由 vs 93% @ 新路由）差 13pp，
+   实证**单发数不是稳定属性、是参考点**——对外 claim 框成 **~80–93%（同模型多次抽样带）**，
+   不写单点 93%；要扛审的稳定数 = 研究 follow-up（小多次抽样取中位数 / 单发 n≥50），非 v1 门。
 2. **数 model-scoped**：只对 `main == digest 生成者`（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，
    路由随 Hermes provider 走、**不锚实例 IP**；当前实例 = `api.example-host.com/v1`，换路由 = 换 `LIVE_ENDPOINT_*` 三件套）有效。
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住，过期数引用时可见、不静默失效）。
