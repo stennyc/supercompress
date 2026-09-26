@@ -24,18 +24,20 @@
   成功 `--run` 尾部自动写 `bench/.last_75_stamp`（双锚 head+model，与数同 commit/链），
   未产出数的路径永不写 stamp。
 - `bench/recall_bench.py` — 检索层 recall@3 evicted 臂。
-- `bench/.last_75_stamp` — 现值 `{"head":"640399b","model":"agnes-3.0-flash","n":30,"pass":24}`。
+- `bench/.last_75_stamp` — 现值 `{"head":"119374a","model":"agnes-3.0-flash","n":30,"pass":26}`（fresh 87% 出数后自动写入，随数同 commit；历史数 93% @ `ba1ae50`、80% @ `640399b` 以 commit 锚留档，非删改）。
 
 ## 3. 实测数与口径边界（对外 claim 必须带定语）
 
 | 数 | 锚 | 口径边界（诚实注脚） |
 |---|---|---|
-| 决策层 n=30 = 93%（28/30 ≥ 75% gate，带 margin） | `ba1ae50` / agnes-3.0-flash（api.example-host.com/v1） | **单一题型合成 fixture**：30 样本同问一个 IP:port 事实。它证「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 93%**。喂真实长 dev session 语料 = 下一步研究项。 |
-| 决策层 n=30 = 80%（24/30，已被 93% 那发取代） | `640399b` / agnes-3.0-flash | 留档：Sub2API 旧路由（10.1.1.116:8080）时代的数。 |
+| 决策层 n=30 = 87%（26/30 ≥ 75% gate，带 margin） | `119374a` / agnes-3.0-flash（key 放行后 https canonical） | **单一题型合成 fixture**：30 样本同问一个 IP:port 事实。它证「该查模式下模型知道查 + BM25 捞得到」，**不是全题型空间的 87%**。喂真实长 dev session 语料 = 下一步研究项。 |
+| 决策层 n=30 = 93%（28/30）｜留档 | `ba1ae50` / agnes-3.0-flash | 同模型三发抽样点之一（80/93/87），非「被 87% 推翻」——同数多次抽样、非稳定属性。 |
+| 决策层 n=30 = 80%（24/30）｜留档 | `640399b` / agnes-3.0-flash | 留档：Sub2API 旧路由（10.1.1.116:8080）时代的数。 |
 | 检索层 recall@3 / 断电半边 | 各 commit 锚 | 确定性量（非活模型随机量），重跑数不变。 |
 
 **model-scoped 注脚**：所有活模型出的数只对 `main == digest 生成者` 那档有效
-（现 = Sub2API agnes-3.0-flash）。换档 = 一行 `--run` 机械重推，stamp 双锚 + ③ advisory
+（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，**不锚实例 IP**——当前实例仅作说明，
+换路由 = 换三件套）。换档 = 一行 `--run` 机械重推，stamp 双锚 + ③ advisory
 让过期数「引用时可见」而非静默失效。**禁止手改 stamp head 消 WARN**（= 假归属）。
 
 ## 4. 下一步研究项（不进 v1、不 block ship）
