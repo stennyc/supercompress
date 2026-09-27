@@ -124,7 +124,7 @@ def build_evicted(tmp, ep):
     target = store.append(Segment(tier="P0", provenance="model",
         original_text=long_src, session_topic=TOPIC, model_version=MV, structural_p0=False))
     # bounded transient-retry on digest generation (@reviewer's structural finding:
-    # Sub2API intermittently force-closes cold connections, so the FIRST ensure_digest
+    # the gateway intermittently force-closes cold connections, so the FIRST ensure_digest
     # in a fresh process can hit a reset; AuxProvider._generate swallows it (transient=True)
     # and digest_ready stays False. Retry while transient; stop on success or hard fail.
     for _attempt in range(3):
@@ -157,7 +157,7 @@ def build_evicted(tmp, ep):
 
 def _call_retry(ep, task, prompt, tries=3, delay=2.0):
     """Bounded retry for TRANSIENT gateway errors only (@reviewer's structural finding:
-    Sub2API intermittently force-closes cold connections -> ConnectionResetError/TimeoutError).
+    the gateway intermittently force-closes cold connections -> ConnectionResetError/TimeoutError).
 
     - HTTP 5xx / 429 -> transient, sleep + retry;
     - HTTP 4xx (auth/param) -> FATAL, re-raise immediately (no retry, no silent 'miss');

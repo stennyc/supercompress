@@ -1,7 +1,7 @@
 """活端点：直接调用 Hermes 已配的模型路由（@user 点破——不另配任何新服务）。
 
 @user 的判定：bench 探针 / aux digest 需要的「活主模型端点」= Hermes 现在就在用的
-主模型路由本身（本机 = Sub2API OpenAI-compat 网关），零新增服务、零新增 provider。
+主模型路由本身（本机 = 团队 OpenAI 兼容网关），零新增服务、零新增 provider。
 (A) 语义「main == digest 生成者」天然满足——digest/tagging/bench 探针全部注入这同一个
 `main_endpoint`，不需要任何配对动作。
 
@@ -12,7 +12,7 @@ skip + 下事件自愈链原样复用，零新故障面）。
 解析顺序（显式、可复现，不猜）：
 1. `LIVE_ENDPOINT_URL` + `LIVE_ENDPOINT_KEY` + `LIVE_ENDPOINT_MODEL`（必填真实模型名，
    占位 "main" 拒出数——@reviewer 口径②）——部署侧把 Hermes 现路由填进来即可
-   （本机 = Sub2API 的 /v1 + x-api-key + agnes 模型名）；
+   （部署侧把 Hermes 现路由的 /v1 + 网关 key + 真实模型名填进来）；
 2. OpenAI 兼容默认：`OPENAI_BASE_URL` + `OPENAI_API_KEY` + `OPENAI_MODEL`（同上必填）；
 3. 都没有 → RuntimeError（显式失败：活端点缺失 = 决策层 75% 不可出数，不静默落回
    FakeEndpoint——对替身出 75% 是循环论证，@researcher 纪律）。

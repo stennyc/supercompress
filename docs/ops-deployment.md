@@ -40,7 +40,7 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 | 全量套件 | `.venv\Scripts\python.exe -m pytest tests/` | 60/60 @ HEAD（34 实现 + 8 数据 ref + 11 ops/preflight + 7 端点面含 3xx 拒重定向 2，含 ③ 四条） |
 | gate⑤ 断电半边 | `tests/test_preflight_ops.py` power-loss 三注入 | 断电上界、零悬空锚点、marker 双向 |
 | ③ stamp advisory | 同文件 `check_stamp_advisory`（随 pytest 出三态） | 75% 数双锚（HEAD + model）失配即 WARN，不 block build |
-| 网关健康 | 团队真路由 `LIVE_ENDPOINT_URL`（**必须 https canonical**——`http://` 会被网关 307 到 https、urllib 跨 scheme 丢 Bearer key → 401；现 = `https://api.example-host.com/v1`，随 Hermes provider 走，**勿写死某台实例 IP**）`/v1/models` 回 200 才放行决策层出数 | 网关不可达/陈旧路由/误写 http:// → 探针 REFUSED、不产数、不写 stamp；换路由 = 换 `LIVE_ENDPOINT_*` 三件套（scheme 一并换对），非代码项 |
+| 网关健康 | 团队真路由 `LIVE_ENDPOINT_URL`（**必须 https canonical**——`http://` 会被网关 307 到 https、urllib 跨 scheme 丢 Bearer key → 401；实例值 = 部署方现路由（随 Hermes provider 走），**勿写死某台实例 IP**）`/v1/models` 回 200 才放行决策层出数 | 网关不可达/陈旧路由/误写 http:// → 探针 REFUSED、不产数、不写 stamp；换路由 = 换 `LIVE_ENDPOINT_*` 三件套（scheme 一并换对），非代码项 |
 | 换模型档位 | `LIVE_ENDPOINT_MODEL=<新模型名> && .venv\Scripts\python.exe bench/decision_layer_probe.py --run 30` | 一行重推，stamp 自动刷新（**别手改 stamp head 消 WARN**） |
 
 **端点面边界注（防误读）：** `sc/live_endpoint.py` 的 `resolve_live_endpoint()` 虽物理住在生产树 `sc/` 里、自己读 `LIVE_ENDPOINT_*`/`OPENAI_*`，但全仓 caller 只有 `bench/decision_layer_probe.py` + 其测试——**没有任何生产调用路径触达它**。prod 端点 = 调用方（Hermes）注入的构造参数（`AuxProvider(main_endpoint)`），零配置跟随默认模型。正确说法不是「`sc/` 里无端点 env 读取」（有），而是「生产路径从不读」——`LIVE_ENDPOINT_URL` 仅活在 bench 出数那一下 shell env，跑完即弃。

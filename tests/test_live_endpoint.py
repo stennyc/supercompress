@@ -14,7 +14,7 @@ def _clear(monkeypatch):
 
 def test_resolve_live_endpoint_env_precedence(monkeypatch):
     _clear(monkeypatch)
-    monkeypatch.setenv("LIVE_ENDPOINT_URL", "http://10.1.1.116:8080/v1")
+    monkeypatch.setenv("LIVE_ENDPOINT_URL", "http://gateway.internal:8080/v1")
     monkeypatch.setenv("LIVE_ENDPOINT_KEY", "k1")
     monkeypatch.setenv("LIVE_ENDPOINT_MODEL", "agnes-3.0-flash")
     monkeypatch.setenv("OPENAI_BASE_URL", "http://openai.default")
@@ -22,7 +22,7 @@ def test_resolve_live_endpoint_env_precedence(monkeypatch):
     monkeypatch.setenv("OPENAI_MODEL", "other-model")
     ep = resolve_live_endpoint()
     assert isinstance(ep, LiveEndpoint)
-    assert ep.base_url == "http://10.1.1.116:8080/v1", "LIVE_ENDPOINT_* 优先"
+    assert ep.base_url == "http://gateway.internal:8080/v1", "LIVE_ENDPOINT_* 优先"
     assert ep.api_key == "k1" and ep.model == "agnes-3.0-flash"
 
 

@@ -46,7 +46,7 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
    对外 claim 框成 **~80–93% band + 中位数 93%**，不写「可复现的单点 93%」；
    真扛审稳定数 = 单发 n≥50（v1 follow-up 研究项，非 v1 门）。
 2. **数 model-scoped**：只对 `main == digest 生成者`（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，
-   路由随 Hermes provider 走、**不锚实例 IP**；当前实例 = `api.example-host.com/v1`，换路由 = 换 `LIVE_ENDPOINT_*` 三件套）有效。
+   路由随 Hermes provider 走、**不锚实例 IP**；实例值 = 部署方现 `LIVE_ENDPOINT_URL`，换路由 = 换 `LIVE_ENDPOINT_*` 三件套）有效。
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住，过期数引用时可见、不静默失效）。
 
 ## 5. footprint（产品可说的版本）

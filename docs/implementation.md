@@ -15,7 +15,7 @@
 ## 辅助面
 
 - **`sc/aux_provider.py`**（Option A）：aux ≡ 主模型端点（Hermes 原生 `auxiliary.compression`，零新增服务、provider-agnostic）；网络异常 → 单事件 transient skip + 下一事件自愈。测试替身 `FakeEndpoint` 在 `tests/fakes.py`，prod import 面零脚手架。
-- **`sc/live_endpoint.py` 端点面**：把 Hermes 现路由（Sub2API `/v1` + x-api-key）resolve 成 bench 可注入的 `LiveEndpoint`；解析链 `LIVE_ENDPOINT_* → OPENAI_* → RuntimeError`，**占位模型名拒出**（不落 `"main"`、不静默回 FakeEndpoint——循环论证纪律写死在 resolve 里）。75% 数的双锚归属（HEAD + 真模型名）机械可查，换档 = 一行 `--run` 重推。
+- **`sc/live_endpoint.py` 端点面**：把 Hermes 现路由（团队 OpenAI 兼容网关 `/v1` + 网关 key）resolve 成 bench 可注入的 `LiveEndpoint`；解析链 `LIVE_ENDPOINT_* → OPENAI_* → RuntimeError`，**占位模型名拒出**（不落 `"main"`、不静默回 FakeEndpoint——循环论证纪律写死在 resolve 里）。75% 数的双锚归属（HEAD + 真模型名）机械可查，换档 = 一行 `--run` 重推。
 
 ## ③ 换档守卫（决策层 75%/80% 的防过期半边）
 

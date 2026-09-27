@@ -53,7 +53,7 @@
    93%（@ `ba1ae50`）/ 87%（@ `119374a`）/ 93%,93%,80%（3 发 @ `9dead01`）波动 13pp → 单发数非稳定属性、是参考点，
    **稳定数 = 3 发中位数 93%（参考带中心，非 CI 硬 claim）**；对外 claim 写 **~80–93% band + 中位数 93%**、不写「可复现的单点 93%」；
    真扛审稳定数 = 单发 n≥50（v1 follow-up，非 v1 门）。
-2. **数 model-scoped**：只对 `main == digest 生成者`（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，路由随 Hermes provider 走、**不锚实例 IP**；当前实例 = `api.example-host.com/v1`）有效，
+2. **数 model-scoped**：只对 `main == digest 生成者`（现档 = `LIVE_ENDPOINT_*` 路由 + agnes-3.0-flash，路由随 Hermes provider 走、**不锚实例 IP**；当前实例值见部署方 `LIVE_ENDPOINT_URL`，随路由换档）有效，
    换档 = 一行 `--run` 机械重推（stamp 双锚 + ③ advisory 兜住）；**禁止手改 stamp head 消 WARN**。
 
 ## footprint（精确口径）

@@ -1,0 +1,10 @@
+# supercompress — 运行期零第三方依赖（纯标准库）
+# Runtime: pure Python stdlib, no third-party packages required.
+#
+# 本文件只列开发/测试依赖。产品树 sc/ 与 scdata.py 仅 import 标准库
+# （json/hashlib/unicodedata/dataclasses/typing/pathlib/urllib），
+# 召回排序是纯标准库 token-overlap（BM25 语义），不依赖 rank_bm25/numpy。
+# This file lists dev/test dependencies only. The product tree (sc/, scdata.py)
+# imports stdlib modules exclusively; recall ranking is stdlib token-overlap
+# (BM25 semantics) with no rank_bm25/numpy dependency.
+pytest>=7.0
