@@ -8,7 +8,7 @@
 | 模块 | 功能（一句话） | 关键不变量 |
 |---|---|---|
 | ① `sc/distill.py` 蒸馏器 | 纯无状态 distiller：tiering（P0/P1/P2）→ P0 write-before-compress（即写即 fsync + 读回过了才发射锚点）→ P1/P2 lazy 批（≤256 KB）→ 锚点 + JSONL 行 | P0 护栏 100% durable；断电只丢一批可重跑 P1/P2；digest pending 时 P0 **不可驱逐**；未 fsync 的 segment 永不发锚点 → 崩溃后死指针恒为 0 |
-| ② `sc/recall.py` 检索 | 点查 O(1) + 纯 BM25 top-k（`rank_bm25`，P0 同相关度 boost）+ Pull 预算 20% enforce | 无 embedding、无向量库；semantic-gap 纯遥测（>15% 才触发可选 v2 语义臂，默认永不自动开） |
+| ② `sc/recall.py` 检索 | 点查 O(1) + 纯 Python token-overlap top-k（BM25 语义，仅标准库 `re`，无 `rank_bm25` import，P0 同相关度 boost）+ Pull 预算 20% enforce | 无 embedding、无向量库；semantic-gap 纯遥测（>15% 才触发可选 v2 语义臂，默认永不自动开） |
 | ③ `sc/ledger.py` 账本 | 新 user 指令 supersede 旧 guardrail/task；被替代项标记后降 digest-only | 账本尾部结构 P0；digest 未就绪前 P0 不驱逐；跨期重开走同一条 replay 路径 |
 | ④ `sc/tagger.py` 标记 | P0 结构标记 + 外部引用跨期 stale 标记（行动前 verify） | tag 决定 tier 门控，不进数据面 |
 

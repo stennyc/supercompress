@@ -51,8 +51,8 @@ supercompress = **上下文蒸馏器 + session 级记忆骨干**，不是内容�
 
 ## 5. footprint（产品可说的版本）
 
-零向量库 · 零外部服务 · 无常驻进程；依赖 = `rank_bm25 + numpy`（pip wheel、免编译，
-精确口径见 `ops-deployment.md` §1）——**不是「纯 Python 零依赖」**，这句别用。
+零向量库 · 零外部服务 · 无常驻进程；**运行时纯 Python 标准库，零第三方依赖**
+（精确口径见 `ops-deployment.md` §1）——.venv 里的 `rank_bm25`/`numpy` 为历史遗留、无代码引用。
 
 ## 6. open 项（均不 block ship）
 

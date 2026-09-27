@@ -58,8 +58,8 @@
 
 ## footprint（精确口径）
 
-零向量库 · 零外部服务 · 无常驻进程；依赖 = `rank_bm25 + numpy`（pip wheel、免编译）。
-**非「纯 Python 零依赖」。**
+零向量库 · 零外部服务 · 无常驻进程；**运行时纯标准库**（召回 = 纯 Python token-overlap 词法排序，BM25 语义，无任何 third-party import；`.venv` 里的 `rank_bm25`/`numpy` 为历史遗留、无代码引用，可删）。
+**纯 Python 零运行时依赖。**
 
 ## 设计依据（WHY，非拍脑袋）
 

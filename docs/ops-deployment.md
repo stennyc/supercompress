@@ -4,8 +4,8 @@
 
 ## 1. 部署足迹（实查口径）
 
-- **一个 jsonl + 内存 `content_hash→line_offset` 索引 + `rank_bm25` + `numpy`**。
-  依赖实装于 `.venv`：`rank_bm25-0.2.2`（其 requires = `numpy` + dev-extra `pytest`）、`numpy-2.5.3`（pip wheel，免编译）。
+- **一个 jsonl + 内存 `content_hash→line_offset` 索引 + 纯标准库召回**（BM25 语义 token-overlap，仅 `re`，零 third-party import）。
+  `.venv` 里历史装过 `rank_bm25-0.2.2`/`numpy-2.5.3`（pip wheel、免编译），但**无任何代码引用**——可删，运行时零依赖。
 - **无常驻进程、无后台**（实查）：prod 树（`sc/ scdata.py bench/`）grep `inotify|watch|daemon|threading|asyncio|subprocess.Popen` = 0 命中。所有组件都是被调用的纯函数/对象，没有 watch hook、没有 daemon。
 - **零向量库、零外部服务**：无 qdrant/embedding/faiss 依赖；检索 = 纯 BM25 词法（+ P0 boost）。
 
@@ -67,4 +67,4 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 ## 6. 未落项（如实标注，不进 ship 口径）
 
 - 归档/retention **路径与策略是部署约定，不是 prod 代码**——超压缩仓库本身不替你建 `~/.hermes/sessions/`，接入方（Hermes）落地时按 §2 约束实现。
-- 「甩掉 numpy、自写纯 Python BM25」为可选 v2（footprint 再减一项 native wheel），默认不建（无消费者不建）。
+- 「召回报文换 `rank_bm25` 库」为可选 v2（当前纯标准库 token-overlap 已够用，无消费者不建），默认不建。
