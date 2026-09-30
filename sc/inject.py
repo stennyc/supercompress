@@ -134,5 +134,5 @@ def render_block(rendered: list[tuple]) -> str:
 
 
 def block_tokens(rendered: list[tuple]) -> int:
-    """注入块总 token（验证/DoD 断言用：≤ 细节 + 索引档，不超 pull cap）。"""
+    """注入块总 token（验证/DoD 断言用：≤ 细节池 4K + 索引池 2K = 总帽 6K，固定池无 pull 耦合）。"""
     return sum(est_tokens(t) for _, _, t in rendered)
