@@ -240,8 +240,8 @@ class TestStoreRoot_EnvAware:
 
     def test_default_store_root_env_wins(self, monkeypatch):
         from engine import _default_store_root
-        monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/coder")
-        assert _default_store_root() == "/opt/hermes/profiles/coder/supercompress_store"
+        monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/profB")
+        assert _default_store_root() == "/opt/hermes/profiles/profB/supercompress_store"
 
     def test_default_store_root_env_absent_falls_back_home(self, monkeypatch, tmp_path):
         """env 缺省 → ~/.hermes 平台默认（conftest 已 delenv）：无 /root 写死。"""
@@ -253,10 +253,10 @@ class TestStoreRoot_EnvAware:
     def test_engine_no_kwargs_resolves_env_root(self, monkeypatch):
         """无 external_store_path 配置 + 无 hermes_home kwarg → env 回退（生产轮转 Major#1 场景）。"""
         from engine import SupercompressContextEngine
-        monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/orchestrator")
+        monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/profA")
         e = SupercompressContextEngine()
-        assert e._legacy_store_dir == "/opt/hermes/profiles/orchestrator/supercompress_store"
-        assert e.store_path == "/opt/hermes/profiles/orchestrator/supercompress_store/active.jsonl"
+        assert e._legacy_store_dir == "/opt/hermes/profiles/profA/supercompress_store"
+        assert e.store_path == "/opt/hermes/profiles/profA/supercompress_store/active.jsonl"
 
     def test_session_start_without_kwarg_uses_env_dir(self, monkeypatch, tmp_path):
         """轮转 rebind 缺 hermes_home kwarg → 经 env 回退落 <HERMES_HOME>/supercompress_store/<sid>.jsonl。"""

@@ -593,6 +593,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         old_sid = kwargs.get("old_session_id")
         # P0.2：单轨读宿主信号 `carry_over_context`（run_agent.py:402 下发）；
         # 旧插件 kwarg `carry_over` 留作兼容别名（既有测试/直调面），二者取或。
+        # 宿主面两键永不并发下发（宿主只发 carry_over_context）→ OR 无歧义；
+        # 「宿主显式 False + 旧 kwarg True → 仍 OR 为 True」的理论路径仅测试/直调面可达。
         carry = bool(kwargs.get("carry_over_context") or kwargs.get("carry_over", False))
         if old_sid and carry:
             old_file = os.path.join(store_dir, f"{_safe_session_name(old_sid)}.jsonl")
