@@ -508,8 +508,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
             logger.error("tcm-supercompress: compress degraded (store error): %s", e)
             return messages  # fail-open：压缩失败 ≠ turn 失败
         # S-Phase 2（决定 B）：阶梯注入取代全文拼接——预算驱动选档（L3/L2/L1/L0），
-        # 总帽 = pull_budget(20% usable)：索引档 2K + 细节档余量；structural P0 豁免
-        # （活账本永不裁）；超预算逐档降级，细节不丢（原文 O(1) 点查）。壳只调 sc.inject，
+        # 固定池无 pull 耦合：索引池 2K（L1+L2 共池）+ 细节池 4K（L3），总帽 6K，
+        # 与模型窗口解耦（注入块不随窗口放大 = 决定 B 核心）；高压（used>cap）细节池
+        # 归零只出 L1/L2/L0；structural P0 豁免（活账本永不裁）。壳只调 sc.inject，
         # 零算法体（壳薄度门禁不变）。
         kept = [ws for ws in window.segs if ws.segment.tier in ("P0", "P1")]
         # Egress 过滤（同 select_context）：已存 group-skeleton P0 段逐出压缩

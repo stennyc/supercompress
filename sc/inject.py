@@ -3,9 +3,10 @@
 现状缺陷（S1）：engine.compress() 把**全部** P0/P1 的 original_text 拼进一条 system
 消息——464 行 session 轻松几万 token 每 turn 重发，窗口单调膨胀。
 本模块根治：注入 = L1 索引行（全量，每段 ~30t）+ 细节预算内 L3 全文 / L2 摘要，
-超预算逐档降级（L3→L2→L1→L0 指针），**总帽 = pull_budget（20% usable，sc.budgets 共享
-分母）**：索引档默认 2K，细节档 = 总帽 − 索引档。细节不丢：原文在盘上 O(1) 点查
-（recall.get），L0 指针带 segment_id。
+超预算逐档降级（L3→L2→L1→L0 指针），**固定池、无 pull 耦合**：索引池 2K +
+细节池 4K（总帽 6K，≤ DoD 8K）——与模型窗口解耦是决定 B 的核心：pull 耦合会让
+注入块随窗口放大（256K 模型 → 51K 块），抵消窗口单调膨胀的修复。细节不丢：
+原文在盘上 O(1) 点查（recall.get），L0 指针带 segment_id。
 
 档位语义（段级，逐段选「装得下的最高档」）：
 - L3 全文   = 原文（digest_only 段 = digest 摘录，与 distill.WindowSeg.excerpt 同义）；
@@ -49,7 +50,8 @@ def _rank_key(ws, query_terms: set[str]) -> tuple:
     return (-hits, tier_order, -ws.segment.seq)
 
 
-# 档位默认预算（文档公式：索引 2K / 细节 4K；高压 = used>cap → 细节池归零，纯索引 ≤2K）
+# 档位默认池（固定，无 pull 耦合——决定 B 核心，见模块 docstring；与模型窗口解耦）。
+# index/detail 参数是扩展缝（默认 None → 常量）；compress() 现不传，保持默认。
 DEFAULT_INDEX_BUDGET = 2048
 DEFAULT_DETAIL_BUDGET = 4096
 
@@ -63,9 +65,10 @@ def choose_forms(
 ) -> list[tuple]:
     """预算驱动选档（核心，确定性）→ [(ws, form, text), ...]，输出 = seq 稳定序。
 
-    form ∈ {"L3","L2","L1","L0"}；预算 = 细节池（L3/L2 共池，默认 4K）+ 索引池（L1，默认 2K）。
+    form ∈ {"L3","L2","L1","L0"}；预算 = 细节池（L3，默认 4K）+ 索引池（L1+L2 共池，默认 2K）。
     **高压语义**（window.used_tokens > capacity，即物理超窗/backpressure 状态）：细节池归零，
-    只出 L1/L0 → 注入块 ≤ 索引池（≈2K）。structural P0（goal/ledger）L3 豁免细节池
+    只出 L1/L2/L0（L2 仍合法——已 digest 段经索引池出 L2，仍在 2K 帽内）→ 注入块 ≤ 索引池
+    （≈2K，structural 豁免除外）。structural P0（goal/ledger）L3 豁免细节池
     （活账本永不裁，push cap 语义一致）；其余段按相关性（query 词面命中 → tier → 新近）
     逐段选「装得下的最高档」，超池逐档降级，绝不超预算。细节不丢：L0 指针带 segment_id，
     原文 O(1) 点查可回（recall.get）。

@@ -55,8 +55,9 @@ def parse_digest_response(text: str | None) -> tuple[str, str]:
         except Exception:
             continue
         if isinstance(d, dict):
-            kf = str(d.get("key_fact", "")).strip()
-            sm = str(d.get("summary", "")).strip()
+            # 限长兜底（F5）：LLM 自报字段进 system 通道 L1/L2 行前截断，防无上限正文
+            kf = str(d.get("key_fact", "")).strip()[:80]
+            sm = str(d.get("summary", "")).strip()[:400]
             if kf or sm:
                 return kf, sm
     # 纯文本回退：整体当 summary，key_fact 取头部（仍远优于无）

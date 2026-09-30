@@ -55,6 +55,14 @@ class TestParseDigestResponse:
     def test_none_response(self):
         assert parse_digest_response(None) == ("", "")
 
+    def test_overlong_llm_fields_capped(self):
+        """F5(security)：LLM 自报超长字段进 system 通道前被限长截断——防无上限正文。"""
+        kf_long = "k" * 500          # > 80
+        sm_long = "s" * 3000         # > 400
+        kf, sm = parse_digest_response(json.dumps({"key_fact": kf_long, "summary": sm_long}))
+        assert len(kf) == 80, f"key_fact 限长 80（实际 {len(kf)}）"
+        assert len(sm) == 400, f"summary 限长 400（实际 {len(sm)}）"
+
 
 class TestDigestCapture_EndToEnd:
     """_generate 消费 LLM 正文：canned JSON → key_fact/digest_text 真实内容（非 head80 占位）。"""
@@ -97,14 +105,15 @@ def _mk(cap, segs):
 
 class TestChooseForms_Budget:
     def test_high_pressure_index_only(self, store):
-        """DoD：高压（used>cap）→ 细节池归零，非 structural 段全落 L1/L0，注入块 ≤ 索引池。"""
+        """DoD：高压（used>cap）→ 细节池归零，非 structural 段全落 L1/L2/L0，注入块 ≤ 索引池。
+        本 fixture 无 digest 段 → 实际只出 L1/L0（已 digest 段 L2 场景见 test_high_pressure_digested_gets_l2）。"""
         segs = [mkseg(store, "p1 body " + str(i) + " " + "word" * 60, "P1") for i in range(40)]
         # 窗：cap 远小于段总 token（used>cap = backpressure 态）
         w = _mk(1000, segs)
         assert w.used_tokens > w.capacity_tokens, "前置：构造为高压态"
         rendered = choose_forms(w.segs, w)
         forms = {ff for _, ff, _ in rendered}
-        assert forms <= {"L1", "L0"}, "高压只出 L1/L0（细节池归零）"
+        assert forms <= {"L1", "L0"}, "无 digest fixture 高压只出 L1/L0（细节池归零且无可 L2 段）"
         assert block_tokens(rendered) <= DEFAULT_INDEX_BUDGET, "注入块 ≤ 索引池 2K"
         # L0 指针带 segment_id（细节可 O(1) 回查）
         l0 = [t for _, ff, t in rendered if ff == "L0"]
@@ -112,6 +121,19 @@ class TestChooseForms_Budget:
             for t in l0:
                 sid = [s.segment_id for s in segs]
                 assert any(sid_i in t for sid_i in sid), "L0 指针含 segment_id"
+
+    def test_high_pressure_digested_gets_l2(self, store):
+        """F3：高压下已 digest 段可出 L2（经索引池，仍在 2K 帽内）——模块 docstring 曾误写'高压只出 L1/L0'。"""
+        segs = [mkseg(store, "p1 body " + str(i) + " " + "word" * 60, "P1") for i in range(40)]
+        digested = mkseg(store, "p1 digested " + "w" * 60, "P1")
+        digested.digest_text = "one-line digest summary of this segment"
+        segs.append(digested)
+        w = _mk(1000, segs)
+        assert w.used_tokens > w.capacity_tokens, "高压态"
+        rendered = choose_forms(w.segs, w)
+        by_id = {ws.segment.segment_id: ff for ws, ff, _ in rendered}
+        assert by_id[digested.segment_id] == "L2", "已 digest 段高压出 L2（索引池内）"
+        assert block_tokens(rendered) <= DEFAULT_INDEX_BUDGET, "L2 仍计入索引池 2K 帽（structural 豁免除外）"
 
     def test_normal_pressure_allows_l3_in_detail_pool(self, store):
         """正常压（used≤cap）→ 细节池 4K 内装得下的段升 L3，其余 L2/L1/L0。"""
@@ -194,3 +216,34 @@ class TestEngineCompress_StagedInjection:
         assert "goal: v1" in block, "structural P0 全文必在（L3 豁免）"
         total = block_tokens(rendered)
         assert total <= DEFAULT_DETAIL_BUDGET + DEFAULT_INDEX_BUDGET, "注入块不超 细节+索引 帽"
+
+    def test_compress_end_to_end_header_and_egress(self, store, aux):
+        """F4：真 e2e e.compress()（非 sc.inject 直调）——补 compress() 管线零测试覆盖面：
+        ① header f-string（forms 统计 + block_tokens + segs 计数）；② structural P0 全文在块；
+        ③ egress：room-skeleton P0 被 _skel 过滤逐出注入块（该过滤当前无任何测试验证）。
+        protect_first_n/last_n 走宿主基类默认（3/6）——本测试环境 base 解析成真宿主基类。"""
+        import tempfile
+        from engine import SupercompressContextEngine
+        tmp = tempfile.mkdtemp()
+        e = SupercompressContextEngine(context_length=100000, external_store_path=tmp)
+        e.on_session_start("e2e")
+        goal = mkseg(e.store, "goal: ship v1", "P0", "user", structural=True)
+        skel = mkseg(e.store, '[Group chat: "ops"] ' + "room skeleton " * 50, "P0",
+                      structural=True)
+        big_p1 = mkseg(e.store, "big dump " + "x" * 4000, "P1")
+        # 宿主消息面：protect_first_n=3 + [system block] + protect_last_n=6
+        msgs = [{"role": "user", "content": f"m{i}"} for i in range(12)]
+        out = e.compress(msgs, current_tokens=200000, force=True)
+        sys_msgs = [m for m in out if m.get("role") == "system"]
+        assert len(sys_msgs) == 1, "恰一条 system 阶梯注入块"
+        content = sys_msgs[0]["content"]
+        # ① header f-string 三要素（engine.py:529-533）
+        assert "staged P0/P1 segments" in content, "header 文案"
+        assert " segs, " in content and " tok" in content, "segs 计数 + block_tokens"
+        assert "forms: {" in content, "forms 档位统计（sorted dict）"
+        # ② structural P0 全文必在（L3 豁免细节池）
+        assert "goal: ship v1" in content, "structural P0 全文在块"
+        # ③ egress：room-skeleton P0 被 _skel 过滤逐出（不进块）
+        assert "room skeleton" not in content, "egress：群聊骨架逐出注入块"
+        assert "goal: ship v1" in content and "room skeleton" not in content, \
+            "structural P0 留、room-skeleton P0 逐（同 tier 不同 provenance）"
