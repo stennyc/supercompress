@@ -54,3 +54,26 @@ def setup_script_path() -> str:
 def install_root() -> str:
     """仓根（= INSTALL_ROOT，别名供脚本侧统一命名导入）。"""
     return INSTALL_ROOT
+
+
+def require_install_root() -> str:
+    """校验仓根层级（让深度假设失败得更可读，@reviewer f3a3df3 Minor②）。
+
+    本插件须置于 ``…/plugins/context_engine/supercompress/sc/`` 层级——
+    ``INSTALL_ROOT`` 由 ``__file__`` 上溯 4 级反推，层级不符时仓根解析到错处。
+    正确层级下 ``INSTALL_ROOT/plugins/context_engine/supercompress/sc/_bootstrap.py``
+    必存在（= 本文件）；层级被搬动则缺失。缺失即 raise 带说明的
+    ``RuntimeError``（而非等到 ``import plugins…`` 抛裸 ``ImportError``）。
+
+    返回校验通过的仓根路径。生产正确层级下恒不 raise。
+    """
+    root = Path(INSTALL_ROOT)
+    rel = "plugins/context_engine/supercompress/sc/_bootstrap.py"
+    if not (root / rel).is_file():
+        raise RuntimeError(
+            f"supercompress 安装层级不符：{root} 下缺少 {rel}。"
+            "本插件须置于 hermes-agent 仓的 plugins/context_engine/supercompress/ 内"
+            "（…/plugins/context_engine/supercompress/sc/）；若已复制到其他位置，"
+            "请调整目录结构后再运行 CLI 脚本。"
+        )
+    return str(root)

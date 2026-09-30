@@ -64,7 +64,12 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
   （双路 PYTHONPATH = hermes-agent 源目录供 `from agent.memory_provider import …` + 插件目录；解释器用真正带 pytest 的那个。全插件套件现 **23/23**（build 半 26 → 删 TCM 半随行去掉 3 条 M6 测试，ref-count 4 + Gold 4 + 存量零回归）。）
 - **ops 前向脆弱性（登记不建）：** 上面 proof 的解释器 = 兄弟工程 `supercompress/.venv`，file-memory 插件自身无 venv；该 `.venv` 一旦被盘清删掉，flag 周期"零调用"证明就无解释器。触发条件 = 切片③ 证明卡在这缺解释器时，才起专用 env / 装 pytest 进插件自身 env，现不预建（无消费者不建）。
 
-## 6. 未落项（如实标注，不进 ship 口径）
+## 6. 数据面运维注记（2026-09-30 per-session store 落地后）
+
+- **legacy 单文件 → per-session 目录**：S-Phase 1 起 store 落 `<HERMES_HOME>/supercompress_store/<sid>.jsonl`（per-session）；旧部署的单一 `active.jsonl`（含历史会话段）在 gateway 重启后**停止写入**（设计内，严格 session 记忆；carry 默认 OFF）。如需把旧活跃会话带入某 profile 新 session：确认轮转时宿主传 `carry_over_context=True`（或直调 `on_session_start` 兼容别名 `carry_over=True`），`materialize()` 会把旧段迁移进新 session 文件；否则旧文件即成归档孤儿（只读审计，不进召回）。**无自动迁移脚本**——按产品决策不做（孤儿数据可手动 `cp` 或丢弃）。
+- **安装层级（Minor②）**：CLI 脚本（`sc/retag.py`、`sc/check_supercompress.py`）经 `sc/_bootstrap.require_install_root()` 校验仓根层级；插件被复制到非 `…/plugins/context_engine/supercompress/sc/` 深度时以可读 `RuntimeError` 失败（非裸 ImportError）。
+
+## 7. 未落项（如实标注，不进 ship 口径）
 
 - 归档/retention **路径与策略是部署约定，不是 prod 代码**——超压缩仓库本身不替你建 `~/.hermes/sessions/`，接入方（Hermes）落地时按 §2 约束实现。
 - 「召回报文换 `rank_bm25` 库」为可选 v2（当前纯标准库 token-overlap 已够用，无消费者不建），默认不建。

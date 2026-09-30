@@ -288,3 +288,14 @@ class TestStoreRoot_EnvAware:
         # 安装根从 __file__ 推导（非 /usr/local 写死）：任何位置装都解析出自己的仓根
         root = Path(_bootstrap.INSTALL_ROOT)
         assert (root / "plugins" / "context_engine" / "supercompress" / "sc" / "_bootstrap.py").exists()
+
+    def test_require_install_root_passes_and_fails_readably(self, monkeypatch):
+        """reviewer Minor②（安装层级校验）：深度假设失败时报可读 RuntimeError，非裸 ImportError。"""
+        import pytest
+        from sc import _bootstrap
+        # 成功面：生产树层级正确 → 返回仓根（marker 存在即通过）
+        assert _bootstrap.require_install_root() == str(Path(_bootstrap.INSTALL_ROOT))
+        # 失败面：仓根误解析（插件被搬到错误深度）→ 可读说明
+        monkeypatch.setattr(_bootstrap, "INSTALL_ROOT", "/nonexistent/hermes_root")
+        with pytest.raises(RuntimeError, match="安装层级不符"):
+            _bootstrap.require_install_root()

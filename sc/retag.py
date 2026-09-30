@@ -18,12 +18,14 @@ from pathlib import Path
 # （plugins.context_engine.* 可导），换任何安装目录/任何用户都成立。
 import os
 _PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])   # supercompress/
-_INSTALL_ROOT = str(Path(__file__).resolve().parents[4])  # hermes-agent 仓根
-for _p in (_PLUGIN_ROOT, _INSTALL_ROOT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
 
-from sc._bootstrap import active_store_path
+from sc._bootstrap import active_store_path, require_install_root
+_INSTALL_ROOT = require_install_root()  # 层级校验：深度假设失败时报可读说明（reviewer Minor②）
+if _INSTALL_ROOT not in sys.path:
+    sys.path.insert(0, _INSTALL_ROOT)
+
 from plugins.context_engine.supercompress.engine import SupercompressContextEngine
 from sc.store import JsonlStore
 from sc.schema import Segment

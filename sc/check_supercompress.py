@@ -16,12 +16,14 @@ from pathlib import Path
 
 # 安装可移植路径引导（零硬编码）：从 __file__ 反推插件根（sc.* / engine 可导）。
 _PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])   # supercompress/
-_INSTALL_ROOT = str(Path(__file__).resolve().parents[4])  # hermes-agent 仓根
-for _p in (_PLUGIN_ROOT, _INSTALL_ROOT):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
 
-from sc._bootstrap import config_path, active_store_path
+from sc._bootstrap import config_path, active_store_path, require_install_root
+_INSTALL_ROOT = require_install_root()  # 层级校验：深度假设失败时报可读说明（reviewer Minor②）
+if _INSTALL_ROOT not in sys.path:
+    sys.path.insert(0, _INSTALL_ROOT)
+
 
 # Hermes 配置文件路径（HERMES_HOME-aware，不写死某 profile / 某 home）
 CONFIG_PATH = Path(config_path())
