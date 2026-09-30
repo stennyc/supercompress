@@ -14,4 +14,8 @@ def store(tmp_path):
 
 @pytest.fixture
 def aux():
-    return AuxProvider(FakeEndpoint())
+    # sc 层契约测试：关冷却窗（fail_cooldown=0）保持「transient 单事件、下事件自愈」纯净；
+    # 引擎层去抖策略（生产默认 60s 冷却）由 engine.py 注入，不进 sc 契约面。
+    # 显式 sync 模式（async_digest=False）= 无 worker 线程、digest 立即生成 → 测试确定性；
+    # 生产 engine.py 走默认 async（worker 后台生成，turn 线程零阻塞）。
+    return AuxProvider(FakeEndpoint(), fail_cooldown=0.0, async_digest=False)

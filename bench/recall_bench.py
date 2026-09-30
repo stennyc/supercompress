@@ -48,7 +48,7 @@ def mkseg(store, text, tier, prov="model", structural=False, kind="segment",
 def build_and_evict(tmp):
     store = JsonlStore(tmp)
     ep = FakeEndpoint(); ep.responses["auxiliary.compression"] = ""
-    aux = AuxProvider(ep)
+    aux = AuxProvider(ep, async_digest=False)   # bench 同步取 digest（确定性）
 
     # resident guardrails (structural P0, never evicted)
     user = mkseg(store, "user: ship v1 and keep /srv/a1", "P0", "user", structural=True)

@@ -112,7 +112,7 @@ def build_evicted(tmp, ep):
     from sc.aux_provider import AuxProvider
 
     store = JsonlStore(tmp)
-    aux = AuxProvider(ep, max_concurrency=1)   # P3: SAME endpoint object -> digest + probe
+    aux = AuxProvider(ep, max_concurrency=1, async_digest=False)  # probe 同步取 digest（确定性）
     user = store.append(Segment(tier="P0", provenance="user",
         original_text="user: ship v1 and keep /srv/a1", session_topic=TOPIC,
         model_version=MV, structural_p0=True))

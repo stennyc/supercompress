@@ -16,10 +16,31 @@
 from __future__ import annotations
 
 import os
+import queue
+import threading
+import time
 
 import scdata
 
 from .schema import Segment
+
+# digest 全局并发帽（跨会话同端点去抖，第 2 层）：模块级 BoundedSemaphore，
+# 同进程内多会话的 digest 调用共享上限（默认 2；SC_DIGEST_CONCURRENCY 进程级覆盖）。
+# BoundedSemaphore 不可 resize → 导入时定死；测试可经 AuxProvider(digest_sem=...) 注入独立实例。
+_SC_CONCURRENCY_RAW = os.environ.get("SC_DIGEST_CONCURRENCY", "2").strip()
+try:
+    _SC_DIGEST_CONCURRENCY = max(1, int(_SC_CONCURRENCY_RAW))
+except ValueError:
+    _SC_DIGEST_CONCURRENCY = 2
+_DIGEST_SEM = threading.BoundedSemaphore(_SC_DIGEST_CONCURRENCY)
+
+
+class _FlushSignal:
+    """flush(timeout) 汇合点信号：worker 处理到即 set event（不中断队列）。"""
+    __slots__ = ("event",)
+
+    def __init__(self, event: threading.Event) -> None:
+        self.event = event
 
 
 def marker_enabled() -> bool:
@@ -32,7 +53,9 @@ class AuxProvider:
 
     COMPRESSION_TASK = "auxiliary.compression"   # digest 映射原生 summarizer 任务
 
-    def __init__(self, main_endpoint, max_concurrency: int = 1) -> None:
+    def __init__(self, main_endpoint, max_concurrency: int = 1, fail_cooldown: float = 60.0,
+                 digest_sem: "threading.BoundedSemaphore | None" = None,
+                 async_digest: bool = True) -> None:
         self.main_endpoint = main_endpoint
         self.fallback_endpoint = main_endpoint   # (A) 失败域与主模型同源
         self.fallback_chain: list[str] = ["main"]
@@ -43,6 +66,59 @@ class AuxProvider:
         self._results: dict[str, dict] = {}       # segment_id -> digest 结果（会话内幂等）
         self._digest_cache: dict[tuple, str] = {}  # 再生三元组 -> refid（跨 turn 幂等）
         self.transient = False                    # 本事件主 LLM 瞬态失败标志
+        # 失败冷却窗（去抖）：端点一次瞬态失败（超时/限流）后，冷却窗内 pending 段
+        # 直接跳过、不再逐个重发端点 —— 多会话 × pending 段 × 重试的放大风暴封死；
+        # 跨 turn 有效（turn 边界只重置 queue/transient，冷却到点才放行下一波）。
+        self.fail_cooldown = fail_cooldown
+        self._cooldown_until: float = 0.0
+        # digest 全局并发帽（去抖第 2 层）：默认共享模块级 _DIGEST_SEM（跨会话同端点
+        # 不互相放大）；测试可注入独立实例。
+        self.digest_sem = digest_sem if digest_sem is not None else _DIGEST_SEM
+        # 异步 digest worker：有界 work queue + 单 daemon 线程。turn 末批次/出 turn 单发
+        # 只入队立即返回（宿主 turn 线程零阻塞，慢端点不再卡 preflight）；冷却窗在
+        # worker 内检查（冷却窗内跳过端点，非入队后逐段重试）。digest 非关键路径——
+        # 未 ready 的后果仅是本事件不逐出（over-store 可接受；force_evict 门不过 digest）。
+        # sync 模式（测试/sc 契约确定性）= 无 worker，原同步路径不变。
+        self.async_digest = async_digest
+        self._work_q: "queue.Queue" = queue.Queue(maxsize=256)
+        self._worker: threading.Thread | None = None
+        self._worker_lock = threading.Lock()
+        self._dropped: int = 0               # 队满丢弃计数（可观测；段保持 pending → 下事件再生）
+        if self.async_digest:
+            self._spawn_worker()
+
+    # ── 异步 worker 生命周期 ──
+    def _spawn_worker(self) -> None:
+        with self._worker_lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=self._worker_loop, name="sc-digest", daemon=True)
+            self._worker.start()
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._work_q.get()
+            try:
+                if isinstance(item, _FlushSignal):
+                    item.event.set()
+                    continue
+                self._generate(item)
+            except Exception:
+                pass   # worker 线程永不炸（端点异常已在 _generate 内吞成 transient）
+            finally:
+                self._work_q.task_done()
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """等待 worker 处理完当前队列（session-end 汇合点；测试确定性屏障）。
+        返回 True = 队列已清空；False = 超时仍有在途（段保持 pending → 下 turn 再生）。"""
+        if not self.async_digest or self._worker is None:
+            return True
+        sig_event = threading.Event()
+        try:
+            self._work_q.put(_FlushSignal(sig_event))
+        except queue.Full:
+            return False
+        return sig_event.wait(timeout)
 
     @property
     def in_turn(self) -> bool:
@@ -57,12 +133,27 @@ class AuxProvider:
 
     def end_turn(self) -> None:
         self._in_turn = False
-        for seg in self._queue:
-            self._generate(seg)
-        self._queue = []
+        queued, self._queue = self._queue, []
+        if self.async_digest:
+            # 异步：批次入队立即返回（宿主 turn 线程零阻塞，慢端点不再卡 preflight）；
+            # 实际生成在 worker 线程（冷却窗/并发帽均在 _generate 内生效）。
+            for seg in queued:
+                self._enqueue(seg)
+        else:
+            for seg in queued:
+                self._generate(seg)
+
+    def _enqueue(self, seg: Segment) -> None:
+        """入队；队满（256）丢弃——段保持 pending → distill 本事件跳过该段（over-store
+        可接受；force_evict 兜底），绝不为消化溢出反堵调用线程。丢弃计数可观测。"""
+        try:
+            self._work_q.put_nowait(seg)
+        except queue.Full:
+            self._dropped += 1
 
     def ensure_digest(self, seg: Segment) -> dict | None:
-        """幂等：已生成 → 返回缓存（不重算、不发起端点调用）；turn 内 → 排队 None；否则立即生成。"""
+        """幂等：已生成 → 返回缓存（不重算、不发起端点调用）；turn 内 → 排队 None；
+        出 turn → async 入队立即返回 None（worker 后台生成），sync 立即生成。"""
         if seg.segment_id in self._results:
             return self._results[seg.segment_id]
         if self._in_turn:
@@ -70,13 +161,26 @@ class AuxProvider:
                 self._queue.append(seg)
                 self._queued.add(seg.segment_id)
             return None
+        if self.async_digest:
+            self._enqueue(seg)
+            return None
         return self._generate(seg)
 
     def _generate(self, seg: Segment) -> dict | None:
+        if self._cooldown_until and time.monotonic() < self._cooldown_until:
+            # 冷却窗内：不调端点（瞬态失败风暴去抖）；transient 标志保持 → 事件走 transient regime
+            self.transient = True
+            return None
         try:
-            self.main_endpoint.call(self.COMPRESSION_TASK, seg.original_text[:4096])
+            self.digest_sem.acquire()
+            try:
+                self.main_endpoint.call(self.COMPRESSION_TASK, seg.original_text[:4096])
+            finally:
+                self.digest_sem.release()
         except Exception:
             self.transient = True
+            if self.fail_cooldown > 0:
+                self._cooldown_until = time.monotonic() + self.fail_cooldown
             return None
         key = scdata.digest_regen_key(
             {"content_hash": seg.content_hash}, seg.model_version, seg.session_topic)

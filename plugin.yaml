@@ -1,0 +1,4 @@
+name: supercompress
+description: "Super-compression context engine v2 — sc distiller + anchor emitter + local-only recall (thin Hermes adapter shell)"
+version: "2.0.0"
+author: "tcm"

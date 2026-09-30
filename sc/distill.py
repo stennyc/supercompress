@@ -85,11 +85,13 @@ class DistillResult:
 class Distiller:
     """纯蒸馏器 + 锚点发射器：不持有状态、不取数、不直接写 jsonl（记忆层管存）。"""
 
-    def __init__(self, window: Window, store, aux, inject_fault_after: str | None = None) -> None:
+    def __init__(self, window: Window, store, aux, inject_fault_after: str | None = None,
+                 force_evict: bool = False) -> None:
         self.window = window
         self.store = store
         self.aux = aux
         self.inject_fault_after = inject_fault_after
+        self.force_evict = force_evict
         self.push_cap_tokens = push_cap(window)   # Push cap 读共享分母（一处定义）
         self.events: list[str] = []
 
@@ -113,14 +115,15 @@ class Distiller:
             return result                 # 锚点不发射、窗口一个字节不动（fail-safe）
 
         # 2. 出 turn 即时 digest 生成（P0 非结构 pending）：aux 瞬态失败 → transient regime
-        for ws in w.segs:
-            seg = ws.segment
-            if (seg.tier == "P0" and not seg.structural_p0
-                    and seg.digest_ref == "pending" and not aux.in_turn):
-                aux.ensure_digest(seg)
+        if not self.force_evict:
+            for ws in w.segs:
+                seg = ws.segment
+                if (seg.tier == "P0" and not seg.structural_p0
+                        and seg.digest_ref == "pending" and not aux.in_turn):
+                    aux.ensure_digest(seg)
 
         # 3. transient_fail：单事件 skip，P1/P2 停止逐出（over-store 可接受），结构地板保 user-msg P0
-        if aux.transient:
+        if aux.transient and not self.force_evict:
             self.events.append("transient_skip")
             store.kpi_log.append({"regime": "transient_fail"})
             result.status = "backpressure" if w.used_tokens > cap else "ok"
@@ -173,6 +176,10 @@ class Distiller:
                 seg = ws.segment
                 if seg.structural_p0:
                     continue                        # 结构 P0（goal / ledger 尾 / 用户指令）永不逐出
+                # force_evict 模式：跳过 digest 检查，直接逐出
+                if self.force_evict:
+                    return ws
+                # 正常模式：检查 digest
                 if tier == "P0" and not seg.digest_ready:
                     if aux.in_turn:
                         continue                    # turn 内 digest 未 ready → P0 不可逐出（gate）

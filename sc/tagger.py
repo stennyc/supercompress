@@ -1,7 +1,10 @@
 """Block ④ tagger：P0 确定性结构地板（语言无关）+ LLM tiering（机器可解析 JSON）。
 
 gate 锁语义：
-- 结构地板（provenance=user）：恒 P0 structural，不进 LLM 评分（transient_fail 时兜底仍保）；
+- 结构地板（provenance=user）：短指令（len < 100）恒 P0 structural，不进 LLM 评分
+  （transient_fail 时兜底仍保）；长 user-sourced 内容（group chat 转发 / compaction
+  summary / 注入块，len ≥ 100）→ P0 non-structural（仍 P0 优先级，push cap 溢出可逐出），
+  根治「注入内容打 user provenance → 100% structural → push cap 失效」；
 - LLM tiering 走 aux 主模型端点（零新 provider），输出**机器可解析 JSON**
   （`{"tier":"P2","score":3}`），不吐自然语言再 regex；
 - 边界 ±1（score 6–8）→ 升一级保守（P2 → P1）；
@@ -16,6 +19,32 @@ from .aux_provider import AuxProvider
 
 TIERS = ("P0", "P1", "P2")
 _TIERS_BY_TIER = {t: i for i, t in enumerate(TIERS)}
+# user 短指令 structural 地板阈值（@reviewer 裁定 2026-09-29）：
+# provenance=user 且 len < 100 → P0 structural；len ≥ 100 → P0 non-structural（可逐出）。
+USER_STRUCTURAL_LEN = 100
+# 长 user-sourced 内容的系统噪声标记（≥100 chars 时才判定，短指令恒保护）：
+# 日志/技能提示词 → P2；compaction summary → P1（@researcher 分级表，@reviewer 锁定）。
+_P2_MARKERS = ("Traceback (most recent call last)", "console.log(", "console.error(",
+               "console.warn(", "UPDATE_SKILL", "update the skill library")
+_P1_MARKERS = ("<compaction-summary>",)
+
+
+def classify_user(text: str) -> tuple[str, bool]:
+    """user-sourced 分级规则（单一实现源：Tagger.classify 与存量重打分 retag.py 共用）。
+
+    - len < 100（短指令）→ ("P0", structural=True)：确定性地板，保护真实用户指令；
+    - len ≥ 100 + 系统噪声标记（日志 / 技能提示词）→ ("P2", False)；
+    - len ≥ 100 + compaction summary 标记 → ("P1", False)；
+    - len ≥ 100 其余（group chat 转发 / 注入块）→ ("P0", False)：
+      优先级不变（仍 P0，先于 P1/P2 保留），仅 push cap 溢出时可逐出。
+    """
+    if len(text) < USER_STRUCTURAL_LEN:
+        return ("P0", True)
+    if any(m in text for m in _P2_MARKERS):
+        return ("P2", False)
+    if any(m in text for m in _P1_MARKERS):
+        return ("P1", False)
+    return ("P0", False)
 
 
 class Tagger:
@@ -26,11 +55,17 @@ class Tagger:
     def classify(self, text: str, provenance: str) -> tuple[str, bool, str, str]:
         """返回 (tier, structural, regime, reason)。
 
-        契约：user-sourced = P0 structural 地板（确定性，不过 aux）；
+        契约：user-sourced 短指令（< 100 chars）= P0 structural 地板（确定性，不过 aux）；
+        user-sourced 长内容（≥ 100 chars，group chat 转发 / compaction summary 等注入块）
+        = P0 non-structural（优先级不变，push cap 溢出时可逐出，注入类 0% structural）；
         model-sourced = aux 端点「tagging」任务 + 机器可解析 JSON。
         """
         if provenance == "user":
-            return ("P0", True, "normal", "user-sourced structural floor (deterministic)")
+            tier, structural = classify_user(text)
+            if structural:
+                return (tier, True, "normal", "user-sourced short instruction structural floor (<100 chars, deterministic)")
+            return (tier, False, "normal",
+                    "user-sourced long content (group-chat/recall/injected block) -> %s non-structural, evictable under push cap" % tier)
 
         # LLM tiering + scoring（机器可解析 JSON）
         try:
