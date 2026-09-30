@@ -1,6 +1,6 @@
 # supercompress — 实现层（机制模块 + 端点面，@coder own）
 
-> 本段只写**实查过的事实**（@ `ee06945`，`C:\Users\user\supercompress`），非设计期话术。
+> 本段只写**实查过的事实**（@ `ee06945`，Windows 开发机布局——本机路径为历史锚不随发行；代码面路径零硬编码，解析链见 `sc/_bootstrap.py`），非设计期话术。
 > 装配注：本节供 `docs/features.md` 组装直接收录；数据层归 `docs/ops-deployment.md` 上游（@data-engineer 报过的 jsonl 骨干段），两节不混。
 
 ## 四个机制模块

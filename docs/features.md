@@ -1,6 +1,6 @@
 # supercompress — 功能总览（features.md 装配页）
 
-> 可 ship 交付物的单页功能说明。`C:\Users\user\supercompress`。
+> 可 ship 交付物的单页功能说明（本机开发路径为历史锚不随发行；代码面路径零硬编码，解析链见 `sc/_bootstrap.py`）。
 > 本装配页引用 5 个源段（全部 tracked，装配后 worktree 应 clean）：
 >
 > | 源段 | 视角 | owner |

@@ -1,6 +1,6 @@
 # supercompress — 部署 / 运行面（ops 段，@devops own）
 
-> 本段只写**实查过的事实**（@ `76810d3`，`C:\Users\user\supercompress`），设计期话术与成品区分开标注。
+> 本段只写**实查过的事实**（@ `76810d3`，Windows 开发机布局——本机路径为历史锚不随发行；代码面路径零硬编码，解析链见 `sc/_bootstrap.py`），设计期话术与成品区分开标注。
 
 ## 1. 部署足迹（实查口径）
 
@@ -57,9 +57,11 @@ Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢
 - **删除注记跟 commit 走（回滚锚）：** 插件 `plugins/file-memory/` 与 `profiles/` **都不是 git repo**——"删除即落盘、无回滚锚"。唯一可回滚仓是本 supercompress 仓，故 TCM 删除的根因（`pg_` 前缀 pending key 从未对齐 memory id 形制、`upgraded_from` 才是真 provenance 终点）+ 上面 5 模式 grep 门 + cron job 移除，全部写在本注记里，跟物理删 commit 同仓同 commit，删错时靠这条找锚。
 - **build 半（Gold 知识层）canonical 验收 recipe（@devops 双跑裁决，@coder 的 Hermes-venv 写跑不通）：**
   ```
-  cd C:/Users/user/.hermes/plugins/file-memory
-  PYTHONPATH="C:/Users/user/AppData/Local/hermes/hermes-agent;C:/Users/user/.hermes/plugins/file-memory" \
-    /c/Users/user/supercompress/.venv/Scripts/python.exe -m pytest tests/test_gold_knowledge_red.py -v
+  # layout-agnostic 占位（2026-09-30 用户"路径零硬编码"口径改写；
+  # 原为 Windows 开发机布局的历史证明，本机具体盘符路径不随发行）
+  cd <HERMES_DATA_ROOT>/plugins/file-memory
+  PYTHONPATH="<hermes-agent 仓根>;<HERMES_DATA_ROOT>/plugins/file-memory" \
+    <supercompress venv 的 python> -m pytest tests/test_gold_knowledge_red.py -v
   ```
   （双路 PYTHONPATH = hermes-agent 源目录供 `from agent.memory_provider import …` + 插件目录；解释器用真正带 pytest 的那个。全插件套件现 **23/23**（build 半 26 → 删 TCM 半随行去掉 3 条 M6 测试，ref-count 4 + Gold 4 + 存量零回归）。）
 - **ops 前向脆弱性（登记不建）：** 上面 proof 的解释器 = 兄弟工程 `supercompress/.venv`，file-memory 插件自身无 venv；该 `.venv` 一旦被盘清删掉，flag 周期"零调用"证明就无解释器。触发条件 = 切片③ 证明卡在这缺解释器时，才起专用 env / 装 pytest 进插件自身 env，现不预建（无消费者不建）。
