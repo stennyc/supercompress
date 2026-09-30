@@ -542,7 +542,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
                      if home else self._legacy_store_dir)
         target = os.path.join(store_dir, f"{_safe_session_name(session_id)}.jsonl")
         if self._bound_session == session_id and self.store.path == target:
-            return  # 幂等重入：同实例同 session 已绑定
+            return  # 幂等重入：同实例同 session 已绑定。
+            # 注：早退**不**重置 last_prompt_tokens / _force_evict_mode —— 它们是「本进程当前
+            # 会话实态」（update_from_response 每次 LLM 调用后重写），重入 = 活会话继续，
+            # 重置反而把活态打回 0。与 on_session_reset（会话边界，必须清）语义不同。
         old_sid = kwargs.get("old_session_id")
         carry = bool(kwargs.get("carry_over", self.carry_over))
         if old_sid and carry:
@@ -578,6 +581,12 @@ class SupercompressContextEngine(sc_context_engine_base()):
 
         宿主 `/new` 走 on_session_reset（非 on_session_end，base 契约）——不 flush 则 carry_over
         materialize 读到半成品归档。flush 后不改动 store 绑定（宿主随后 on_session_start 重绑）。
+
+        重置集对齐宿主基类 ContextEngine.on_session_reset（agent/context_engine.py:187-205）：
+        last_prompt/completion/total_tokens + compression_count 全 0（0 = "无真实 usage 用粗估"，
+        非 -1 sentinel #36718）；另清 _force_evict_mode（会话级升级态，与 on_session_start 对称——
+        旧 session 末 turn 的 backpressure 强制逐出态不得泄漏进新 session 首 turn）。
+        super() 在测试环境 base=object 时不存在 → hasattr 守卫优雅降级，手动 4 字段仍确定性对齐。
         """
         try:
             self._aux.flush(timeout=5.0)
@@ -587,7 +596,17 @@ class SupercompressContextEngine(sc_context_engine_base()):
             self.store.flush()  # P1/P2 lazy 批落盘（会话边界原子点）
         except StoreError as e:
             logger.error("tcm-supercompress: session-reset flush failed: %s", e)
+        # 基类重置集（若宿主真基类在 MRO 中则委托 super；object 基类则手动 4 字段）
+        try:
+            if hasattr(super(), "on_session_reset"):
+                super().on_session_reset()
+        except Exception:
+            pass
         self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.compression_count = 0
+        self._force_evict_mode = False
         logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:

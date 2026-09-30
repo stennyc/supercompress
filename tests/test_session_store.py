@@ -137,6 +137,31 @@ def test_on_session_start_idempotent_same_instance(tmp_path):
     assert e.store.line_count == 1, "重入不得清空已有段"
 
 
+def test_on_session_reset_flushes_and_resets_session_state(tmp_path):
+    """/new 交接原子点：flush 在途 P1/P2 + 重置实态字段 + 清 _force_evict_mode（reviewer 挂账 #3/#4）。"""
+    e = _mkengine(tmp_path)
+    e.on_session_start("s_r")
+    _append_p1(e, "in-flight P1")  # 进 lazy 批（未 flush）
+    # 模拟旧 session 末 turn 升级态
+    e._force_evict_mode = True
+    e.last_prompt_tokens = 1234
+    e.last_completion_tokens = 56
+    e.compression_count = 2
+
+    e.on_session_reset()
+
+    # P1 已落盘（交接原子点：归档字节完整）
+    assert (tmp_path / "s_r.jsonl").exists()
+    assert e.store.line_count == 1, "reset 后 P1 已 durable 进 store 视图"
+    # 实态字段对齐宿主基类重置集（agent/context_engine.py:187-205）
+    assert e.last_prompt_tokens == 0
+    assert e.last_completion_tokens == 0
+    assert e.last_total_tokens == 0
+    assert e.compression_count == 0
+    # 会话级升级态与 on_session_start 对称清零（不得泄漏进新 session 首 turn）
+    assert e._force_evict_mode is False, "reset 必须清 _force_evict_mode（reviewer 挂账 #4）"
+
+
 def test_hermes_home_profiles_isolated(tmp_path):
     """hermes_home 按 profile 解析 → 不同 profile 各自 store 目录（隔离白捡，同 sid 不撞）。"""
     prof_a = tmp_path / "profiles" / "default"
