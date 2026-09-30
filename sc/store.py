@@ -131,6 +131,8 @@ class JsonlStore:
             segs.append(seg)
             self._record(seg, durable=True)
         self._next_seq = max((s.seq for s in segs), default=-1) + 1
+        # 重放后磁盘态行数 = 已验段数（_line_count 反映 on-disk 事实，非「本次进程 append 数」）
+        self._line_count = len(segs)
         return segs
 
     @staticmethod

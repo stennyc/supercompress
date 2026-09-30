@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import time
 from typing import Any, Dict, List, Optional
@@ -185,6 +186,11 @@ def is_room_skeleton(text: str) -> bool:
     return s.startswith("[Group chat")
 
 
+def _safe_session_name(session_id: str) -> str:
+    """session id → 安全文件名（宿主 sid 形如 20260926_111839_1e31d0；防御非法字符）。"""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", (session_id or "")).strip("_") or "unnamed"
+
+
 class SupercompressContextEngine(sc_context_engine_base()):
     """Hermes ContextEngine 薄壳：全委托 sc 组件，算法零实现。
 
@@ -209,7 +215,17 @@ class SupercompressContextEngine(sc_context_engine_base()):
         store_path = _get("external_store_path", DEFAULT_EXTERNAL_STORE_PATH)
         # 数据面：单一 active.jsonl（@data-engineer 契约：旧 chunk_* store 零携带零触碰，
         # 新 active.jsonl 是独立新文件，同住目录互不干扰）
-        self.store_path = os.path.join(os.path.expanduser(store_path), "active.jsonl")
+        # legacy 目录（独立测试/bench 无 hermes_home 时回退；__init__  eager 建 JsonlStore）
+        self._legacy_store_dir = os.path.expanduser(store_path)
+        self.store_path = os.path.join(self._legacy_store_dir, "active.jsonl")
+
+        # S-Phase 1：per-session 独立 store —— on_session_start 按 host 注入的 hermes_home
+        # rebind 到 <hermes_home>/supercompress_store/<sid>.jsonl（profile 隔离随
+        # HERMES_HOME 按 profile 解析白捡：4 profile 各存各的）；无 hermes_home（独立测试/
+        # bench）回退 legacy 目录。store 目录优先级：hermes_home > legacy。
+        self.session_id: Optional[str] = None
+        self._bound_session: Optional[str] = None   # 幂等哨兵：同实例同 sid 重入 → no-op
+        self.carry_over: bool = _get("carry_over", False)  # 默认关（严格 session 记忆）；轮转确认事件显式 carry_over=True
 
         self.store = JsonlStore(self.store_path)
         self._window: Optional[Window] = None
@@ -510,10 +526,69 @@ class SupercompressContextEngine(sc_context_engine_base()):
     # ── 会话边界 ──
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
-        self.store = JsonlStore(self.store_path)  # 重放磁盘态（active.jsonl 缺失 = 空窗口，正常首启）
+        """S-Phase 1：per-session 独立 store + carry_over 交接。
+
+        宿主 kwargs（agent_init.py:2133）：hermes_home / platform / model / context_length /
+        conversation_id；轮转事件额外带 old_session_id（conversation_compression.py:1700/2551）。
+        - store 目录：hermes_home 存在 → <hermes_home>/supercompress_store（profile 隔离白捡）；
+          缺省（独立测试/bench）→ legacy 目录
+        - session 文件 = <dir>/<sid>.jsonl；同实例同 sid 重入 → 幂等 no-op
+        - old_session_id + carry_over=True（确认轮转事件）→ materialize(old→new, reopen_from=old)
+          （激活 store.py:137 死代码，P1 自动 stale 标记）；无 carry_over 的自动路径 → 默认 OFF
+        - 同 sid 冷重开（新实例、文件已存在）→ replayed P1 中间推理内存标 stale（不动字节）
+        """
+        home = kwargs.get("hermes_home")
+        store_dir = (os.path.join(os.path.expanduser(home), "supercompress_store")
+                     if home else self._legacy_store_dir)
+        target = os.path.join(store_dir, f"{_safe_session_name(session_id)}.jsonl")
+        if self._bound_session == session_id and self.store.path == target:
+            return  # 幂等重入：同实例同 session 已绑定
+        old_sid = kwargs.get("old_session_id")
+        carry = bool(kwargs.get("carry_over", self.carry_over))
+        if old_sid and carry:
+            old_file = os.path.join(store_dir, f"{_safe_session_name(old_sid)}.jsonl")
+            if os.path.exists(old_file):
+                self.store = JsonlStore.materialize(old_file, target, reopen_from=old_sid)
+                logger.info("tcm-supercompress: carry_over handoff %s -> %s (%d segs)",
+                            old_sid, session_id, self.store.line_count)
+            else:
+                self.store = JsonlStore(target)
+                logger.warning("tcm-supercompress: carry_over requested but archive for %s not found (%s)",
+                               old_sid, old_file)
+        else:
+            existed = os.path.exists(target) and os.path.getsize(target) > 0
+            self.store = JsonlStore(target)
+            if existed:
+                # 同 session 冷重开（进程重启）：replayed P1 中间推理内存标 stale（文件字节不动）
+                for seg in self.store.by_hash.values():
+                    if seg.tier == "P1":
+                        seg.stale = True
+                logger.info("tcm-supercompress: session %s reopened, %d segs replayed (P1 stale-marked)",
+                            session_id, self.store.line_count)
+            else:
+                logger.info("tcm-supercompress: session %s start (fresh), store=%s", session_id, target)
+        # 新 session 窗口重置：force_evict 是会话级升级态，fresh 窗口不应继承
+        self._force_evict_mode = False
         self.last_prompt_tokens = 0
-        logger.info("tcm-supercompress: session %s start, store replayed %d segments",
-                    session_id, self.store.line_count)
+        self.session_id = session_id
+        self._bound_session = session_id
+
+    def on_session_reset(self) -> None:
+        """/new / /reset：flush 在途 P1/P2 使当前 session 归档字节完整（carry-over 交接原子点）。
+
+        宿主 `/new` 走 on_session_reset（非 on_session_end，base 契约）——不 flush 则 carry_over
+        materialize 读到半成品归档。flush 后不改动 store 绑定（宿主随后 on_session_start 重绑）。
+        """
+        try:
+            self._aux.flush(timeout=5.0)
+        except Exception:
+            pass
+        try:
+            self.store.flush()  # P1/P2 lazy 批落盘（会话边界原子点）
+        except StoreError as e:
+            logger.error("tcm-supercompress: session-reset flush failed: %s", e)
+        self.last_prompt_tokens = 0
+        logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         # 会话边界：先汇合异步 digest worker（在途段尽量 ready，缩短会话收尾等待），
