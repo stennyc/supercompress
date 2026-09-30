@@ -18,6 +18,7 @@ from .store import JsonlStore, StoreError
 from .budgets import usable_tokens, pull_budget, push_cap
 from .aux_provider import AuxProvider, marker_enabled
 from .distill import Window, WindowSeg, Distiller, DistillResult, Anchor
+from .inject import choose_forms, render_block, block_tokens
 from .live_endpoint import LiveEndpoint, resolve_live_endpoint
 
 __all__ = [
@@ -26,5 +27,6 @@ __all__ = [
     "usable_tokens", "pull_budget", "push_cap",
     "AuxProvider", "marker_enabled",
     "Window", "WindowSeg", "Distiller", "DistillResult", "Anchor",
+    "choose_forms", "render_block", "block_tokens",
     "LiveEndpoint", "resolve_live_endpoint",
 ]

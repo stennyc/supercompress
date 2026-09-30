@@ -15,14 +15,52 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import queue
+import re
 import threading
 import time
 
 import scdata
 
 from .schema import Segment
+
+# digest 提示词（S2a/修 S5：之前 LLM 响应正文被丢弃、digest_text 只填 head80 占位——
+# 同一处 LLM 调用、零新增调用次数，现在捕获正文并结构化解析出 key_fact/summary）。
+DIGEST_INSTRUCTION = (
+    "Compress the conversation segment below into strict JSON (no code fence, no extra text):\n"
+    '{"key_fact": "<=60 chars: the single most important fact/decision", '
+    '"summary": "<=200 chars: 2-4 sentence digest"}\n'
+    "--- segment ---\n"
+)
+
+
+def parse_digest_response(text: str | None) -> tuple[str, str]:
+    """digest LLM 响应 → (key_fact, summary)。容忍裸 JSON / code fence / 纯文本 / None；
+    空响应 → ("", "")（调用方回退 head 摘录占位，bench 空响应不变量保持）。"""
+    if not text or not str(text).strip():
+        return "", ""
+    t = str(text).strip()
+    candidates = [t]
+    m = re.search(r"```(?:json)?\s*(.*?)```", t, re.DOTALL)
+    if m:
+        candidates.insert(0, m.group(1).strip())
+    m = re.search(r"\{.*\}", t, re.DOTALL)
+    if m:
+        candidates.append(m.group(0))
+    for c in candidates:
+        try:
+            d = json.loads(c)
+        except Exception:
+            continue
+        if isinstance(d, dict):
+            kf = str(d.get("key_fact", "")).strip()
+            sm = str(d.get("summary", "")).strip()
+            if kf or sm:
+                return kf, sm
+    # 纯文本回退：整体当 summary，key_fact 取头部（仍远优于无）
+    return t[:60], t[:400]
 
 # digest 全局并发帽（跨会话同端点去抖，第 2 层）：模块级 BoundedSemaphore，
 # 同进程内多会话的 digest 调用共享上限（默认 2；SC_DIGEST_CONCURRENCY 进程级覆盖）。
@@ -174,7 +212,8 @@ class AuxProvider:
         try:
             self.digest_sem.acquire()
             try:
-                self.main_endpoint.call(self.COMPRESSION_TASK, seg.original_text[:4096])
+                response = self.main_endpoint.call(
+                    self.COMPRESSION_TASK, DIGEST_INSTRUCTION + seg.original_text[:4096])
             finally:
                 self.digest_sem.release()
         except Exception:
@@ -189,8 +228,13 @@ class AuxProvider:
             refid = scdata.sha256_nfc("digest|" + "/".join(key))[:16]
             self._digest_cache[key] = refid
         seg.digest_ref = "ready:%s" % refid
-        if not seg.digest_text:
-            seg.digest_text = seg.original_text[:80]   # head 摘录（marker 态占位小）
+        # S2a/修 S5：捕获 LLM 正文并解析 key_fact/summary（零新增调用点——之前正文被丢弃、
+        # digest_text 只填 head80 占位）。空响应 / 无法解析 → 回退 head80 占位（bench 空响应
+        # 不变量保持）；transient（call 抛异常）走上方 except，digest_text 保持 ""（[no digest]
+        # marker 路径，与本路径分离）。
+        key_fact, summary = parse_digest_response(response)
+        seg.key_fact = key_fact
+        seg.digest_text = summary or seg.original_text[:80]
         out = {"digest_ref_id": refid, "content_hash": seg.content_hash}
         self._results[seg.segment_id] = out
         return out

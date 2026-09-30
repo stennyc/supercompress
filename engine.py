@@ -47,6 +47,7 @@ from sc import (
     est_tokens,
     nfc_hash,
 )
+from sc.inject import choose_forms, render_block, block_tokens
 from sc.recall import Recaller
 from sc.tagger import Tagger
 
@@ -506,20 +507,30 @@ class SupercompressContextEngine(sc_context_engine_base()):
         except StoreError as e:
             logger.error("tcm-supercompress: compress degraded (store error): %s", e)
             return messages  # fail-open：压缩失败 ≠ turn 失败
-        kept_texts = [ws.segment.original_text for ws in window.segs
-                      if ws.segment.tier in ("P0", "P1")]
+        # S-Phase 2（决定 B）：阶梯注入取代全文拼接——预算驱动选档（L3/L2/L1/L0），
+        # 总帽 = pull_budget(20% usable)：索引档 2K + 细节档余量；structural P0 豁免
+        # （活账本永不裁）；超预算逐档降级，细节不丢（原文 O(1) 点查）。壳只调 sc.inject，
+        # 零算法体（壳薄度门禁不变）。
+        kept = [ws for ws in window.segs if ws.segment.tier in ("P0", "P1")]
         # Egress 过滤（同 select_context）：已存 group-skeleton P0 段逐出压缩
         # anchor-manifest 注入面——否则压缩时群聊骨架仍驻留进 durable 段块。
-        _skel_c = [t for t in kept_texts if is_room_skeleton(t)]
-        if _skel_c:
+        _skel = [ws for ws in kept if is_room_skeleton(ws.segment.original_text)]
+        if _skel:
             logger.info("tcm-supercompress: compress egress cut %d room-skeleton segment(s) "
-                        "from anchor manifest", len(_skel_c))
-        kept_texts = [t for t in kept_texts if not is_room_skeleton(t)]
+                        "from anchor manifest", len(_skel))
+        kept = [ws for ws in kept if not is_room_skeleton(ws.segment.original_text)]
+        rendered = choose_forms(kept, window, query=focus_topic or "")
+        block = render_block(rendered)
+        _forms: Dict[str, int] = {}
+        for _ws, _ff, _tx in rendered:
+            _forms[_ff] = _forms.get(_ff, 0) + 1
         out: List[Dict[str, Any]] = list(messages[:self.protect_first_n])
-        if kept_texts:
+        if block:
             out.append({"role": "system",
-                        "content": "[supercompress] durable P0/P1 segments (anchor manifest):\n"
-                                   + "\n---\n".join(kept_texts)})
+                        "content": f"[supercompress] staged P0/P1 segments "
+                                    f"({len(rendered)} segs, {block_tokens(rendered)} tok, "
+                                    f"forms: {dict(sorted(_forms.items()))}):\n"
+                                    + block})
         out.extend(messages[-self.protect_last_n:] if messages else [])
         return out
 

@@ -56,6 +56,7 @@ class Segment:
     reopened_from: str | None = None  # 跨期重开物化来源（归档 id）；None = 原 session
     stale: bool = False             # 隔期重开的 P1 中间推理：降召回优先级，行动前 verify
     digest_text: str = ""           # 运行期：digest 生成后的摘要文本（不落盘，三元组可再生）
+    key_fact: str = ""             # 运行期：digest 解析出的单点最重要事实（不落盘，同 digest_text）
     # ── ledger 字段（kind=ledger 时启用）──
     goal: str | None = None         # 顶层目标：仅 user-sourced，永久 pin
     phase_id: str | None = None
