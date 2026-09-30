@@ -16,7 +16,8 @@ tier/structural_p0，使 A1 上线即生效。
 - 原子写：先写 .tmp 再 rename；写前自动备份 .bak_<ts>；
 - 行数守恒：输出行数 == 输入行数（只改字段，不增删行）。
 
-CLI: python3 retag.py [active.jsonl 路径]   （缺省 ~/.hermes/supercompress_store/active.jsonl）
+CLI: python3 retag.py [active.jsonl 路径]
+（缺省 = HERMES_HOME-aware：$HERMES_HOME/supercompress_store/active.jsonl，无 env 时 ~/.hermes/...）
 """
 from __future__ import annotations
 
@@ -28,7 +29,16 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sc.tagger import classify_user  # 单一实现源（与 A1 共用，不另造规则）
 
-DEFAULT_PATH = os.path.expanduser("~/.hermes/supercompress_store/active.jsonl")
+
+def _default_store_path() -> str:
+    """缺省 store 路径（安装可移植）：HERMES_HOME env 优先（per-profile 数据根），
+    缺省回退 ~/.hermes——与 engine._default_store_root / sc._bootstrap 同源语义。"""
+    hh = os.environ.get("HERMES_HOME", "").strip()
+    base = hh if hh else os.path.expanduser("~/.hermes")
+    return os.path.join(base, "supercompress_store", "active.jsonl")
+
+
+DEFAULT_PATH = _default_store_path()
 
 
 def retag_file(path: str, backup: bool = True) -> dict:

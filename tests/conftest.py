@@ -7,6 +7,14 @@ from sc.aux_provider import AuxProvider
 from sc.store import JsonlStore
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_hermes_home(monkeypatch):
+    """测试 hermetic：清 HERMES_HOME env，保证 engine 默认路径回退（~/.hermes）与
+    runner 所在 Hermes 会话的 env 解耦——env 驱动路径解析有专属测试
+    （test_session_store.TestStoreRoot_EnvAware）单独封住，此处保持零 env 依赖。"""
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+
 @pytest.fixture
 def store(tmp_path):
     return JsonlStore(str(tmp_path / "s.jsonl"))

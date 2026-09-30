@@ -7,12 +7,21 @@ patch_supercompress_aux.py - 为 supercompress 配置 aux 端点
 
 用法:
     python3 patch_supercompress_aux.py
+
+路径零硬编码：CONFIG_PATH 走 HERMES_HOME（sc/_bootstrap），setup 脚本落 HERMES_HOME 下。
 """
 import os
 import re
 from pathlib import Path
 
-CONFIG_PATH = Path('/root/.hermes/profiles/orchestrator/config.yaml')
+import sys
+_PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])   # supercompress/
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
+
+from sc._bootstrap import config_path, setup_script_path
+
+CONFIG_PATH = Path(config_path())
 
 def get_hermes_model_config():
     """从 config.yaml 读取当前模型配置"""
@@ -112,12 +121,12 @@ def main():
     print(f'export LIVE_ENDPOINT_KEY="{api_key}"')
     print(f'export LIVE_ENDPOINT_MODEL="{model_cfg.get("model")}"')
     
+    # 创建环境变量设置脚本（落 HERMES_HOME 下，不写死 profile 名）
     print("\n=== 验证命令 ===")
-    print("source /root/.hermes/profiles/orchestrator/setup_supercompress_aux.sh")
-    print("python3 /usr/local/lib/hermes-agent/plugins/context_engine/supercompress/sc/retag.py")
+    print(f"source {setup_script_path()}")
+    print(f"python3 {os.path.join(_PLUGIN_ROOT, 'sc', 'retag.py')}")
     
-    # 创建环境变量设置脚本
-    setup_script = Path('/root/.hermes/profiles/orchestrator/setup_supercompress_aux.sh')
+    setup_script = Path(setup_script_path())
     with open(setup_script, 'w') as f:
         f.write(f'''#!/bin/bash
 # Supercompress aux endpoint setup

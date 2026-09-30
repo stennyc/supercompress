@@ -2,14 +2,18 @@
 """
 临时 patch：为当前测试会话设置 aux 端点环境变量
 
-用法：
-    source /root/.hermes/profiles/orchestrator/setup_supercompress_aux.sh
-    python3 /usr/local/lib/hermes-agent/plugins/context_engine/supercompress/sc/patch_aux_endpoint.py
+用法（路径自动推导，无安装目录硬编码）：
+    source <HERMES_HOME>/setup_supercompress_aux.sh
+    python3 <...>/plugins/context_engine/supercompress/sc/patch_aux_endpoint.py
 """
 import os
 import sys
+from pathlib import Path
 
-sys.path.insert(0, '/usr/local/lib/hermes-agent')
+# 安装可移植路径引导（零硬编码）：从 __file__ 反推插件根（sc.* 可导）。
+_PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])   # supercompress/
+if _PLUGIN_ROOT not in sys.path:
+    sys.path.insert(0, _PLUGIN_ROOT)
 
 # 检查环境变量
 print("=== 检查环境变量 ===")

@@ -6,17 +6,26 @@ Supercompress 健康检查与修复助手
 1. 检查当前配置状态
 2. 注入 aux 端点环境变量（复用 Hermes 当前模型）
 3. 运行 retag 重新生成 digest
+
+路径零硬编码：config/store 走 HERMES_HOME（sc/_bootstrap），安装根从 __file__ 推导。
 """
 import os
 import sys
 import subprocess
 from pathlib import Path
 
-sys.path.insert(0, '/usr/local/lib/hermes-agent')
+# 安装可移植路径引导（零硬编码）：从 __file__ 反推插件根（sc.* / engine 可导）。
+_PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])   # supercompress/
+_INSTALL_ROOT = str(Path(__file__).resolve().parents[4])  # hermes-agent 仓根
+for _p in (_PLUGIN_ROOT, _INSTALL_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
-# Hermes 配置文件路径
-CONFIG_PATH = Path('/root/.hermes/profiles/orchestrator/config.yaml')
-STORE_PATH = '/root/.hermes/supercompress_store/active.jsonl'
+from sc._bootstrap import config_path, active_store_path
+
+# Hermes 配置文件路径（HERMES_HOME-aware，不写死某 profile / 某 home）
+CONFIG_PATH = Path(config_path())
+STORE_PATH = active_store_path()
 
 def check_config():
     """检查配置状态"""

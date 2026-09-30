@@ -14,8 +14,16 @@ import sys
 import json
 from pathlib import Path
 
-sys.path.insert(0, '/usr/local/lib/hermes-agent')
+# 安装可移植路径引导（零硬编码）：从 __file__ 反推插件根（sc.* 可导）与仓根
+# （plugins.context_engine.* 可导），换任何安装目录/任何用户都成立。
+import os
+_PLUGIN_ROOT = str(Path(__file__).resolve().parents[1])   # supercompress/
+_INSTALL_ROOT = str(Path(__file__).resolve().parents[4])  # hermes-agent 仓根
+for _p in (_PLUGIN_ROOT, _INSTALL_ROOT):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
+from sc._bootstrap import active_store_path
 from plugins.context_engine.supercompress.engine import SupercompressContextEngine
 from sc.store import JsonlStore
 from sc.schema import Segment
@@ -105,5 +113,5 @@ if __name__ == '__main__':
     parser.add_argument('--max', type=int, default=0, help='Max segments to process (0=all)')
     args = parser.parse_args()
     
-    store_path = '/root/.hermes/supercompress_store/active.jsonl'
+    store_path = active_store_path()
     retag_segments(store_path, dry_run=False, max_segments=args.max)

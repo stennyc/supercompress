@@ -1,6 +1,7 @@
 """Hermes host adapter shell — 薄接线层（PM 路①定稿：壳只做接线，零新业务逻辑）。
 
-宿主契约（远端 117 `/usr/local/lib/hermes-agent` 实码核清，@coder 117 直查 2026-09-27）：
+宿主契约（hermes-agent 宿主仓实码核清，@coder 直查 2026-09-27；宿主仓位置因安装而异，
+本插件不引用宿主仓绝对路径——安装根从 __file__ 反推，数据根走 HERMES_HOME env）：
 - loader: plugins/plugin_loader.py `load_plugin_module` → `instance_from_module`
   （`mod.register(collector)` 优先，collector._EngineCollector `register_context_engine(engine)` 收实例；
   register 失败则回退扫描模块属性找 ContextEngine 子类无参构造）。`probe_availability` 调
@@ -23,6 +24,7 @@ import os
 import re
 import sys
 import time
+import hashlib
 from typing import Any, Dict, List, Optional
 
 # ── 宿主路径引导（壳的唯一环境接线，非业务逻辑）──────────────────────────
@@ -68,8 +70,22 @@ DEFAULT_COMPACT_RATIO = 0.5
 DEFAULT_FORCE_COMPACT_RATIO = 0.75
 DEFAULT_MAX_TAIL_TURNS = 15
 DEFAULT_MAX_TAIL_TOKENS = 32000
-DEFAULT_EXTERNAL_STORE_PATH = "~/.hermes/supercompress_store"
 DISTILL_WATER_FRAC = 0.8  # sc.distill 软水位（组件内部定义；壳不重算算法）
+
+
+def _default_store_root() -> str:
+    """默认 store 根（安装可移植，零宿主改动）：HERMES_HOME-aware 解析。
+
+    优先级：显式 ``external_store_path`` 配置（__init__ 消费）> ``HERMES_HOME`` env
+    （生产 gateway 进程 per-profile 自带，指向 profile 数据根）> ``~/.hermes``（平台默认）。
+    生产轮转 rebind 缺 ``hermes_home`` kwarg 时，env 回退即落对 profile 目录
+    （reviewer S1 Major#1 效果达成，宿主 conversation_compression.py 零改动）；
+    任意安装环境设 ``HERMES_HOME`` 指数据根即可，无 /root、/usr/local 写死。
+    与 sc/_bootstrap.hermes_home() 同源语义（同一 env 名，不 import 宿主）。
+    """
+    hh = os.environ.get("HERMES_HOME", "").strip()
+    base = hh if hh else os.path.expanduser("~/.hermes")
+    return os.path.join(base, "supercompress_store")
 
 
 def sc_context_engine_base():
@@ -188,8 +204,17 @@ def is_room_skeleton(text: str) -> bool:
 
 
 def _safe_session_name(session_id: str) -> str:
-    """session id → 安全文件名（宿主 sid 形如 20260926_111839_1e31d0；防御非法字符）。"""
-    return re.sub(r"[^A-Za-z0-9._-]", "_", (session_id or "")).strip("_") or "unnamed"
+    """session id → 安全文件名（宿主 sid 形如 20260926_111839_1e31d0；防御非法字符）。
+
+    P0.7（Nit#3 碰撞加固）：净化改变原串（含非法字符或边界 _）→ 追加原串短 hash
+    后缀，不同原始 sid（`a/b` vs `a_b`）不再共写一文件；宿主生成器的干净 sid
+    （时间戳+hex）identity 通过 → 零行为变化（既有测试/生产落点不变）。
+    """
+    raw = session_id or ""
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", raw).strip("_") or "unnamed"
+    if base != raw:
+        base = f"{base[:64]}.{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:10]}"
+    return base
 
 
 class SupercompressContextEngine(sc_context_engine_base()):
@@ -213,10 +238,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.force_compact_ratio: float = _get("force_compact_ratio", DEFAULT_FORCE_COMPACT_RATIO)
         self.max_tail_turns: int = _get("max_tail_turns", DEFAULT_MAX_TAIL_TURNS)
         self.max_tail_tokens: int = _get("max_tail_tokens", DEFAULT_MAX_TAIL_TOKENS)
-        store_path = _get("external_store_path", DEFAULT_EXTERNAL_STORE_PATH)
+        store_path = _get("external_store_path", _default_store_root())
         # 数据面：单一 active.jsonl（@data-engineer 契约：旧 chunk_* store 零携带零触碰，
         # 新 active.jsonl 是独立新文件，同住目录互不干扰）
-        # legacy 目录（独立测试/bench 无 hermes_home 时回退；__init__  eager 建 JsonlStore）
+        # legacy 目录（独立测试/bench 无 hermes_home kwarg 时回退；__init__ eager 建 JsonlStore）
+        # 安装可移植（零宿主改动方案）：默认根 HERMES_HOME-aware——生产 gateway 进程自带
+        # HERMES_HOME（per-profile 数据根），轮转 rebind 缺 kwarg 时 env 回退即落对 profile
+        # 目录（Major#1 效果达成，宿主 conversation_compression.py 零改动）；任意安装环境
+        # 设 HERMES_HOME 指数据根即可，无 /root、/usr/local 写死。
         self._legacy_store_dir = os.path.expanduser(store_path)
         self.store_path = os.path.join(self._legacy_store_dir, "active.jsonl")
 
@@ -226,7 +255,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # bench）回退 legacy 目录。store 目录优先级：hermes_home > legacy。
         self.session_id: Optional[str] = None
         self._bound_session: Optional[str] = None   # 幂等哨兵：同实例同 sid 重入 → no-op
-        self.carry_over: bool = _get("carry_over", False)  # 默认关（严格 session 记忆）；轮转确认事件显式 carry_over=True
+        # P0.2 双轨收敛：carry_over 单轨 = 宿主现成信号 `carry_over_context`
+        # （run_agent.py:402 经 on_session_start 下发；确认轮转事件才 True）——删插件自造
+        # `carry_over` 配置键（reviewer S1 Minor#2）：严格 session 记忆默认关，事件驱动。
 
         self.store = JsonlStore(self.store_path)
         self._window: Optional[Window] = None
@@ -538,15 +569,16 @@ class SupercompressContextEngine(sc_context_engine_base()):
     # ── 会话边界 ──
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
-        """S-Phase 1：per-session 独立 store + carry_over 交接。
+        """S-Phase 1：per-session 独立 store + carry_over 交接（P0.2 宿主单轨）。
 
         宿主 kwargs（agent_init.py:2133）：hermes_home / platform / model / context_length /
-        conversation_id；轮转事件额外带 old_session_id（conversation_compression.py:1700/2551）。
+        conversation_id；轮转事件额外带 old_session_id（conversation_compression.py:1703/2556）。
         - store 目录：hermes_home 存在 → <hermes_home>/supercompress_store（profile 隔离白捡）；
           缺省（独立测试/bench）→ legacy 目录
         - session 文件 = <dir>/<sid>.jsonl；同实例同 sid 重入 → 幂等 no-op
-        - old_session_id + carry_over=True（确认轮转事件）→ materialize(old→new, reopen_from=old)
-          （激活 store.py:137 死代码，P1 自动 stale 标记）；无 carry_over 的自动路径 → 默认 OFF
+        - old_session_id + carry_over_context=True（宿主确认轮转信号，run_agent.py:402）
+          → materialize(old→new, reopen_from=old)（激活 store.py:137 死代码，P1 自动 stale 标记）；
+          无 carry_over_context 的自动路径 → 默认 OFF（旧插件 kwarg `carry_over` 仅兼容别名）
         - 同 sid 冷重开（新实例、文件已存在）→ replayed P1 中间推理内存标 stale（不动字节）
         """
         home = kwargs.get("hermes_home")
@@ -559,7 +591,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 会话实态」（update_from_response 每次 LLM 调用后重写），重入 = 活会话继续，
             # 重置反而把活态打回 0。与 on_session_reset（会话边界，必须清）语义不同。
         old_sid = kwargs.get("old_session_id")
-        carry = bool(kwargs.get("carry_over", self.carry_over))
+        # P0.2：单轨读宿主信号 `carry_over_context`（run_agent.py:402 下发）；
+        # 旧插件 kwarg `carry_over` 留作兼容别名（既有测试/直调面），二者取或。
+        carry = bool(kwargs.get("carry_over_context") or kwargs.get("carry_over", False))
         if old_sid and carry:
             old_file = os.path.join(store_dir, f"{_safe_session_name(old_sid)}.jsonl")
             if os.path.exists(old_file):

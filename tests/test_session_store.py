@@ -162,6 +162,48 @@ def test_on_session_reset_flushes_and_resets_session_state(tmp_path):
     assert e._force_evict_mode is False, "reset 必须清 _force_evict_mode（reviewer 挂账 #4）"
 
 
+def test_carry_over_via_host_signal(tmp_path):
+    """P0.2 单轨：宿主现成信号 carry_over_context=True（run_agent.py:402 下发）→ materialize 交接。
+
+    证明单轨事实源 = 宿主信号（非插件自造配置键）：仅传 carry_over_context、不传旧 kwarg。"""
+    e = _mkengine(tmp_path)
+    e.on_session_start("s_old")
+    _append_user(e, "goal: v1 上线, 宿主信号 carry")
+    p1 = _append_p1(e, "P1 中间推理")
+    e.on_session_reset()
+    old_lines = (tmp_path / "s_old.jsonl").read_text(encoding="utf-8")
+
+    # 宿主 lifecycle 面：carry_over_context（不传旧 carry_over kwarg）
+    e.on_session_start("s_new", old_session_id="s_old", carry_over_context=True)
+    new_lines = (tmp_path / "s_new.jsonl").read_text(encoding="utf-8")
+    assert new_lines.strip() == old_lines.strip(), "宿主信号 carry_over_context 必须物化 old→new"
+    p1_replayed = e.store.get(p1.segment_id)
+    assert p1_replayed is not None, "carry 后旧 P1 应在新 store 中可查"
+    assert p1_replayed.stale is True and p1_replayed.reopened_from == "s_old"
+
+
+def test_no_carry_without_host_signal(tmp_path):
+    """P0.2 默认关：无 carry_over_context 且无旧 kwarg → 自动路径 OFF（严格 session 记忆）。"""
+    e = _mkengine(tmp_path)
+    e.on_session_start("s_old")
+    _append_user(e, "auto path marker")
+    old_bytes = (tmp_path / "s_old.jsonl").read_text(encoding="utf-8")
+    e.on_session_start("s_new", old_session_id="s_old")  # 无任何 carry 信号
+    assert e.store.line_count == 0, "无宿主信号 → 默认 OFF，new 不携带 old"
+    assert (tmp_path / "s_old.jsonl").read_text(encoding="utf-8") == old_bytes
+
+
+def test_safe_session_name_collision_hardening(tmp_path):
+    """P0.7：净化同名 sid（a/b vs a_b）加短 hash 后缀消解；干净 sid 零行为变化。"""
+    from engine import _safe_session_name
+    assert _safe_session_name("20260926_111839_1e31d0") == "20260926_111839_1e31d0", "干净 sid 不变"
+    assert _safe_session_name("s_new") == "s_new", "纯 sid 零行为变化（无后缀）"
+    a, b = _safe_session_name("a/b"), _safe_session_name("a_b")
+    assert b == "a_b", "纯 sid 不加后缀"
+    assert a != b, "净化同名 sid 必须消解碰撞（a/b 与 a_b 不得共写一文件）"
+    assert a.startswith("a_b.") and len(a.rsplit(".", 1)[-1]) == 10, "含非法字符 sid 带 10 位短 hash 后缀"
+
+
 def test_hermes_home_profiles_isolated(tmp_path):
     """hermes_home 按 profile 解析 → 不同 profile 各自 store 目录（隔离白捡，同 sid 不撞）。"""
     prof_a = tmp_path / "profiles" / "default"
@@ -185,3 +227,64 @@ def test_hermes_home_profiles_isolated(tmp_path):
     b_text = " ".join(s.original_text for s in e_b.store.by_hash.values())
     assert "DEFAULT-only" in a_text and "DEFAULT-only" not in b_text
     assert "CODER-only" in b_text and "CODER-only" not in a_text
+
+
+# ───────────────────────── 安装可移植：store 根 HERMES_HOME-aware（零宿主改动 Major#1 替代面）────────────────────────
+
+class TestStoreRoot_EnvAware:
+    """宿主侧零改动方案：store 根解析链 = 显式 external_store_path > HERMES_HOME env > ~/.hermes。
+
+    生产 gateway 进程 per-profile 自带 HERMES_HOME → 轮转 rebind 缺 hermes_home kwarg
+    时 env 回退落对 profile 目录（Major#1 效果达成，宿主文件零改动）。conftest autouse
+    fixture 已清 HERMES_HOME，此处 monkeypatch 显式设 env 验证 env 分支。"""
+
+    def test_default_store_root_env_wins(self, monkeypatch):
+        from engine import _default_store_root
+        monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/coder")
+        assert _default_store_root() == "/opt/hermes/profiles/coder/supercompress_store"
+
+    def test_default_store_root_env_absent_falls_back_home(self, monkeypatch, tmp_path):
+        """env 缺省 → ~/.hermes 平台默认（conftest 已 delenv）：无 /root 写死。"""
+        from engine import _default_store_root
+        monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
+        monkeypatch.setenv("HERMES_HOME", "")  # 空串视同未设
+        assert _default_store_root() == str(tmp_path / "fakehome" / ".hermes" / "supercompress_store")
+
+    def test_engine_no_kwargs_resolves_env_root(self, monkeypatch):
+        """无 external_store_path 配置 + 无 hermes_home kwarg → env 回退（生产轮转 Major#1 场景）。"""
+        from engine import SupercompressContextEngine
+        monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/orchestrator")
+        e = SupercompressContextEngine()
+        assert e._legacy_store_dir == "/opt/hermes/profiles/orchestrator/supercompress_store"
+        assert e.store_path == "/opt/hermes/profiles/orchestrator/supercompress_store/active.jsonl"
+
+    def test_session_start_without_kwarg_uses_env_dir(self, monkeypatch, tmp_path):
+        """轮转 rebind 缺 hermes_home kwarg → 经 env 回退落 <HERMES_HOME>/supercompress_store/<sid>.jsonl。"""
+        from engine import SupercompressContextEngine
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "data"))
+        e = SupercompressContextEngine()
+        e.on_session_start("s_rot")  # 无 hermes_home kwarg（宿主轮转面现状）
+        assert e.store.path == str(tmp_path / "data" / "supercompress_store" / "s_rot.jsonl")
+        _append_user(e, "rotation marker")
+        assert (tmp_path / "data" / "supercompress_store" / "s_rot.jsonl").exists()
+
+    def test_explicit_config_beats_env(self, monkeypatch, tmp_path):
+        """显式 external_store_path 配置最高优先（测试隔离面不被 env 污染）。"""
+        from engine import SupercompressContextEngine
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "env_root"))
+        e = SupercompressContextEngine(external_store_path=str(tmp_path / "explicit"))
+        assert e._legacy_store_dir == str(tmp_path / "explicit")
+        assert e.store.path == str(tmp_path / "explicit" / "active.jsonl")
+
+    def test_bootstrap_module_paths_env_driven(self, monkeypatch, tmp_path):
+        """sc/_bootstrap 单一事实源：config/store/setup 全部 env 驱动，零 /root、零 profile 名。"""
+        from sc import _bootstrap
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        assert _bootstrap.hermes_home() == str(tmp_path)
+        assert _bootstrap.config_path() == str(tmp_path / "config.yaml")
+        assert _bootstrap.store_dir() == str(tmp_path / "supercompress_store")
+        assert _bootstrap.active_store_path() == str(tmp_path / "supercompress_store" / "active.jsonl")
+        assert _bootstrap.setup_script_path() == str(tmp_path / "setup_supercompress_aux.sh")
+        # 安装根从 __file__ 推导（非 /usr/local 写死）：任何位置装都解析出自己的仓根
+        root = Path(_bootstrap.INSTALL_ROOT)
+        assert (root / "plugins" / "context_engine" / "supercompress" / "sc" / "_bootstrap.py").exists()
