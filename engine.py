@@ -529,7 +529,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 seg.session_topic = str(self._drift.current_epoch)
                 self.store.append(seg)
             self._aux.end_turn()
-            result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode).run()
+            # R3：force_ratio 接 engine 同源配置 force_compact_ratio（kwarg = 接线非算法）
+            result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode,
+                               force_ratio=self.force_compact_ratio).run()
             if result.status not in ("ok", "backpressure"):
                 logger.warning("tcm-supercompress: distill status=%s events=%s",
                                result.status, result.events)
@@ -630,13 +632,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     logger.warning("tcm-supercompress: overflow %d tokens > 50%% push_cap %d, "
                                    "enabling force_evict_mode", overflow, push_cap)
                     self._force_evict_mode = True
-            # 执行 distill
-            result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode).run()
+            # 执行 distill（R3：force_ratio 接同源配置 force_compact_ratio）
+            result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode,
+                               force_ratio=self.force_compact_ratio).run()
             # 如果 normal distill 失败（transient_skip）且未启用 force_evict，自动降级
             if result.status == "backpressure" and not self._force_evict_mode:
                 logger.warning("tcm-supercompress: distill backpressure, trying force_evict")
                 self._force_evict_mode = True
-                result = Distiller(window, self.store, self._aux, force_evict=True).run()
+                result = Distiller(window, self.store, self._aux, force_evict=True,
+                                   force_ratio=self.force_compact_ratio).run()
                 logger.info("tcm-supercompress: force_evict result status=%s events=%s",
                             result.status, result.events)
             if result.status not in ("ok", "backpressure"):

@@ -89,12 +89,13 @@ class Distiller:
     """纯蒸馏器 + 锚点发射器：不持有状态、不取数、不直接写 jsonl（记忆层管存）。"""
 
     def __init__(self, window: Window, store, aux, inject_fault_after: str | None = None,
-                 force_evict: bool = False) -> None:
+                 force_evict: bool = False, force_ratio: float = 0.75) -> None:
         self.window = window
         self.store = store
         self.aux = aux
         self.inject_fault_after = inject_fault_after
         self.force_evict = force_evict
+        self.force_ratio = force_ratio    # R3 逃生门压力线（默认 0.75 = engine force_compact_ratio 同源）
         self.push_cap_tokens = push_cap(window)   # Push cap 读共享分母（一处定义）
         self.events: list[str] = []
 
@@ -137,7 +138,16 @@ class Distiller:
         if aux.transient and not self.force_evict:
             self.events.append("transient_skip")
             store.kpi_log.append({"regime": "transient_fail"})
-            result.status = "backpressure" if w.used_tokens > cap else "ok"
+            over_cap = w.used_tokens > cap   # 逃生门逐出前的压力快照（status 口径不变）
+            if self._p0_pending_escape_allowed(w):
+                # R3 逃生门（pending 兜底）：端点瞬态 + 存在 pending 非结构 P0 + 窗口超
+                # force_ratio 压力 → P0-only head80 占位摘要逐出（P1/P2 停止逐出语义保留、
+                # 结构 P0 仍永不逐出）——宁可占位摘要落地，不让窗口无限 over-store。
+                # status/KPI 保持保守 transient 口径（引擎侧 force_evict 兜底接更强逐出，
+                # pending digest 经幂等三元组下事件再生）；双事件留痕（观测面 grep）。
+                self.events.append("p0_pending_escape")
+                self._evict_until(w, water, aux, result, tiers=("P0",))
+            result.status = "backpressure" if over_cap else "ok"
             result.kept_p0_ids = self._kept_p0_ids(w)
             return result
 
@@ -209,15 +219,29 @@ class Distiller:
                         continue                    # turn 内 digest 未 ready → P0 不可逐出（gate）
                     aux.ensure_digest(seg)          # 出 turn 即时生成
                     if not seg.digest_ready:
-                        continue                    # 生成失败（transient）→ P0 不可逐出
+                        # R3 pending 兜底（逃生门）：端点持续劣化 + digest 全 pending 且窗口
+                        # 超 force_ratio 压力（默认 0.75）→ 允许 head80 占位摘要兜底逐出
+                        # （digest_text 预填原文头部 80 字符——比 "[no digest]" marker 多保留
+                        # P0 事实头部；token 成本 20 tok 封顶）——宁可占位摘要落地，不让窗口
+                        # 无限 over-store。结构 P0 上方已 continue（逃生门不豁免结构地板）；
+                        # 未劣化 / 未超压 / 正常路径（digest ready / turn 内）0 行为变化
+                        # （回归钉 test_r3 / test_block1 transient）。
+                        if self._p0_pending_escape_allowed(w):
+                            if "p0_pending_escape" not in self.events:
+                                self.events.append("p0_pending_escape")
+                            if not seg.digest_text:
+                                seg.digest_text = seg.original_text[:80]   # head80 占位摘要
+                            return ws
+                        continue                    # 生成失败（transient）且逃生门未开 → P0 不可逐出
                 elif tier in ("P1", "P2") and seg.digest_ref == "pending" and not aux.in_turn:
                     aux.ensure_digest(seg)          # 出 turn 顺带生成 digest；失败 → digest_only 走 marker
                 return ws
         return None
 
-    def _evict_until(self, w: Window, water: int, aux, result: DistillResult) -> None:
+    def _evict_until(self, w: Window, water: int, aux, result: DistillResult,
+                     tiers: tuple = ("P2", "P1", "P0")) -> None:
         while w.used_tokens > water:
-            cand = self._next_candidate(w, aux, tiers=("P2", "P1", "P0"))
+            cand = self._next_candidate(w, aux, tiers=tiers)
             if cand is None:
                 break                               # 无段可逐（结构 P0 钉死 / P0 digest 未 ready）
             self._evict(cand, result)
@@ -225,6 +249,39 @@ class Distiller:
     def _evict(self, ws: WindowSeg, result: DistillResult) -> None:
         ws.form = "digest_only"
         result.dropped.append(ws.segment)
+
+    def _p0_pending_escape_allowed(self, w: Window) -> bool:
+        """R3 逃生门谓词（pending 兜底）：端点持续劣化 + digest 全 pending + 窗口超压。
+
+        条件（全部满足才开逃生门，缺一不可）：
+        ① 非 force_evict 模式（force_evict 自身即最强逐出口径，逃生门零冗余）；
+        ② 端点持续劣化（aux.endpoint_degraded：真实端点调用连败 ≥ 3）——单一瞬态
+           事件（连败 1~2）保持既有 transient_skip 单事件自愈口径 0 行为变化
+           （回归钉 test_block1::test_transient_fail_single_event_self_heal）；
+        ③ 窗口 used > capacity × force_ratio（默认 0.75 = engine force_compact_ratio
+           同源口径；water=0.8×cap，故「超软水位」⊆「超逃生线」——正常逐出能解决的
+           场景逃生门不介入，只在 (force_ratio×cap, water] 窄带 / 结构 P0 钉死顶穿时兜底）；
+        ④ 窗口内存在 pending 且非结构的 P0 段（逃生门只兜 pending P0；结构地板
+           goal/ledger/用户指令永不豁免——它们上方已 continue）。
+
+        逃生门开后，逐出走 head80 占位摘要（digest_text 预填原文头部 80 字符——
+        比 "[no digest]" marker 多保留一点 P0 事实头部，token 成本仍 20 tok 封顶；
+        pending digest 经幂等三元组下事件再生）——宁可占位摘要落地，不让窗口
+        无限 over-store（audit 报告#3：internal aux endpoint ~14-21% 超时 → P0 digest 全卡
+        pending → 窗口慢性 over-store + P0 细节只留索引；本逃生门把「无限 over-store」
+        封顶在占位摘要粒度）。
+        """
+        if self.force_evict:
+            return False
+        # ② 端点持续劣化门（R3 核心）：真实端点调用连败 ≥ 3 才放行；单一瞬态事件
+        # 不触发（默认 aux 无该读面时 getattr 缺省 False = 逃生门关，fail-closed）。
+        if not getattr(self.aux, "endpoint_degraded", False):
+            return False
+        if w.used_tokens <= int(w.capacity_tokens * self.force_ratio):
+            return False
+        return any(ws.segment.tier == "P0" and ws.segment.digest_ref == "pending"
+                   and not ws.segment.structural_p0
+                   for ws in w.segs)
 
     def _p0_resident_tokens(self, w: Window) -> int:
         return sum(ws.tokens() for ws in w.segs
