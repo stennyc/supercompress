@@ -56,19 +56,20 @@ def test_anchor_build_no_drift_in_build_phase():
 
 
 def test_same_topic_no_false_positive():
-    """DoD FPR 面：真正同主题 user 段（与锚点大量共享 token）不触发漂移（误报 0）。
-
-    锚点由「k8s 集群 节点 部署 扩缩容」5 条建；续判串复用同套词根（k8s/集群/节点/部署/副本），
-    hit_ratio 恒 ≥ 阈值 → 连续低相关计数归零，永不 drift。
+    """DoD FPR 面（20 session 实测，收口 @reviewer Minor）：20 个独立单任务 session，
+    每个 5 建锚 + 15 同主题续判 → 每个 session drift_events 必须 0（FPR = 0/20 ≤ 1/20）。
+    单任务 session 内部词根高度共享（k8s/集群/节点/部署/副本 轮转），hit_ratio 恒 ≥ 阈值。
     """
-    d = DriftTracker()
-    for i in range(N_ANCHOR):
-        d.observe_user(f"部署 k8s 集群 节点 扩缩容 {i}")
-    assert d.current_epoch == 0
-    for i in range(15):
-        assert d.observe_user(f"k8s 集群 节点 部署 副本 {i}") is False, f"同主题误报 @ {i}"
-    assert d.current_epoch == 0
-    assert d.drift_events == []
+    total_drift = 0
+    for s in range(20):
+        d = DriftTracker()
+        for i in range(N_ANCHOR):
+            d.observe_user(f"部署 k8s 集群 节点 扩缩容 方案 {i}")
+        for i in range(15):
+            d.observe_user(f"k8s 集群 节点 部署 副本 扩缩容 方案 {i}")
+        total_drift += len(d.drift_events)
+        assert d.current_epoch == 0, f"session {s} 单任务不得 drift"
+    assert total_drift == 0, f"20 session 实测 FPR 面：drift 事件总数 {total_drift} 必须 0（≤1/20）"
 
 
 def test_two_task_switch_detection_delay_le_2():
@@ -157,11 +158,33 @@ def test_soft_rank_downweights_old_epoch_p1_p2_only():
     assert by_seg[ref["neu_p1"].segment_id] == 10.0, "中性 topic 段不得降权"
     assert abs(by_seg[ref["old_p1"].segment_id] - 10.0 * 0.30) < 1e-9, "旧 epoch P1 应 ×0.3"
     assert abs(by_seg[ref["old_p2"].segment_id] - 10.0 * 0.30) < 1e-9, "旧 epoch P2 应 ×0.3"
+    # Nit 收口（copy-in）：soft_rank 不 mutate 入参 hits —— 入参 Hit.score 保持原值（可安全复用/重入）
+    in_scores = {h.seg.segment_id: h.score for h in hits}
+    assert abs(in_scores[ref["old_p1"].segment_id] - 10.0) < 1e-9, "入参旧 epoch P1 不得被原地改分"
+    assert abs(in_scores[ref["neu_p1"].segment_id] - 10.0) < 1e-9, "入参中性 P1 不得被改分"
     # 确定性：全新 Hit + 全新 tracker 再跑一次 → 排序与分数全等
     d2 = DriftTracker()
     d2.current_epoch = 1
     assert [(h.seg.seq, round(h.score, 9)) for h in d.soft_rank(_fresh_hits()[0])] == \
            [(h.seg.seq, round(h.score, 9)) for h in d2.soft_rank(_fresh_hits()[0])]
+
+
+def test_soft_rank_no_double_penalty_on_reuse():
+    """Nit 收口反证：同一 hits 列表被两个不同 current_epoch 复用，各自独立计分（无累积降权）。
+
+    旧实现原地改分会把复用同一 hits 的第二次调用再 ×0.3（双重降权）；copy-in 后每次从
+    原始分出发 → 两次结果只反映各自 tracker 的 epoch，互不污染。
+    """
+    hits, ref = _fresh_hits()
+    d_a = DriftTracker(); d_a.current_epoch = 1
+    out_a = d_a.soft_rank(hits)
+    by_a = {h.seg.segment_id: h.score for h in out_a}
+    assert abs(by_a[ref["old_p1"].segment_id] - 10.0 * 0.30) < 1e-9
+    # 同一 hits（未被 mutate）再喂给另一个 tracker（仍 epoch 1）→ 结果全等（非 0.3×0.3）
+    d_b = DriftTracker(); d_b.current_epoch = 1
+    out_b = d_b.soft_rank(hits)
+    by_b = {h.seg.segment_id: h.score for h in out_b}
+    assert by_b[ref["old_p1"].segment_id] == by_a[ref["old_p1"].segment_id], "复用不得二次降权"
 
 
 def test_hard_evict_candidates_and_restore():
@@ -237,6 +260,38 @@ def test_rehydrate_rebuilds_anchor_from_current_epoch():
     assert d.current_epoch == 1
     assert "k8s" in d.anchor, "锚点应含当前 epoch 段的话题 token"
     assert d.observe_user("k8s deploy more nodes") is False, "锚点已对齐当前任务，不应触发"
+
+
+def test_anchor_evidence_audit_face():
+    """Nit 收口（审计面）：anchor_evidence/anchor_source 诚实反映锚点真实证据基，
+    与 anchor_user_count（门控哨兵）分离 —— 不夸大（drift 重建锚点证据 = 最近 K 条，非 N_ANCHOR）。"""
+    # build：头 N_ANCHOR 条同主题 → 证据 = N_ANCHOR，来源 build
+    d = DriftTracker()
+    for i in range(N_ANCHOR):
+        d.observe_user(f"auth service token {i}")
+    assert d.anchor_source == "build"
+    assert d.anchor_evidence == N_ANCHOR, "build 期证据 = 已入锚 user 段数"
+
+    # drift：触发后锚点由最近 K_CONSEC 条重建 → 证据 = K_CONSEC（< N_ANCHOR，哨兵 anchor_user_count=N_ANCHOR 不夸大）
+    d.observe_user("k8s deploy node 0")
+    d.observe_user("k8s pod scheduling gpu 1")      # 触发 drift（consec=K_CONSEC=2）
+    assert d.current_epoch == 1
+    assert d.anchor_source == "drift"
+    assert d.anchor_user_count == N_ANCHOR, "门控哨兵跳过建锚期"
+    assert d.anchor_evidence == K_CONSEC, "drift 锚点真实证据基 = 触发 K 条（≠ N_ANCHOR，诚实）"
+
+    # rehydrate：3 段当前 epoch → 证据 = 3（可 < N_ANCHOR），来源 rehydrate
+    d2 = DriftTracker()
+    d2.rehydrate([_seg("k8s deploy 0", topic="1", seq=0),
+                  _seg("k8s pod 1", topic="1", seq=1),
+                  _seg("k8s gpu 2", topic="1", seq=2)])
+    assert d2.anchor_source == "rehydrate"
+    assert d2.anchor_evidence == 3, "rehydrate 锚点由盘上 3 段重建"
+
+    # reset / fresh：无锚点 → source none, evidence 0
+    d3 = DriftTracker()
+    assert d3.anchor_source == "none"
+    assert d3.anchor_evidence == 0
 
 
 # ─────────────────────────── engine 级 e2e：epoch 打标 + soft/hard 接线 ───────────────────────────

@@ -23,7 +23,7 @@ fence：纯 sc 层算法 + engine 接线；不新增数据列（复用 session_t
 """
 from __future__ import annotations
 
-from .recall import tokenize
+from .recall import Hit, tokenize
 
 # ── P2 定稿参数（plan P2.x；引擎配置面可覆写）──
 N_ANCHOR = 5            # 头 N 条 user 段建话题锚点（评分开始前）
@@ -69,6 +69,8 @@ class DriftTracker:
         self.user_seq: int = 0               # 本 session user 段计数（drift 事件可观测）
         self.drift_events: list[dict] = []    # 宿主日志/审计面（{epoch, user_seq, ratio}）
         self._recent: list[set[str]] = []     # 最近 K 条 user 显著 token（drift 时重建锚点）
+        self.anchor_source: str = "none"       # 锚点来源：build(头N) / drift(触发K重建) / rehydrate(冷重开)
+        self.anchor_evidence: int = 0          # 当前锚点实际由几条 user 段构建（诚实审计面；≠ anchor_user_count 门控哨兵）
 
     def reset(self) -> None:
         """会话边界：session 记忆 scope → 全清（fresh session 回到 epoch 0 建锚）。"""
@@ -79,6 +81,8 @@ class DriftTracker:
         self.user_seq = 0
         self.drift_events = []
         self._recent = []
+        self.anchor_source = "none"            # 锚点来源（build/drift/rehydrate/none）
+        self.anchor_evidence = 0               # 当前锚点实际由几条 user 段构建（诚实审计面）
 
     # ── P2.2 检测（喂一条 user 段 → 是否触发 drift）──
     def observe_user(self, text: str) -> bool:
@@ -94,6 +98,8 @@ class DriftTracker:
             # 建锚期：头 N 条 user 段进锚点（不判漂移）
             self.anchor |= q
             self.anchor_user_count += 1
+            self.anchor_evidence += 1          # 建锚期每条有显著 token 的 user 段 +1（诚实证据数）
+            self.anchor_source = "build"
             self.consec_low = 0
             return False
         ratio = hit_ratio(text, self.anchor)
@@ -110,7 +116,9 @@ class DriftTracker:
         """drift 事件：epoch 前进；锚点用最近 K 条（触发本次的 user 段）重建。"""
         self.current_epoch += 1
         self.anchor = set().union(*self._recent) if self._recent else set(last_q)
-        self.anchor_user_count = N_ANCHOR      # 新锚已建（无需再走建锚期）
+        self.anchor_source = "drift"
+        self.anchor_evidence = len([r for r in self._recent if r])   # 锚点实际由最近 ≤K_CONSEC 条有显著 token 段构建（≠ N_ANCHOR 门控哨兵）
+        self.anchor_user_count = N_ANCHOR      # 门控哨兵：跳过建锚期；证据面见 anchor_evidence（二者分离，不夸大）
         self.consec_low = 0
         self.drift_events.append({"epoch": self.current_epoch,
                                    "user_seq": self.user_seq, "ratio": round(last_ratio, 4)})
@@ -132,14 +140,20 @@ class DriftTracker:
     def soft_rank(self, hits: list) -> list:
         """P2.3 soft：旧 epoch 非结构 P1/P2 召回权重 ×SOFT_FACTOR，重排（P1 search 零动）。
 
+        纯函数（copy-in）：不 mutate 入参 hits，对旧 epoch 段返回**新 Hit**（score×SOFT_FACTOR，
+        其余字段引用保留）；其余 Hit 原样。故可安全重复调用 / 确定性复跑，无共享态副作用
+        （Nit 收口：原实现原地改 h.score 会被调用方复用 hits 时二次降权）。
         确定性：(-score, tier 序) 排序；P0/goal/ledger 不动（is_old_epoch 对 "" 返 False 且 P0 豁免）。
         """
         tidx = {"P0": 0, "P1": 1, "P2": 2}
+        ranked = []
         for h in hits:
             seg = h.seg
             if self.is_old_epoch(seg) and not seg.structural_p0 and seg.tier in ("P1", "P2"):
-                h.score = h.score * SOFT_FACTOR
-        return sorted(hits, key=lambda h: (-h.score, tidx.get(h.seg.tier, 9)))
+                ranked.append(Hit(seg, h.score * SOFT_FACTOR, h.downweighted, h.note))
+            else:
+                ranked.append(h)
+        return sorted(ranked, key=lambda h: (-h.score, tidx.get(h.seg.tier, 9)))
 
     def hard_evict(self, segs: list) -> list:
         """P2.3 hard 候选：旧 epoch 非结构 P1/P2（→ 调用方置 form=digest_only）。
@@ -179,6 +193,7 @@ class DriftTracker:
         self.current_epoch = max(int(s.session_topic) for s in ints)
         cur = [s for s in ints if s.session_topic == str(self.current_epoch)]
         cur.sort(key=lambda s: getattr(s, "seq", 0))  # seq 时序序（锚点用头 N 条）
+        self.anchor_source = "rehydrate"
         for s in cur:
             if self.anchor_user_count >= N_ANCHOR:
                 break
@@ -186,3 +201,4 @@ class DriftTracker:
             if q:
                 self.anchor |= q
                 self.anchor_user_count += 1
+                self.anchor_evidence += 1      # 证据面：rehydrate 锚点实际由几条段重建（可 < N_ANCHOR）
