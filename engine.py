@@ -54,6 +54,7 @@ from sc.recall import Recaller
 from sc.rerank import RerankGate, rerank_hits
 from sc.tagger import Tagger
 from sc.drift import DriftTracker
+from sc.version import build_id, desync_warning
 
 
 def _get_call_llm():
@@ -312,13 +313,40 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._rotation_advisory: bool = False
         self._adv_consec: int = 0
 
+        # R1 版本戳（报告#1 #1）：构造期算一个稳定 build_id —— 一眼判断"本进程跑的
+        # 到底是哪一代"：git checkout → 短 sha（working tree 有改动带 -dirty）；env 冻结
+        # 副本（无 .git）→ c-内容 hash（确定性可复现，同字节在任何位置同 build_id）。
+        # 纯本地观测面：任何异常 fail-open 落 "unknown"，绝不阻断引擎构造（宿主 0 改动）。
+        try:
+            self.build_id = build_id()
+        except Exception:
+            self.build_id = "unknown"
+        self._desync_checked = False
+        self._check_version_desync()
+
         logger.info(
             "tcm-supercompress: shell v2 initialized — store=%s, context_length=%d, "
-            "compact_ratio=%.2f, force_ratio=%.2f, segments_on_disk=%d, call_llm=%s",
+            "compact_ratio=%.2f, force_ratio=%.2f, segments_on_disk=%d, call_llm=%s, "
+            "build=%s",
             self.store_path, self.context_length, self.compact_ratio,
             self.force_compact_ratio, self.store.line_count,
             "available" if self._call_llm else "not available",
+            self.build_id,
         )
+
+    def _check_version_desync(self) -> None:
+        """R1 脱钩自检（报告#1 #1）：若可推导 repo 源（sc.version.repo_root：SC_REPO_ROOT
+        override / 自身 git checkout / 仓根祖先），对比运行副本与 repo 源的内容 hash；
+        不一致打一行 ``version desync: running=<..> repo=<..>`` WARNING（只警告不阻断，
+        宿主 0 改动原则下不能崩车）；repo 不可推导 → 静默跳过。纯观测面：自检自身异常
+        吞掉，不影响引擎启动；每实例只查一次。"""
+        if self._desync_checked:
+            return
+        self._desync_checked = True
+        try:
+            desync_warning(log=logger)
+        except Exception:
+            pass
 
     # ───────────────────── 接线件（全部委托 sc）─────────────────────
 
@@ -739,10 +767,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 for seg in self.store.by_hash.values():
                     if seg.tier == "P1":
                         seg.stale = True
-                logger.info("tcm-supercompress: session %s reopened, %d segs replayed (P1 stale-marked)",
-                            session_id, self.store.line_count)
+                logger.info("tcm-supercompress: session %s reopened, %d segs replayed (P1 stale-marked), build=%s",
+                            session_id, self.store.line_count, self.build_id)
             else:
-                logger.info("tcm-supercompress: session %s start (fresh), store=%s", session_id, target)
+                logger.info("tcm-supercompress: session %s start (fresh), store=%s, build=%s",
+                            session_id, target, self.build_id)
         # P2：会话边界 drift 态恢复——有盘内容（carry_over/冷重开）rehydrate（取盘上
         # 最大整数 epoch + 重建锚点，避免冷重启 epoch 失配假阳性漂移）；fresh session reset。
         if self.store.line_count:
