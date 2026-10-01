@@ -306,8 +306,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._rerank_gate = RerankGate(low_score_threshold=self.rerank_low_score_threshold)
         self._rerank_cache: dict = {}
         # P0.4 rotation advisory：纯信号置位（零注入/零遥测/零 cache 影响，宿主契约 fail-safe）；
-        # 会话边界（on_session_start/on_session_reset）对称清零，防泄漏进新 session
-        self.rotation_advisory: bool = False
+        # 会话边界（on_session_start/on_session_reset）对称清零，防泄漏进新 session。
+        # P0.4b：契约化读面——底层私有存储 _rotation_advisory（rotation_advisory 升 property，
+        # 对称 force_evict_mode；宿主 getattr(agent.context_compressor, "rotation_advisory") 可读）
+        self._rotation_advisory: bool = False
         self._adv_consec: int = 0
 
         logger.info(
@@ -387,6 +389,46 @@ class SupercompressContextEngine(sc_context_engine_base()):
     @force_evict_mode.setter
     def force_evict_mode(self, value: bool) -> None:
         self._force_evict_mode = value
+
+    # ── P0.4b rotation 信号契约面（纯 engine.py 内部新增；宿主 getattr 即读，sc/ 层零动）──
+
+    @property
+    def rotation_advisory(self) -> bool:
+        """P0.4 rotation advisory 置位态（对称 force_evict_mode property；底层 _rotation_advisory）。
+
+        宿主契约读面：`getattr(agent.context_compressor, "rotation_advisory")` 一行即读；
+        内部赋值点（_check_rotation_advisory / on_session_start / on_session_reset 清零）
+        自动经 setter 落底层私有存储，语义与原 plain attribute 完全等价。"""
+        return getattr(self, '_rotation_advisory', False)
+
+    @rotation_advisory.setter
+    def rotation_advisory(self, value: bool) -> None:
+        self._rotation_advisory = value
+
+    def pressure(self) -> float:
+        """当前窗口压力 = last_prompt_tokens / context_length（O(1) 纯读，除零安全：
+        context_length <= 0 → 0.0，对称 _check_rotation_advisory 的 :443-444 既有防御）。
+
+        宿主契约读面：宿主 / 未来 TUI 卡一行 getattr 即可算出窗口压力，无需重读 token 账。"""
+        if self.context_length <= 0:
+            return 0.0
+        return self.last_prompt_tokens / self.context_length
+
+    def rotation_reason(self) -> str:
+        """rotation advisory 的宿主可读文案（一行）：已置位 → 原因串（含 pressure 与
+        连续 turn 数）；未置位 → "none"。纯 O(1) 读，零 side-effect。"""
+        if not self.rotation_advisory:
+            return "none"
+        return f"window pressure {self.pressure():.2f} for {self._adv_consec} consecutive turn(s)"
+
+    def should_carry_over(self) -> bool:
+        """P0.4b 纯 advisory 谓词：advisory 已置位 且 当前压力 ≥ ROTATION_PROMPT_RATIO
+        （与 _check_rotation_advisory 置位线同源常量，零硬编码；pressure() 除零安全）。
+
+        零 side-effect：不动 store / window / last_prompt_tokens / 任何持久态——纯读。
+        边界：这是给宿主的读面，实际 carry 仍由宿主 `carry_over_context` 单轨门控
+        （on_session_start，P0.4 设计不变）；宿主不调本方法即零行为、零注入、零 cache 破坏。"""
+        return self.rotation_advisory and self.pressure() >= ROTATION_PROMPT_RATIO
 
     def _window_fresh(self) -> Window:
         """窗口 = 磁盘 replay 段（单一事实源；内存工作态崩溃清零 = session 重启已知边界）。"""
