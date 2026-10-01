@@ -642,8 +642,18 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if result.status not in ("ok", "backpressure"):
                 logger.warning("tcm-supercompress: distill status=%s events=%s",
                                result.status, result.events)
-        except StoreError as e:
-            logger.error("tcm-supercompress: compress degraded (store error): %s", e)
+        except (StoreError, OSError) as e:
+            # R2：full-disk 时 store 交互抛 OSError（EIO/ENOSPC）——store 写路径已归一为
+            # StoreError("io_error: ...")，此处双 catch 防御 replay/aux 面裸 OSError 逃逸。
+            # 优雅降级：log warning + 磁盘水位观测（剩余空间 + 触发动作，ops 监控），
+            # 本轮跳过持久化，不炸宿主（压缩失败 ≠ turn 失败；与 on_turn_complete 宽
+            # catch 口径对齐——fail-open 返回原 messages，宿主本 turn 原样继续）
+            logger.warning("tcm-supercompress: compress degraded (store error, "
+                           "skipping this round's persistence, host untouched): %s", e)
+            try:
+                self.store.log_water_warn("compress-failed", e)
+            except Exception:
+                pass
             return messages  # fail-open：压缩失败 ≠ turn 失败
         # S-Phase 2（决定 B）：阶梯注入取代全文拼接——预算驱动选档（L3/L2/L1/L0），
         # 固定池无 pull 耦合：索引池 2K（L1+L2 共池）+ 细节池 4K（L3），总帽 6K，
@@ -764,8 +774,17 @@ class SupercompressContextEngine(sc_context_engine_base()):
             pass
         try:
             self.store.flush()  # P1/P2 lazy 批落盘（会话边界原子点）
-        except StoreError as e:
-            logger.error("tcm-supercompress: session-reset flush failed: %s", e)
+        except (StoreError, OSError) as e:
+            # R2：full-disk 时 flush 抛 OSError（EIO/ENOSPC，store 写路径归一为
+            # StoreError("io_error: ...")，双 catch 防裸 OSError 逃逸到宿主 /new 面）。
+            # 优雅降级：log warning + 水位观测，跳过本轮持久化（pending 批留内存可重试，
+            # 断电丢批上界不变），重置流程继续走完——不炸宿主 /new。
+            logger.warning("tcm-supercompress: session-reset flush failed (degraded, "
+                           "pending P1/P2 kept in memory, reset proceeds): %s", e)
+            try:
+                self.store.log_water_warn("session-reset-flush-failed", e)
+            except Exception:
+                pass
         # 基类重置集（若宿主真基类在 MRO 中则委托 super；object 基类则手动 4 字段）
         try:
             if hasattr(super(), "on_session_reset"):
@@ -794,8 +813,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
             pass
         try:
             self.store.flush()  # P1/P2 lazy 批落盘（会话边界原子点）
-        except StoreError as e:
-            logger.error("tcm-supercompress: session-end flush failed: %s", e)
+        except (StoreError, OSError) as e:
+            # R2：与 on_session_reset 同口径（full-disk OSError 优雅降级 + 水位观测）——
+            # 会话收尾面同样不炸宿主（pending 批留内存，断电丢批上界不变）。
+            logger.warning("tcm-supercompress: session-end flush failed (degraded, "
+                           "pending P1/P2 kept in memory): %s", e)
+            try:
+                self.store.log_water_warn("session-end-flush-failed", e)
+            except Exception:
+                pass
         logger.info("tcm-supercompress: session %s end, store lines=%d",
                     session_id, self.store.line_count)
 

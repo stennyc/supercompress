@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import scdata
@@ -23,6 +24,8 @@ from .aux_provider import marker_enabled
 from .budgets import push_cap
 from .schema import est_tokens
 from .store import StoreError
+
+logger = logging.getLogger(__name__)
 
 
 class WindowSeg:
@@ -109,9 +112,17 @@ class Distiller:
                 seg = ws.segment
                 if seg.tier == "P0" and seg.content_hash not in store.durable:
                     store.append(seg)
-        except StoreError as e:
-            self.events.append(str(e))   # "source_unavailable" 等
+        except (StoreError, OSError) as e:
+            # R2：full-disk 时 P0 append 抛 OSError（EIO/ENOSPC）——store 写路径已归一为
+            # StoreError("io_error: ...")，此处双 catch 防御测试直接 monkeypatch 注入裸
+            # OSError。fail-safe 口径不变：源写失败 = 全量不压缩 + 零锚点发射，
+            # 水位 WARNING 留痕（剩余空间 + 触发动作，供 ops 监控）
+            self.events.append(str(e))
             result.status = "compress_failed"
+            try:
+                store.log_water_warn("p0-append-failed", e)
+            except Exception:
+                pass
             return result                 # 锚点不发射、窗口一个字节不动（fail-safe）
 
         # 2. 出 turn 即时 digest 生成（P0 非结构 pending）：aux 瞬态失败 → transient regime
@@ -159,8 +170,21 @@ class Distiller:
             result.kept_p0_ids = self._kept_p0_ids(w)
             return result
 
-        # 7. 正常收尾：P1/P2 lazy 批 flush（size trigger / turn 末），之后才发射锚点
-        store.flush()
+        # 7. 正常收尾：P1/P2 lazy 批 flush（size trigger / turn 末），之后才发射锚点。
+        # R2：full-disk 时 flush 抛 StoreError("io_error: ...") / OSError——distill 是异步面，
+        # 本就允许丢一个 pending 批（断电丢批上界不变）；不上抛、不炸宿主：
+        # 水位 WARNING 留痕 + pending 保留在内存（store.flush 失败语义：批未清、可重试），
+        # 锚点发射经 store.durable 过滤天然不含 pending 段（宁可不压，不可断锚）。
+        try:
+            store.flush()
+        except (StoreError, OSError) as e:
+            self.events.append("flush_failed:" + str(e))
+            try:
+                store.log_water_warn("distill-flush-failed", e)
+            except Exception:
+                pass
+            logger.warning("tcm-supercompress: distill final flush degraded (lossy, "
+                           "pending kept for retry): %s", e)
         result.anchor_manifest = self._emit_anchors(result, store)
         result.status = "backpressure" if w.used_tokens > cap else "ok"
         result.kept_p0_ids = self._kept_p0_ids(w)

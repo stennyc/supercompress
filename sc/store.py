@@ -13,11 +13,18 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 
 import scdata
 
 from .schema import Segment
+
+logger = logging.getLogger(__name__)
+
+# R2：磁盘水位观测阈值（写盘前例行检查用；≥ 此值打一行 INFO 供 ops 监控 grep）。
+# 纯观测、零自动清理（#5 retention 是独立任务，本行不触发任何清理动作）。
+DISK_WATER_HIGH_PCT = 0.90
 
 
 class StoreError(Exception):
@@ -43,23 +50,68 @@ class JsonlStore:
         if os.path.exists(path) and os.path.getsize(path) > 0:
             self.replay()
 
+    # ───────────── 磁盘水位观测（R2：full-disk 优雅降级配套，一行 ops 监控面）─────────────
+    def disk_water_level(self) -> tuple[int, float]:
+        """store 文件所在文件系统水位 → (剩余字节, 已用百分比 0.0-1.0)。
+
+        statvfs 自身失败（只读挂载 / 盘消失 / 容器异常）→ (0, -1.0)：
+        调用方按「水位未知」处理，观测面绝不反向上抛（不能成为新的宿主炸点）。"""
+        try:
+            st = os.statvfs(os.path.dirname(os.path.abspath(self.path)) or "/")
+            free_b = st.f_bavail * st.f_frsize
+            total_b = st.f_blocks * st.f_frsize
+            pct = (1.0 - st.f_bavail / st.f_blocks) if st.f_blocks else 0.0
+            return int(free_b), float(pct)
+        except OSError:
+            return 0, -1.0
+
+    def log_water_check(self, action: str) -> None:
+        """写盘前例行水位观测：used ≥ DISK_WATER_HIGH_PCT 才打一行 INFO（剩余空间 + 触发动作）；
+        健康态（< 阈值 / 水位未知）静默——零日志污染。自身 fail-safe：绝不抛出。"""
+        try:
+            free_b, pct = self.disk_water_level()
+            if pct >= DISK_WATER_HIGH_PCT:
+                logger.info("tcm-supercompress: disk water-level HIGH: free=%.1fGiB used=%.1f%% "
+                            "action=%s", free_b / (1024 ** 3), pct * 100.0, action)
+        except Exception:
+            pass   # 观测面永不炸宿主
+
+    def log_water_warn(self, action: str, exc: BaseException) -> None:
+        """写盘失败时水位 WARNING（恒打一行：剩余空间 + 触发动作 + 错误），供 ops 监控定位
+        full-disk 事故（tui_gateway EIO/EIO-unhandledRejection 同因面）。自身 fail-safe。"""
+        try:
+            free_b, pct = self.disk_water_level()
+            used_txt = f"{pct * 100.0:.1f}%" if pct >= 0 else "unknown"
+            logger.warning("tcm-supercompress: disk water-level: free=%.1fGiB used=%s "
+                          "action=%s failed: %s", free_b / (1024 ** 3), used_txt, action, exc)
+        except Exception:
+            pass
+
     # ───────────── 写路径（tier-aware fsync）─────────────
     def append(self, seg: Segment) -> Segment:
-        """P0 即写即 fsync + 读回；P1/P2 进 lazy 批。写失败 → StoreError（调用方 fail-safe 回滚）。"""
+        """P0 即写即 fsync + 读回；P1/P2 进 lazy 批。写失败 → StoreError（调用方 fail-safe 回滚）。
+
+        R2：底层 OSError（full-disk ENOSPC / EIO）在此归一为 StoreError("io_error: ...")
+        统一语义——调用方（distill gate① / engine 壳）只需 catch StoreError 一族，
+        裸 OSError 不再逃逸到宿主。"""
         if self._write_fail:
             raise StoreError("source_unavailable")
         seg.seq = self._next_seq
         self._next_seq += 1
         line = scdata.to_line(seg.to_dict())        # 行字节单点产出：scdata 权威
         if seg.tier == "P0":
-            with open(self.path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-                f.flush()
-                os.fsync(f.fileno())
-            self.fsynced_p0_count += 1
-            # 读回校验（write-before-compress gate 的源存储侧半）：单一解析 = Segment.from_line
-            with open(self.path, "r", encoding="utf-8") as f:
-                last = [l for l in f.readlines() if l.strip()][-1].strip()
+            self.log_water_check("p0-append")       # 写盘前例行水位观测（≥90% 才出 INFO）
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+                self.fsynced_p0_count += 1
+                # 读回校验（write-before-compress gate 的源存储侧半）：单一解析 = Segment.from_line
+                with open(self.path, "r", encoding="utf-8") as f:
+                    last = [l for l in f.readlines() if l.strip()][-1].strip()
+            except OSError as e:
+                raise StoreError(f"io_error: {e}") from e
             if Segment.from_line(last) is None:
                 raise StoreError("readback_verify_failed")
             self._record(seg, durable=True)
@@ -77,16 +129,23 @@ class JsonlStore:
             self.durable.add(seg.content_hash)
 
     def flush(self) -> int:
-        """P1/P2 lazy 批 flush + fsync（批间隔 = 断电丢失上界：一个批）。"""
+        """P1/P2 lazy 批 flush + fsync（批间隔 = 断电丢失上界：一个批）。
+
+        R2：写块 OSError 归一为 StoreError("io_error: ...")；失败时 **不清** _pending
+        （批留在内存可重试；重放 by_hash 天然去重；断电丢批上界语义不变 = 一个批）。"""
         if self._write_fail:
             raise StoreError("source_unavailable")
         n = 0
         if self._pending:
-            with open(self.path, "a", encoding="utf-8") as f:
-                for seg in self._pending:
-                    f.write(scdata.to_line(seg.to_dict()) + "\n")
-                f.flush()
-                os.fsync(f.fileno())
+            self.log_water_check("flush")
+            try:
+                with open(self.path, "a", encoding="utf-8") as f:
+                    for seg in self._pending:
+                        f.write(scdata.to_line(seg.to_dict()) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError as e:
+                raise StoreError(f"io_error: {e}") from e
             for seg in self._pending:
                 self._record(seg, durable=True)
             n = len(self._pending)
