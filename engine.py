@@ -407,7 +407,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
 
     def pressure(self) -> float:
         """当前窗口压力 = last_prompt_tokens / context_length（O(1) 纯读，除零安全：
-        context_length <= 0 → 0.0，对称 _check_rotation_advisory 的 :443-444 既有防御）。
+        context_length <= 0 → 0.0，对称 _check_rotation_advisory 的既有防御）。
 
         宿主契约读面：宿主 / 未来 TUI 卡一行 getattr 即可算出窗口压力，无需重读 token 账。"""
         if self.context_length <= 0:
