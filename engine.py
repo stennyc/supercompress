@@ -51,6 +51,7 @@ from sc import (
 )
 from sc.inject import choose_forms, render_block, block_tokens
 from sc.recall import Recaller
+from sc.rerank import RerankGate, rerank_hits
 from sc.tagger import Tagger
 from sc.drift import DriftTracker
 
@@ -295,6 +296,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # P2（S-Phase 5）drift tracker：task epoch 状态机 + 锚点 + soft/hard 判定
         #（纯 sc 层，零 LLM/零网络/确定性；复用 P1 tokenize）
         self._drift = DriftTracker()
+        # P3（S-Phase 4）gate rerank：LLM 两步重排（独立 step，P1 打分核零动，同 P2 soft_rank 模式）。
+        # 端点注入 = aux 主模型端点（宿主主模型共享，零新 provider / 零模型名 / 零 provider 块）；
+        # gate 默认保守（low_score_threshold=0.0 → 只在「召回空 / 显式搜索词」触发，非常态 LLM 调用）；
+        # 缓存键 (sha256(query), store.line_count) 会话内幂等（plain dict：CPython GIL 下
+        # get/set 原子，并发最坏 = 一次良性的 LLM 调用重复，不炸不脏）；
+        # 会话边界（on_session_start/on_session_reset）清零，防跨 session 泄漏。
+        self.rerank_low_score_threshold: float = float(_get("rerank_low_score_threshold", 0.0))
+        self._rerank_gate = RerankGate(low_score_threshold=self.rerank_low_score_threshold)
+        self._rerank_cache: dict = {}
         # P0.4 rotation advisory：纯信号置位（零注入/零遥测/零 cache 影响，宿主契约 fail-safe）；
         # 会话边界（on_session_start/on_session_reset）对称清零，防泄漏进新 session
         self.rotation_advisory: bool = False
@@ -516,6 +526,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
             hits = recaller.search(query, k=3)
             # P2.3 soft：旧 epoch 非结构 P1/P2 召回降权（P1 search 打分核零动，独立 rerank 步）
             hits = self._drift.soft_rank(hits)
+            # P3（S-Phase 4）gate LLM rerank（独立 step，P1 打分核零动）：
+            # gate 三选一（召回空 / 显式搜索词 / top-1 < 低分阈值，默认保守）+ 缓存键
+            # (sha256(query), store.line_count) + fail-safe（LLM 不可用/解析失败 → 原样返回）。
+            # 端点 = aux 主模型端点（宿主主模型共享，零新 provider / 零模型名 / 零 provider 块）。
+            # _NoEndpoint（未注入 call_llm）下 gate 触发也 fail-safe no-op（纯本地不炸）。
+            hits = rerank_hits(
+                hits, query, self._aux.main_endpoint,
+                cache=self._rerank_cache, window_version=self.store.line_count,
+                gate=self._rerank_gate)
             recalled = [h.seg.original_text for h in hits
                         if h.seg.tier in ("P0", "P1") and h.score > 0.0]
             # Egress 过滤（存量止血）：磁盘上已存的 203 条 P0 group-skeleton 段
@@ -679,6 +698,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # P0.4：rotation advisory 会话边界清零（对称 on_session_reset，防泄漏进新 session）
         self.rotation_advisory = False
         self._adv_consec = 0
+        # P3：rerank 缓存会话边界清零（防跨 session 泄漏：新 store 的窗口指纹从 0 起步）
+        self._rerank_cache = {}
         self.last_prompt_tokens = 0
         self.session_id = session_id
         self._bound_session = session_id
@@ -718,6 +739,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.rotation_advisory = False
         self._adv_consec = 0
         self._drift.reset()   # P2：会话边界 drift 态全清（session 记忆 scope）
+        # P3：rerank 缓存会话边界清零（对称 on_session_start）
+        self._rerank_cache = {}
         logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
