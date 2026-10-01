@@ -113,7 +113,10 @@ def main() -> int:
     print(f"  P1(BM25+CJK)        recall@3 = {p1_hits}/{len(pairs)} = {p1_r:.3f}")
     print(f"  Δ(P1-base) = {delta:+.3f}  相对提升 = {((p1_r-base_r)/base_r*100 if base_r else 0):+.1f}%")
     print(f"  GATE(p1 ≥ base×1.30): {gate}   ← 主门禁（DoD），决定退出码")
-    print(f"  DISCRIM-CAP(p1 > weak): {discrim}  ← advisory：{'' if discrim else '当前 gold 集对朴素 CJK scorer 仍饱和；+111% 是相对旧生产 \\S+ 基线的提升，非 P1 绝对上限'}")
+    # advisory 注记先 hoist（f-string 表达式部分含 backslash 是 3.12+ PEP 701 语法；
+    # 宿主测试 venv = 3.11 → 模块 import 即炸。P-INST 可移植性：全树须 3.11 可 compile）。
+    _disc_note = "当前 gold 集对朴素 CJK scorer 仍饱和；+111% 是相对旧生产 \\S+ 基线的提升，非 P1 绝对上限"
+    print(f"  DISCRIM-CAP(p1 > weak): {discrim}  ← advisory：{'' if discrim else _disc_note}")
 
     # 逐条 CJK 无空格 case 展示（区分度证据：旧 `\S+` 把整串当一个 token → 命中≈0）
     print("  CJK 无空格 case（旧≈0，P1 主战场）:")
