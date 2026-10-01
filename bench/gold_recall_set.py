@@ -27,9 +27,23 @@ _CORPUS = [
     ("P1", "model", False, "缓存命中率下降排查热点key引起的抖动"),
     ("P0", "model", False, "网关限流阈值调至每秒五百请求并配置告警"),
     ("P2", "model", False, "慢查询top十排序结果含索引缺失的字段"),
+    # ── CJK 近重复干扰簇（打破「主题分块饱和」：同主题多篇，考 scorer 能否选中对的那篇）──
+    #    与 idx7 近重复，仅 四十二/生产/保留/入口 vs 四十三/测试/无需 或 预发/开关 区分
+    ("P0", "model", False, "部署发布版本四十三到测试环境无需回滚入口"),
+    ("P1", "model", False, "部署发布版本四十二到预发环境保留回滚开关"),
+    #    与 idx8 近重复，仅 8081 vs 8082 区分
+    ("P1", "model", False, "端口8080被nginx占用需改到8082再重启网关"),
+    #    与 idx9 近重复，仅 maxsize vs timeout 区分
+    ("P2", "model", False, "数据库连接池超时日志刷屏需调大连接池timeout"),
+    # ── EN 近重复干扰簇（证明区分度不止 CJK 面）──
+    #    与 idx1 近重复，仅 .55/.56 与 8080/8081 区分
+    ("P0", "model", False, "decision: port 8080 bound to 192.168.55.56 for the auth service"),
+    ("P0", "model", False, "decision: port 8081 bound to 192.168.55.55 for the auth service"),
 ]
 
-# (query, target_index_in_corpus) — 20 条人工标注（EN 7 + CJK 无空格 8 + 混合 5）。
+# (query, target_index_in_corpus) — 人工标注。
+# 前 19 条（EN 7 + CJK 无空格 8 + 混合 4）+ 5 条近重复干扰 query（打破主题分块饱和）。
+# 近重复簇内每条 query 的 target 是簇里**唯一最贴切**篇；弱/散打 scorer 会选错篇。
 _GOLD = [
     # 英文（新旧都该中 → 考排序）
     ("ship v1 keep srv a1 online",        0),
@@ -53,6 +67,10 @@ _GOLD = [
     ("auth service rollback on failure",  4),
     ("限流告警 五百 请求",                11),   # 带空格 CJK
     ("日志刷屏 数据库 连接池",             9),    # 带空格 CJK
+    # 近重复干扰（同主题多篇，考 scorer 选中「对的那篇」，散打 scorer 会选错）
+    # 注：既有 CJK 无空格 query（部署…四十二…→7 / 端口…8081→8）随干扰簇加入已自动获得判别力，不重复列
+    ("数据库连接池maxsize调大",             9),   # vs idx16(timeout)：query 要 maxsize，idx9 独中
+    ("auth service port 8080 192.168.55.55", 1),  # vs idx17(.56)/idx18(8081)：8080+.55 独指 idx1
 ]
 
 

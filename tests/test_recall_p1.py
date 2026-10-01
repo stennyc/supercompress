@@ -60,6 +60,36 @@ class TestP1_Determinism:
         hits = r.search("42 srv deploy release", k=2)
         assert hits[0].seg.segment_id == p0.segment_id, "P0 boost 排前（默认 λ=0 不变）"
 
+    def test_decay_lambda_positive_demotes_oldest_and_newest_undimmed(self, store, aux):
+        """Minor(e)：decay_lambda>0 → 同分下越早 seq 越多被降权；最新段（seq=n-1）因子 1.0 不降权。
+
+        off-by-λ 钉死（sc/recall.py `1.0-λ(n-1-seq)`）：seq=n-1 → 因子 1.0，seq=0 → 1-λ(n-1)。
+        三条同文 P1（base 全等）λ=0.5 时严格 [seq2 > seq1 > seq0]（无 tie 可依赖）；
+        P0(seq0) 在 λ=0.5 被时序压过最新 P1(seq2) → P0 不再无条件排第一。
+        确定性：两次全等（纯函数、无 wall-clock）。
+        """
+        from sc.recall import Recaller
+        w = mk_window(1000, [
+            mkseg(store, "same base text here", "P0", "user", structural=True),  # seq0
+            mkseg(store, "same base text here", "P1"),                             # seq1
+            mkseg(store, "same base text here", "P1"),                             # seq2（最新）
+        ])
+        r = Recaller(store, w)
+        q = "same base text here"
+        h_lam05 = r.search(q, k=3, decay_lambda=0.5)
+        order = [h.seg.seq for h in h_lam05]
+        assert order == [2, 1, 0], f"λ=0.5 同文应 [最新>中>最早]，实际 {order}"
+        # P0(seq0) 被时序压过最新 P1(seq2)
+        assert h_lam05[0].seg.tier == "P1" and h_lam05[0].seg.seq == 2, "最新 P1 应第一"
+        # 严格 >（非 tie 兜底）：seq2 未降权 > seq0 降权最多
+        assert h_lam05[0].score > h_lam05[2].score, "off-by-λ：最新段(因子1.0) > 最早段(因子1-λ(n-1))"
+        # 确定性：同 query 两次全等
+        b = [(h.seg.seq, round(h.score, 9)) for h in r.search(q, k=3, decay_lambda=0.5)]
+        c = [(h.seg.seq, round(h.score, 9)) for h in Recaller(store, w).search(q, k=3, decay_lambda=0.5)]
+        assert b == c, "decay_lambda>0 结果非确定"
+        # 回退默认 λ=0：P0 boost 恢复排第一（钉死面，off-by-λ 不影响 λ=0 面）
+        assert Recaller(store, w).search(q, k=3)[0].seg.tier == "P0", "λ=0 → P0 boost 仍排第一"
+
 
 class TestP1_CjkRecall:
     def test_cjk_no_space_query_recalls_cjk_segment(self, store, aux):

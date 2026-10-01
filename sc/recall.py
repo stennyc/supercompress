@@ -7,7 +7,7 @@
 - 排序（P1，2026-10-01 换层，数据面/点查/三元组零动，`search()`/`Hit`/`Recaller` 公共 API 不变）：
   **BM25（tf-idf，k1=1.2 / b=0.75）** × P0 boost × stale P1 降权。
   分词 = 拉丁词 + CJK unigram+bigram（纯标准库：无 jieba / 无网络 / 无 dict 加载），
-  让中文/日韩 query 无需空格即可召回（现状 `\S+` 词重叠面把整段中文当一个 token，CJK query 命中≈0）。
+  让中文/日韩 query 无需空格即可召回（现状 \\S+ 词重叠面把整段中文当一个 token，CJK query 命中≈0）。
   **确定性**：BM25 只读固定语料统计（N/df/avgdl，corpus = 当前 window），
   CJK bigram 按字面左到右生成、查询 term 按 sorted 序累加 → 同 query 两次结果全等；
   可选 seq 时效降权（`decay_lambda>0`）为纯函数、无 wall-clock，默认 0 不扰动既有钉死面。
@@ -23,7 +23,7 @@ import math
 import re
 
 from .budgets import pull_budget
-from .schema import est_tokens
+from .schema import Segment, est_tokens
 
 # ── 分词（纯标准库、确定性；CJK unigram 保词根 + bigram 保双字词，100+ 语言覆盖）────
 # 拉丁词：小写 [a-z0-9_]+（标点/空格/斜杠为界）。
@@ -50,7 +50,7 @@ def tokenize(text: str) -> list[str]:
 
 
 class Hit:
-    def __init__(self, seg, score: float, downweighted: bool = False, note: str = "") -> None:
+    def __init__(self, seg: "Segment", score: float, downweighted: bool = False, note: str = "") -> None:
         self.seg = seg
         self.score = score
         self.downweighted = downweighted
@@ -130,7 +130,9 @@ class Recaller:
             if getattr(seg, "stale", False):
                 base *= self.STALE_DECAY
             if decay_lambda > 0.0 and n > 0:
-                base *= max(0.0, 1.0 - decay_lambda * (float(n) - float(seg.seq)))
+                # seq=n-1（窗口最新段）→ 因子 1.0 不降权；seq=0（最早段）→ 1-λ(n-1) 降最多。
+                # max(0.0,…) 钉在 0，永不产生负乘子把无关段重排到零分段之下。
+                base *= max(0.0, 1.0 - decay_lambda * (float(n) - 1.0 - float(seg.seq)))
             scored.append((-base, tidx[seg.tier], seg.seq, seg))
         scored.sort()                                      # 相关度 desc → 层级（P0 先）→ seq 稳定序
 
