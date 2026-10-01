@@ -70,18 +70,24 @@ class TestBlock4_Aux:
         assert len(aux.main_endpoint.calls) == n_calls, "冷却窗内端点调用数不变"
 
     def test_fail_cooldown_expires_resumes(self, store):
-        """去抖可恢复：冷却到点后下一段正常生成（非永久熔断）。"""
+        """去抖可恢复：连败 2 次（阶梯 0.2s×1 档封顶）后手动拨回冷却窗，端点恢复 → 正常生成。"""
         import threading
         aux = AuxProvider(FakeEndpoint(), fail_cooldown=0.2,
+                          cooldown_backoff=(0.2,),
                           digest_sem=threading.BoundedSemaphore(2), async_digest=False)
         aux.main_endpoint.fail = True
         s1 = mkseg(store, "pre fail", "P0")
         assert aux.ensure_digest(s1) is None
+        s_x = mkseg(store, "fail two", "P0")
+        aux._cooldown_until = 0.0      # 手动拨回时钟（测试确定性，零 sleep）
+        assert aux.ensure_digest(s_x) is None
+        assert aux._consec_fails == 2, "两次真实端点失败 = 2 连败"
+        aux._cooldown_until = 0.0      # 冷却窗到点（模拟时间流逝，零 sleep）
         aux.main_endpoint.fail = False
-        import time
-        time.sleep(0.25)
         s2 = mkseg(store, "post cooldown", "P0")
         assert aux.ensure_digest(s2) is not None and s2.digest_ready, "冷却到点恢复生成"
+        assert aux._consec_fails == 0, "成功复位连败计数"
+        assert aux._cooldown_until == 0.0, "成功复位冷却窗"
 
     def test_digest_semaphore_caps_concurrency(self, store):
         """去抖第 2 层：digest_sem 在端点调用期间独占（慢端点下第二调用无法并发）。"""

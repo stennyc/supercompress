@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -25,6 +26,29 @@ import time
 import scdata
 
 from .schema import Segment
+
+logger = logging.getLogger(__name__)
+
+# R3 健康探测/降级（任务 t_d94cc07e 报告#3）：不加新 endpoint / 新 provider（LLM 约束），
+# 探测 = 现有 digest 调用（本端点同通道）的成功/失败统计。连败计数 _consec_fails +
+# 退避阶梯（基线 = fail_cooldown，乘数 1×→5×→30× 封顶；engine 默认 60s 配置 →
+# 60s→300s→1800s 契约曲线）→ 冷却窗自适应拉长，防「每 N 秒一波 pending 段重发端点」
+# 的放大风暴；端点恢复（1 次成功）→ 计数归零、冷却窗关闭回落基线。状态变化打一行 INFO。
+COOLDOWN_BACKOFF_MULTIPLIERS = (1.0, 5.0, 30.0)
+
+
+def effective_cooldown(aux: "AuxProvider", n_fails: int) -> float:
+    """第 n_fails 次连败（1 起）对应的冷却窗时长 = ladder[min(n-1, len(ladder)-1)]。
+
+    纯阶梯索引（尾档封顶 = 指数退避封顶语义）；阶梯全 0 → 返回 0.0（冷却窗恒关，
+    `if cooldown > 0` 守卫下 `_cooldown_until` 保持 0 —— fail_cooldown=0 的 sc 契约
+    替身「transient 单事件自愈」口径 0 行为变化）。冷却窗是否启用由 fail_cooldown
+    总开关语义决定（=0 → 阶梯全 0 → 恒关）。
+    """
+    ladder = getattr(aux, "cooldown_backoff", ()) or ()
+    if not ladder:
+        return 0.0
+    return ladder[min(max(n_fails, 1) - 1, len(ladder) - 1)]
 
 # digest 提示词（S2a/修 S5：之前 LLM 响应正文被丢弃、digest_text 只填 head80 占位——
 # 同一处 LLM 调用、零新增调用次数，现在捕获正文并结构化解析出 key_fact/summary）。
@@ -88,13 +112,23 @@ def marker_enabled() -> bool:
 
 
 class AuxProvider:
-    """(A) aux ≡ 主模型端点。endpoint 注入：生产 = Hermes 原生网关，测试 = FakeEndpoint。"""
+    """(A) aux ≡ 主模型端点。endpoint 注入：生产 = Hermes 原生网关，测试 = FakeEndpoint。
+
+    R3 健康探测读面（零新 endpoint / 零新 provider，LLM 约束）：探测 = 本端点 digest
+    调用同通道的成功/失败统计——`consec_fails`（连败计数，property）+ `endpoint_degraded`
+    （端点持续劣化判定，property：连败 ≥ ESCAPE_STREAK_THRESHOLD，引擎/蒸馏器逃生门
+    据此放行 P0 pending 兜底逐出）+ `cooldown_status()`（一行可观测：连败/降级/冷却窗/阶梯）。
+    """
 
     COMPRESSION_TASK = "auxiliary.compression"   # digest 映射原生 summarizer 任务
+    # R3 逃生门连败阈值：端点连续失败达此数才判「持续劣化」（单一事件瞬态 →
+    # 既有 transient_skip 自愈口径不变；2 次失败可能是抖动，3 次起才降级）。
+    ESCAPE_STREAK_THRESHOLD: int = 3
 
     def __init__(self, main_endpoint, max_concurrency: int = 1, fail_cooldown: float = 60.0,
                  digest_sem: "threading.BoundedSemaphore | None" = None,
-                 async_digest: bool = True) -> None:
+                 async_digest: bool = True,
+                 cooldown_backoff: "tuple[float, ...] | None" = None) -> None:
         self.main_endpoint = main_endpoint
         self.fallback_endpoint = main_endpoint   # (A) 失败域与主模型同源
         self.fallback_chain: list[str] = ["main"]
@@ -110,6 +144,16 @@ class AuxProvider:
         # 跨 turn 有效（turn 边界只重置 queue/transient，冷却到点才放行下一波）。
         self.fail_cooldown = fail_cooldown
         self._cooldown_until: float = 0.0
+        # R3 健康探测/降级口径：不加新 endpoint / 新 provider（LLM 约束），探测 = 现有
+        # digest 调用（本端点同通道）的成功/失败统计。连败计数 _consec_fails + 退避
+        # 阶梯 cooldown_backoff（默认 = fail_cooldown × COOLDOWN_BACKOFF_MULTIPLIERS
+        # 派生：60s 配置 → 60s→300s→1800s 契约曲线，第 1 连败 = 1× 基线（legacy 行为
+        # 完全一致），2/3 连败起 5×/30× 拉长封顶；fail_cooldown=0 → 阶梯全 0 → 冷却窗
+        # 恒关（sc 契约测试「transient 单事件自愈」0 行为变化）；可显式注入绝对阶梯）。
+        # 1 次成功 → 计数归零、冷却窗关闭回落基线。状态变化打一行 INFO（可观测）。
+        self.cooldown_backoff: tuple = tuple(cooldown_backoff) if cooldown_backoff is not None \
+            else tuple(fail_cooldown * m for m in COOLDOWN_BACKOFF_MULTIPLIERS)
+        self._consec_fails: int = 0
         # digest 全局并发帽（去抖第 2 层）：默认共享模块级 _DIGEST_SEM（跨会话同端点
         # 不互相放大）；测试可注入独立实例。
         self.digest_sem = digest_sem if digest_sem is not None else _DIGEST_SEM
@@ -163,6 +207,32 @@ class AuxProvider:
     def in_turn(self) -> bool:
         return self._in_turn
 
+    # ── R3 健康探测读面（零新 endpoint / 零新 provider，LLM 约束）──
+    # 探测 = 本端点 digest 调用同通道的成功/失败统计，供引擎/蒸馏器逃生门决策：
+    # `consec_fails`（连败计数）+ `endpoint_degraded`（连败 ≥ 阈值 → 持续劣化判定，
+    # 逃生门据此放行 P0 pending 兜底逐出；单一瞬态事件 consec=1 < 阈值 → 不降级，
+    # 既有 transient_skip 单事件自愈口径 0 行为变化）+ `cooldown_status`（一行可观测）。
+    @property
+    def consec_fails(self) -> int:
+        """真实端点调用连败计数（冷却窗内跳段 ≠ 端点失败，不累加——退避不自我放大）。"""
+        return self._consec_fails
+
+    @property
+    def endpoint_degraded(self) -> bool:
+        """端点持续劣化判定：连败 ≥ ESCAPE_STREAK_THRESHOLD（3）。单一/两次瞬态抖动
+        不触发（保持 sc 契约「transient 单事件自愈」）；3 连败起才判降级放行逃生门。"""
+        return self._consec_fails >= self.ESCAPE_STREAK_THRESHOLD
+
+    def cooldown_status(self) -> dict:
+        """R3 观测面（一行可 grep）：连败 / 是否降级 / 冷却窗剩余 / 退避阶梯快照。"""
+        remaining = max(0.0, self._cooldown_until - time.monotonic())
+        return {
+            "consec_fails": self._consec_fails,
+            "degraded": self.endpoint_degraded,
+            "cooldown_remaining_s": round(remaining, 3),
+            "ladder_s": [f"{c:g}" for c in self.cooldown_backoff],
+        }
+
     # ── turn 边界：digest 生成只发生在 turn 末（不与主模型解码撞车）──
     def start_turn(self) -> None:
         self._in_turn = True
@@ -207,7 +277,8 @@ class AuxProvider:
 
     def _generate(self, seg: Segment) -> dict | None:
         if self._cooldown_until and time.monotonic() < self._cooldown_until:
-            # 冷却窗内：不调端点（瞬态失败风暴去抖）；transient 标志保持 → 事件走 transient regime
+            # 冷却窗内：不调端点（瞬态失败风暴去抖）；transient 标志保持 → 事件走 transient regime。
+            # R3：跳段 ≠ 端点失败——连败计数不动（退避不自我放大，计数只统计真实端点调用失败）。
             self.transient = True
             return None
         try:
@@ -219,9 +290,28 @@ class AuxProvider:
                 self.digest_sem.release()
         except Exception:
             self.transient = True
+            # R3 连败退避：计数 +1 → 冷却窗按阶梯 effective_cooldown(连败数) 自适应拉长
+            #（默认 60→300→1800s 封顶；cooldown_backoff 可注入）。fail_cooldown 保留
+            # 原「冷却总开关」语义（>0 才落冷却窗；=0 → 计数照常但窗口恒 0，sc 契约
+            # 测试「transient 单事件自愈」口径不变，零行为变化）。退避跳段（冷却窗内）
+            # 不累加计数（不自我放大）。状态变化打一行 INFO（端点劣化观测面）。
+            self._consec_fails += 1
             if self.fail_cooldown > 0:
-                self._cooldown_until = time.monotonic() + self.fail_cooldown
+                cooldown = effective_cooldown(self, self._consec_fails)
+                if cooldown > 0:
+                    self._cooldown_until = time.monotonic() + cooldown
+                    logger.info(
+                        "sc-aux: endpoint fail streak=%d cooldown=%.0fs "
+                        "(backoff ladder=%s)",
+                        self._consec_fails, cooldown,
+                        ",".join(f"{c:g}s" for c in self.cooldown_backoff))
             return None
+        # R3 成功复位：1 次成功 → 连败计数归零、冷却窗关闭回落基线（端点恢复观测面）。
+        if self._consec_fails or self._cooldown_until:
+            logger.info("sc-aux: endpoint recovered (fail streak %d -> 0, cooldown cleared)",
+                        self._consec_fails)
+            self._consec_fails = 0
+            self._cooldown_until = 0.0
         key = scdata.digest_regen_key(
             {"content_hash": seg.content_hash}, seg.model_version, seg.session_topic)
         refid = self._digest_cache.get(key)
