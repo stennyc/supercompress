@@ -52,6 +52,7 @@ from sc import (
 from sc.inject import choose_forms, render_block, block_tokens
 from sc.recall import Recaller
 from sc.tagger import Tagger
+from sc.drift import DriftTracker
 
 
 def _get_call_llm():
@@ -287,6 +288,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.threshold_tokens_cap: Optional[int] = None
         # force_evict_mode: 禁用 digest 要求，直接逐出 resident P0/P1/P2
         self._force_evict_mode: bool = False
+        # P2（S-Phase 5）drift tracker：task epoch 状态机 + 锚点 + soft/hard 判定
+        #（纯 sc 层，零 LLM/零网络/确定性；复用 P1 tokenize）
+        self._drift = DriftTracker()
 
         logger.info(
             "tcm-supercompress: shell v2 initialized — store=%s, context_length=%d, "
@@ -433,7 +437,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
             for m in fresh:
                 if is_room_skeleton(str(m.get("content") or "")):
                     continue
-                self.store.append(_make_segment(m, self._tagger, ts=time.time()))
+                seg = _make_segment(m, self._tagger, ts=time.time())
+                # P2.1/P2.2：user 段 epoch 打标 + 漂移检测（零 LLM 确定性，复用 P1 tokenize）
+                self._drift.observe_user(str(m.get("content") or ""))
+                seg.session_topic = str(self._drift.current_epoch)
+                self.store.append(seg)
             self._aux.end_turn()
             result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode).run()
             if result.status not in ("ok", "backpressure"):
@@ -470,6 +478,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
             window = self._window_fresh()
             recaller = Recaller(self.store, window)
             hits = recaller.search(query, k=3)
+            # P2.3 soft：旧 epoch 非结构 P1/P2 召回降权（P1 search 打分核零动，独立 rerank 步）
+            hits = self._drift.soft_rank(hits)
             recalled = [h.seg.original_text for h in hits
                         if h.seg.tier in ("P0", "P1") and h.score > 0.0]
             # Egress 过滤（存量止血）：磁盘上已存的 203 条 P0 group-skeleton 段
@@ -544,6 +554,12 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # 归零只出 L1/L2/L0；structural P0 豁免（活账本永不裁）。壳只调 sc.inject，
         # 零算法体（壳薄度门禁不变）。
         kept = [ws for ws in window.segs if ws.segment.tier in ("P0", "P1")]
+        # P2.3 hard：旧 epoch 非结构 P1/P2 → form=digest_only（可逆：jsonl 字节不动，
+        # epoch 回切即恢复；structural P0 / goal / ledger 豁免）。纯内存翻转，确定性，零 LLM。
+        _hard = {s.segment_id for s in self._drift.hard_evict([ws.segment for ws in kept])}
+        for _ws in kept:
+            if _ws.segment.segment_id in _hard:
+                _ws.form = "digest_only"
         # Egress 过滤（同 select_context）：已存 group-skeleton P0 段逐出压缩
         # anchor-manifest 注入面——否则压缩时群聊骨架仍驻留进 durable 段块。
         _skel = [ws for ws in kept if is_room_skeleton(ws.segment.original_text)]
@@ -618,6 +634,12 @@ class SupercompressContextEngine(sc_context_engine_base()):
                             session_id, self.store.line_count)
             else:
                 logger.info("tcm-supercompress: session %s start (fresh), store=%s", session_id, target)
+        # P2：会话边界 drift 态恢复——有盘内容（carry_over/冷重开）rehydrate（取盘上
+        # 最大整数 epoch + 重建锚点，避免冷重启 epoch 失配假阳性漂移）；fresh session reset。
+        if self.store.line_count:
+            self._drift.rehydrate(list(self.store.by_hash.values()))
+        else:
+            self._drift.reset()
         # 新 session 窗口重置：force_evict 是会话级升级态，fresh 窗口不应继承
         self._force_evict_mode = False
         self.last_prompt_tokens = 0
@@ -655,6 +677,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_total_tokens = 0
         self.compression_count = 0
         self._force_evict_mode = False
+        self._drift.reset()   # P2：会话边界 drift 态全清（session 记忆 scope）
         logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
