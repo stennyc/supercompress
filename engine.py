@@ -72,6 +72,10 @@ DEFAULT_FORCE_COMPACT_RATIO = 0.75
 DEFAULT_MAX_TAIL_TURNS = 15
 DEFAULT_MAX_TAIL_TOKENS = 32000
 DISTILL_WATER_FRAC = 0.8  # sc.distill 软水位（组件内部定义；壳不重算算法）
+# P0.4 rotation advisory 阈值（引擎侧纯信号，零注入、零遥测、零 cache 影响；宿主契约 fail-safe）：
+ROTATION_PROMPT_RATIO = 0.85   # T_prompt：连续压力达标置位线
+ROTATION_RESET_RATIO = 0.75    # < 此值 = 已 compress 过，清 advisory（引擎侧等价「轮转前重读 pressure 二次确认防误轮转」）
+ADVISORY_DEBOUNCE_TURNS = 2    # 连续 N turn 超阈值才置位（session-redesign S-Phase 6 防抖口径）
 
 
 def _default_store_root() -> str:
@@ -256,9 +260,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # bench）回退 legacy 目录。store 目录优先级：hermes_home > legacy。
         self.session_id: Optional[str] = None
         self._bound_session: Optional[str] = None   # 幂等哨兵：同实例同 sid 重入 → no-op
-        # P0.2 双轨收敛：carry_over 单轨 = 宿主现成信号 `carry_over_context`
-        # （run_agent.py:402 经 on_session_start 下发；确认轮转事件才 True）——删插件自造
-        # `carry_over` 配置键（reviewer S1 Minor#2）：严格 session 记忆默认关，事件驱动。
+        # P0.4 单轨收口完成：宿主现成信号 `carry_over_context`（run_agent.py:402 经
+        # on_session_start 下发；确认轮转事件才 True）为 carry 唯一源——插件自造
+        # `carry_over` kwarg/配置键已删（reviewer S1 Minor#2）：严格 session 记忆默认关，事件驱动。
 
         self.store = JsonlStore(self.store_path)
         self._window: Optional[Window] = None
@@ -291,6 +295,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # P2（S-Phase 5）drift tracker：task epoch 状态机 + 锚点 + soft/hard 判定
         #（纯 sc 层，零 LLM/零网络/确定性；复用 P1 tokenize）
         self._drift = DriftTracker()
+        # P0.4 rotation advisory：纯信号置位（零注入/零遥测/零 cache 影响，宿主契约 fail-safe）；
+        # 会话边界（on_session_start/on_session_reset）对称清零，防泄漏进新 session
+        self.rotation_advisory: bool = False
+        self._adv_consec: int = 0
 
         logger.info(
             "tcm-supercompress: shell v2 initialized — store=%s, context_length=%d, "
@@ -413,6 +421,32 @@ class SupercompressContextEngine(sc_context_engine_base()):
         rough = sum(est_tokens(str(m.get("content") or "")) for m in messages)
         return rough > self._effective_threshold()
 
+    def _check_rotation_advisory(self) -> None:
+        """P0.4 rotation advisory 置位检查（turn 末调用；纯信号，不动 store 字节 / messages / window）。
+
+        pressure = last_prompt_tokens / context_length（context_length 为 0 直接 return 防除零）：
+        - pressure < ROTATION_RESET_RATIO → 静默重置（rotation_advisory=False; 计数归零，不 log 防刷屏）
+        - pressure ≥ ROTATION_PROMPT_RATIO → 防抖计数 +1；连续 ADVISORY_DEBOUNCE_TURNS 且未置位
+          → 置 True + logger.info（只 log False→True 翻转，文案含 pressure / 连续 turn 数）
+        - 中间带 [RESET, PROMPT) → 不清已置位，仅重置防抖计数
+        """
+        if self.context_length <= 0:
+            return
+        pressure = self.last_prompt_tokens / self.context_length
+        if pressure < ROTATION_RESET_RATIO:
+            self.rotation_advisory = False
+            self._adv_consec = 0
+        elif pressure >= ROTATION_PROMPT_RATIO:
+            self._adv_consec += 1
+            if self._adv_consec >= ADVISORY_DEBOUNCE_TURNS and not self.rotation_advisory:
+                self.rotation_advisory = True
+                logger.info(
+                    "tcm-supercompress: rotation advisory set (pressure=%.2f, "
+                    "consecutive_turns=%d)", pressure, self._adv_consec)
+        else:
+            # 中间带：不清已置位，只重置防抖计数
+            self._adv_consec = 0
+
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None,
                          **kwargs: Any) -> None:
         """turn 末接线：新 user 消息落盘（P0 即写即 fsync）+ aux turn 边界 + Distiller.run 逐出。
@@ -447,6 +481,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if result.status not in ("ok", "backpressure"):
                 logger.warning("tcm-supercompress: distill status=%s events=%s",
                                result.status, result.events)
+            # P0.4：turn 末 pressure 检查（防抖口径）+ 会话边界外不触碰任何持久态
+            self._check_rotation_advisory()
         except StoreError as e:
             logger.error("tcm-supercompress: store error (fail-safe, window untouched): %s", e)
         except Exception as e:  # 壳永不把宿主 turn 炸掉（fail-open，宿主契约）
@@ -585,16 +621,16 @@ class SupercompressContextEngine(sc_context_engine_base()):
     # ── 会话边界 ──
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
-        """S-Phase 1：per-session 独立 store + carry_over 交接（P0.2 宿主单轨）。
+        """S-Phase 1：per-session 独立 store + carry_over 交接（P0.4 单轨收口）。
 
-        宿主 kwargs（agent_init.py:2133）：hermes_home / platform / model / context_length /
+        宿主 kwargs（agent_init.py:2133）：hermes_home / platform / model / context_length/
         conversation_id；轮转事件额外带 old_session_id（conversation_compression.py:1703/2556）。
         - store 目录：hermes_home 存在 → <hermes_home>/supercompress_store（profile 隔离白捡）；
           缺省（独立测试/bench）→ legacy 目录
         - session 文件 = <dir>/<sid>.jsonl；同实例同 sid 重入 → 幂等 no-op
         - old_session_id + carry_over_context=True（宿主确认轮转信号，run_agent.py:402）
           → materialize(old→new, reopen_from=old)（激活 store.py:137 死代码，P1 自动 stale 标记）；
-          无 carry_over_context 的自动路径 → 默认 OFF（旧插件 kwarg `carry_over` 仅兼容别名）
+          无 carry_over_context 的自动路径 → 默认 OFF（P0.4 单轨收口：宿主信号 `carry_over_context` 唯一源，插件自造键已删）
         - 同 sid 冷重开（新实例、文件已存在）→ replayed P1 中间推理内存标 stale（不动字节）
         """
         home = kwargs.get("hermes_home")
@@ -607,11 +643,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 会话实态」（update_from_response 每次 LLM 调用后重写），重入 = 活会话继续，
             # 重置反而把活态打回 0。与 on_session_reset（会话边界，必须清）语义不同。
         old_sid = kwargs.get("old_session_id")
-        # P0.2：单轨读宿主信号 `carry_over_context`（run_agent.py:402 下发）；
-        # 旧插件 kwarg `carry_over` 留作兼容别名（既有测试/直调面），二者取或。
-        # 宿主面两键永不并发下发（宿主只发 carry_over_context）→ OR 无歧义；
-        # 「宿主显式 False + 旧 kwarg True → 仍 OR 为 True」的理论路径仅测试/直调面可达。
-        carry = bool(kwargs.get("carry_over_context") or kwargs.get("carry_over", False))
+        # P0.4 单轨收口：宿主信号 `carry_over_context`（run_agent.py:402 下发）为唯一源，
+        # 插件自造键 `carry_over` 已删——宿主面唯一事实源，零双轨歧义。
+        carry = bool(kwargs.get("carry_over_context"))
         if old_sid and carry:
             old_file = os.path.join(store_dir, f"{_safe_session_name(old_sid)}.jsonl")
             if os.path.exists(old_file):
@@ -642,6 +676,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
             self._drift.reset()
         # 新 session 窗口重置：force_evict 是会话级升级态，fresh 窗口不应继承
         self._force_evict_mode = False
+        # P0.4：rotation advisory 会话边界清零（对称 on_session_reset，防泄漏进新 session）
+        self.rotation_advisory = False
+        self._adv_consec = 0
         self.last_prompt_tokens = 0
         self.session_id = session_id
         self._bound_session = session_id
@@ -677,6 +714,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_total_tokens = 0
         self.compression_count = 0
         self._force_evict_mode = False
+        # P0.4：rotation advisory 会话边界清零（对称 on_session_start，防泄漏进新 session）
+        self.rotation_advisory = False
+        self._adv_consec = 0
         self._drift.reset()   # P2：会话边界 drift 态全清（session 记忆 scope）
         logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
 

@@ -2,9 +2,9 @@
 
 DoD（references/supercompress-session-redesign.md S-Phase 1）：
 - 双 session 并行 0 泄漏：session A 的信息 0 泄漏进 B（独立文件 <sid>.jsonl）
-- carry_over（确认轮转事件 old_session_id + carry_over=True）→ materialize(old→new, reopen_from=old)
+- carry_over（确认轮转事件 old_session_id + carry_over_context=True）→ materialize(old→new, reopen_from=old)
   激活 store.py:137 死代码，P1 中间推理自动 stale 标记（recall 降权 ×0.5 即刻生效）
-- 自动路径（无 carry_over）默认 OFF：旧 session 归档字节不动，新 session 全新空文件
+- 自动路径（无 carry 信号）默认 OFF：旧 session 归档字节不动，新 session 全新空文件
 - 同 session 冷重开（新实例、文件已存在）→ P1 内存标 stale，文件字节不动（byte-stable 保证）
 - 幂等：同实例同 sid 重入 on_session_start → no-op
 - hermes_home 落点：<hermes_home>/supercompress_store/<sid>.jsonl（profile 隔离白捡）
@@ -23,9 +23,12 @@ from engine import SupercompressContextEngine
 from sc.schema import Segment
 
 
-def _mkengine(tmp_path: Path) -> SupercompressContextEngine:
-    """独立隔离的 engine 实例（external_store_path → tmp，不碰全局 active.jsonl）。"""
-    return SupercompressContextEngine(context_length=256000,
+def _mkengine(tmp_path: Path, context_length: int = 256000) -> SupercompressContextEngine:
+    """独立隔离的 engine 实例（external_store_path → tmp，不碰全局 active.jsonl）。
+
+    context_length 参数（P0.4 rotation advisory 测试面：小窗口 10000 + prompt_tokens
+    造压力）；默认 256000 保持既有测试行为不变。"""
+    return SupercompressContextEngine(context_length=context_length,
                                        external_store_path=str(tmp_path))
 
 
@@ -74,7 +77,7 @@ def test_no_cross_session_leak(tmp_path):
 
 
 def test_carry_over_materializes_old_to_new(tmp_path):
-    """确认轮转（old_session_id + carry_over=True）→ materialize 交接。"""
+    """确认轮转（old_session_id + carry_over_context=True）→ materialize 交接。"""
     e = _mkengine(tmp_path)
     e.on_session_start("s_old")
     _append_user(e, "goal: v1 上线, 关掉重开记忆还在")
@@ -82,7 +85,7 @@ def test_carry_over_materializes_old_to_new(tmp_path):
     e.on_session_reset()  # /new 前 flush，保证 old 归档字节完整
     old_lines = (tmp_path / "s_old.jsonl").read_text(encoding="utf-8")
 
-    e.on_session_start("s_new", old_session_id="s_old", carry_over=True)
+    e.on_session_start("s_new", old_session_id="s_old", carry_over_context=True)
     new_lines = (tmp_path / "s_new.jsonl").read_text(encoding="utf-8")
     # materialize = 字节稳定拷贝（逐行 verbatim）
     assert new_lines.strip() == old_lines.strip(), "carry_over 必须字节稳定物化 old→new"
@@ -299,3 +302,84 @@ class TestStoreRoot_EnvAware:
         monkeypatch.setattr(_bootstrap, "INSTALL_ROOT", "/nonexistent/hermes_root")
         with pytest.raises(RuntimeError, match="安装层级不符"):
             _bootstrap.require_install_root()
+
+
+# ───────────────────────── P0.4 rotation advisory（引擎侧纯信号：turn 末 pressure 检查 + 防抖）────────────────────────
+
+class TestRotationAdvisory:
+    """P0.4 rotation advisory：turn 末压力检查（ROTATION_PROMPT_RATIO=0.85 置位 /
+    ROTATION_RESET_RATIO=0.75 清位 / ADVISORY_DEBOUNCE_TURNS=2 防抖）。
+
+    测试口径：小窗口 context_length=10000 + update_from_response 造 prompt_tokens 压力
+    + on_turn_complete([]) 触发 turn 末检查（turn 末语义，非 LLM 调用时检查）。
+    纯信号契约：不动 store 字节 / messages / window（零注入、零遥测、零 cache 影响）。"""
+
+    def _press(self, e: SupercompressContextEngine, prompt_tokens: int) -> None:
+        """造一次 turn 末压力：usage 更新 + turn 末接线（advisory 检查在 turn 尾部执行）。"""
+        e.update_from_response({"prompt_tokens": prompt_tokens})
+        e.on_turn_complete([])
+
+    def test_single_high_pressure_turn_does_not_set(self, tmp_path):
+        """(a) 单高压 turn 不置位：防抖需连续 ADVISORY_DEBOUNCE_TURNS=2。"""
+        e = _mkengine(tmp_path, context_length=10000)
+        e.on_session_start("s_adv")
+        self._press(e, 9000)   # pressure=0.90 ≥ 0.85，但仅 1 turn
+        assert e.rotation_advisory is False, "单 turn 高压不得置位（防抖需连续 2）"
+        assert e._adv_consec == 1
+
+    def test_two_consecutive_high_pressure_turns_set(self, tmp_path):
+        """(b) 连续 2 turn pressure≥0.85 → 置位 True。"""
+        e = _mkengine(tmp_path, context_length=10000)
+        e.on_session_start("s_adv")
+        self._press(e, 9000)
+        assert e.rotation_advisory is False
+        self._press(e, 8600)   # 连续第 2 turn
+        assert e.rotation_advisory is True, "连续 2 turn ≥0.85 必须置位"
+        # 再压 1 turn：已置位不重复翻转（只 log False→True，幂等保持）
+        self._press(e, 9500)
+        assert e.rotation_advisory is True
+
+    def test_low_pressure_clears_set_advisory(self, tmp_path):
+        """(c) 置位后 pressure<0.75（已 compress 过）→ 清回 False + 防抖计数归零。"""
+        e = _mkengine(tmp_path, context_length=10000)
+        e.on_session_start("s_adv")
+        self._press(e, 9000)
+        self._press(e, 9000)
+        assert e.rotation_advisory is True
+        self._press(e, 6000)   # pressure=0.60 < 0.75
+        assert e.rotation_advisory is False, "<0.75 = 已 compress 过，必须清位"
+        assert e._adv_consec == 0, "清位必须同步归零防抖计数"
+
+    def test_middle_band_keeps_set_and_resets_counter(self, tmp_path):
+        """(d) 中间带 [0.75, 0.85)：不清已置位、仅归零防抖计数（两种向都验）。"""
+        e = _mkengine(tmp_path, context_length=10000)
+        e.on_session_start("s_adv")
+        # 未置位：中间带不得置位（计数保持 0，后续单高压 turn 仍不够 2）
+        self._press(e, 8000)
+        assert e.rotation_advisory is False and e._adv_consec == 0
+        # 置位后：中间带不清位（只压一轮计数归零 → 再一轮高压也需重新连 2）
+        self._press(e, 9000)
+        self._press(e, 9000)
+        assert e.rotation_advisory is True
+        self._press(e, 8000)   # 中间带 [0.75, 0.85)
+        assert e.rotation_advisory is True, "中间带不清已置位"
+        assert e._adv_consec == 0, "中间带只重置防抖计数"
+
+    def test_session_boundaries_clear_advisory(self, tmp_path):
+        """(e) 会话边界（on_session_start / on_session_reset）→ advisory 与计数对称清零。"""
+        e = _mkengine(tmp_path, context_length=10000)
+        e.on_session_start("s_adv")
+        self._press(e, 9000)
+        self._press(e, 9000)
+        assert e.rotation_advisory is True and e._adv_consec == 2
+        # on_session_reset（/new 边界）清零
+        e.on_session_reset()
+        assert e.rotation_advisory is False and e._adv_consec == 0
+        # 重新置位后 on_session_start（轮转 rebind）清零 —— 不得泄漏进新 session
+        e.on_session_start("s_rot")
+        self._press(e, 9000)
+        self._press(e, 9000)
+        assert e.rotation_advisory is True
+        e.on_session_start("s_next")
+        assert e.rotation_advisory is False and e._adv_consec == 0, \
+            "rotation advisory 不得跨 session 边界泄漏"
