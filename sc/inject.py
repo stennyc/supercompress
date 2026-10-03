@@ -55,6 +55,13 @@ def _rank_key(ws, query_terms: set[str]) -> tuple:
 DEFAULT_INDEX_BUDGET = 2048
 DEFAULT_DETAIL_BUDGET = 4096
 
+# P3 30% 零成本剔除档（注入端·非驱逐端——8 个 coder worker 全死在「往 Distiller 塞
+# fill_prune 参数」即误落到驱逐层；本档属注入池自剪，零 LLM 成本，经 L0 指针可回）。
+# 激活水线：窗口压力 ≥ 30%（used > 0.30×cap）。撤 30 是默认（plan §1）；re-add 唯一条件 =
+# P2 遥测「填充占比 > 40%」（telemetry FILLER_RE_ADD_THRESHOLD，gate_re_add_30pct）。
+# 本常量只钉激活水线，门禁读面在 engine 经 P2 telemetry 提供，不在此复写阈值。
+FILL_PRUNE_WATER_FRAC = 0.30
+
 
 def choose_forms(
     segs: list,
@@ -62,6 +69,7 @@ def choose_forms(
     query: str = "",
     index_budget: int | None = None,
     detail_budget: int | None = None,
+    fill_prune: bool = False,
 ) -> list[tuple]:
     """预算驱动选档（核心，确定性）→ [(ws, form, text), ...]，输出 = seq 稳定序。
 
@@ -72,6 +80,12 @@ def choose_forms(
     （活账本永不裁，push cap 语义一致）；其余段按相关性（query 词面命中 → tier → 新近）
     逐段选「装得下的最高档」，超池逐档降级，绝不超预算。细节不丢：L0 指针带 segment_id，
     原文 O(1) 点查可回（recall.get）。
+
+    **fill_prune（P3 30% 零成本剔除档）**：默认 False = 钉死面逐字不变（旧行为）。True 时
+    非结构 P1/P2 填充段被逐档锁到 L0 指针（零 LLM 成本：不依赖 digest、不落驱逐），仅 structural
+    P0 / P0 高信号段豁免——释放注入池给高信号段。激活由 engine 经 P2 telemetry 门禁
+    （fill_share>0.40 且 窗口压力≥FILL_PRUNE_WATER_FRAC）传入，本函数不自读阈值（单源在 telemetry）。
+    确定性不变（同 segs/window/query/fill_prune → 同输出）。
     """
     ib = DEFAULT_INDEX_BUDGET if index_budget is None else max(0, int(index_budget))
     db = DEFAULT_DETAIL_BUDGET if detail_budget is None else max(0, int(detail_budget))
@@ -101,6 +115,12 @@ def choose_forms(
         sid = ws.segment.segment_id
         if sid in structural:
             form_of[sid] = ("L3", _l3_text(ws))
+            continue
+        # P3 30% 零成本剔除档（fill_prune 由 engine 门禁激活）：非结构 P1/P2 填充段直接锁
+        # L0 指针（零 LLM、不落驱逐层；L0 带 segment_id 可 O(1) 点查回原文）。P0（含非结构
+        # 高信号）豁免——填充物 = P1/P2（模型侧推理/日志/填充），与 telemetry filler 口径同源。
+        if fill_prune and ws.segment.tier in ("P1", "P2"):
+            form_of[sid] = ("L0", _l0_ptr(ws))
             continue
         c = costs[sid]
         if c["l3"] <= detail_pool:

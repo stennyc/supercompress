@@ -52,7 +52,7 @@ from sc import (
 # 数据子目录名单一事实源（G2）：telemetry_report_path / on_session_start 的 legacy 回退
 # 各带 env/kwarg 分支（合法独立规则），但目录名字面引用共享常量，杜绝「改一处漏一处」。
 from sc._bootstrap import STORE_SUBDIR
-from sc.inject import choose_forms, render_block, block_tokens
+from sc.inject import choose_forms, render_block, block_tokens, FILL_PRUNE_WATER_FRAC
 from sc.recall import Recaller
 from sc.rerank import RerankGate, rerank_hits
 from sc.semantic import BoundaryExpander, BOUNDARY_TASK
@@ -78,7 +78,11 @@ DEFAULT_COMPACT_RATIO = 0.5
 DEFAULT_FORCE_COMPACT_RATIO = 0.75
 DEFAULT_MAX_TAIL_TURNS = 15
 DEFAULT_MAX_TAIL_TOKENS = 32000
-DISTILL_WATER_FRAC = 0.8  # sc.distill 软水位（组件内部定义；壳不重算算法）
+# P3 梯级水位：主 compact 触发默认挪 0.8→0.55（55–80% compact 带提前预摘要，band 内最优点由
+# P2 遥测定案，先给 0.55 默认——G5 数据闸门；P2 首读 fill_share 0.789 / 触发点随 1–2 周 sink 校准）。
+# 语义边界：本常量 = engine 侧「何时触发 compress」的水线；sc/distill.py 内部 evict-to 软水位
+# （80% cap，R3 逃生门钉死面）与 90% 非 P0 逐出档在组件内独立定义，壳不重算算法。
+DISTILL_WATER_FRAC = 0.55
 # P1 extended-BM25 招③：召回时间衰减接线面（Recaller 构造默认 decay_lambda）。
 # 默认 0.0 = 不启用（钉死面零扰动）；启用 = 同分下越早 seg.seq 越多被降（纯函数、无 wall-clock）。
 DEFAULT_RECALL_DECAY_LAMBDA = 0.0
@@ -849,20 +853,41 @@ class SupercompressContextEngine(sc_context_engine_base()):
             logger.info("tcm-supercompress: compress egress cut %d room-skeleton segment(s) "
                         "from anchor manifest", len(_skel))
         kept = [ws for ws in kept if not is_room_skeleton(ws.segment.original_text)]
-        rendered = choose_forms(kept, window, query=focus_topic or "")
+        # P3 30% 零成本剔除档（注入端·非驱逐端）——两条件门禁（缺任一条 = 不剪，旧行为逐字）：
+        #   ① 密度条件（P2 telemetry 单源）：gate_re_add_30pct = fill_share > FILLER_RE_ADD_THRESHOLD(0.40)
+        #      —— 注入池填充占比足够高才值得剪（P2 首读 0.789 → 开；无证据/低填充 → 关，撤 30 是默认）。
+        #   ② 压力水线：窗口压力 used/cap ≥ FILL_PRUNE_WATER_FRAC(0.30) —— 30% 是「压力档」触发点，
+        #      低压（窗口很空）时 P1 全文是召回主力材料，剪了反失忆（钉 test_drift 空/旧 epoch 全文保留面）。
+        # 开时把非结构 P1/P2 填充段锁到 L0 指针（零 LLM、不落驱逐层，经 segment_id 可 O(1) 回查），
+        # 释放 6K 注入池给高信号段。fail-open（telemetry 异常 → 两条件均取 False，不炸宿主 turn）。
+        # 确定性：门禁单源在 telemetry + FILL_PRUNE_WATER_FRAC（本壳不硬编码 0.40 阈值）；同输入 → 同输出。
+        _fill_prune = False
+        _press = 0.0
+        try:
+            _fs = filler_form_share(window, query=focus_topic or "", segs=kept)
+            _cap = getattr(window, "capacity_tokens", 0)
+            _press = (window.used_tokens / _cap) if _cap else 0.0
+            _fill_prune = (bool(_fs.get("gate_re_add_30pct", False))
+                          and _press >= FILL_PRUNE_WATER_FRAC)
+        except Exception:
+            _fs = {}
+        if _fill_prune:
+            logger.info("tcm-supercompress: P3 30%% 零成本剔除档激活 (fill_share gate + "
+                        "pressure %.2f>=%.2f)，非结构 P1/P2 锁 L0 指针", _press, FILL_PRUNE_WATER_FRAC)
+        rendered = choose_forms(kept, window, query=focus_topic or "", fill_prune=_fill_prune)
         block = render_block(rendered)
         _forms: Dict[str, int] = {}
         for _ws, _ff, _tx in rendered:
             _forms[_ff] = _forms.get(_ff, 0) + 1
         # P2 telemetry（指标① fill_share）：注入池填充占比观测面（镜像 choose_forms 同源
         # 排序/池记账；append-only 零控制流改动 G4；fail-open 永不炸宿主 turn）。
-        try:
-            _fs = filler_form_share(window, query=focus_topic or "", segs=kept)
-            self.telemetry.record_compress(fill_share=_fs["fill_share"],
-                                           pool_tokens=_fs["pool_tokens"],
-                                           forms=_forms)
-        except Exception:
-            pass
+        if _fs:
+            try:
+                self.telemetry.record_compress(fill_share=_fs["fill_share"],
+                                               pool_tokens=_fs["pool_tokens"],
+                                               forms=_forms)
+            except Exception:
+                pass
         out: List[Dict[str, Any]] = list(messages[:self.protect_first_n])
         if block:
             out.append({"role": "system",

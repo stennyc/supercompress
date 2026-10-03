@@ -153,8 +153,9 @@ class Distiller:
 
         store.kpi_log.append({"regime": "normal"})
 
-        # 4. 80% 软水位：P2 → P1 → P0（digest ready 且非结构）逐出至水位
-        self._evict_until(w, water, aux, result)
+        # 4. 80% 软水位：P2 → P1 逐出至水位（P3 梯级：90% 水线不逐 P0/AC——P0 只走
+        #    ① push cap（P0 常驻集 ≤15%）② 100% force_evict 兜底 两出口；本档 P0 豁免）
+        self._evict_until(w, water, aux, result, tiers=("P2", "P1"))
 
         # 5. push cap：P0 常驻集 ≤ 15%（goal / structural P0 永不裁）
         while self._p0_resident_tokens(w) > self.push_cap_tokens:
