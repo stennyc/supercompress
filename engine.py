@@ -12,7 +12,7 @@
   probe_availability 返回 active（@reviewer 静态验收门 #1，tests/test_hermes_shell.py 复现）。
 
 零外呼: aux 端点默认 `_NoEndpoint`（纯本地）→ tagger LLM tiering 异常 → 结构 P0 地板；
-旧 Ollama `No route to host`（旧 engine.py:1795-1802 调内网 Ollama embedding 端点）整类消失。
+历史内网外部端点依赖已整类移除（旧代外部调用面不复存在，运行时不发起任何外部服务调用）。
 Phase 1 起：`update_model()` 由宿主注入 agent 运行时（call_llm + main_runtime），aux 自动
 升级为 `_CallLlmEndpoint`（两级路由：aux 通道短超时 → 主模型兜底）——**生产路径零 env
 依赖**，`LIVE_ENDPOINT_*`/`OPENAI_*` 仅活在 bench 出数面（sc/live_endpoint.py，非生产调用链）。
