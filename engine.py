@@ -52,6 +52,7 @@ from sc import (
 from sc.inject import choose_forms, render_block, block_tokens
 from sc.recall import Recaller
 from sc.rerank import RerankGate, rerank_hits
+from sc.semantic import BoundaryExpander, BOUNDARY_TASK
 from sc.tagger import Tagger
 from sc.drift import DriftTracker
 from sc.version import build_id, desync_warning
@@ -74,6 +75,9 @@ DEFAULT_FORCE_COMPACT_RATIO = 0.75
 DEFAULT_MAX_TAIL_TURNS = 15
 DEFAULT_MAX_TAIL_TOKENS = 32000
 DISTILL_WATER_FRAC = 0.8  # sc.distill 软水位（组件内部定义；壳不重算算法）
+# P1 extended-BM25 招③：召回时间衰减接线面（Recaller 构造默认 decay_lambda）。
+# 默认 0.0 = 不启用（钉死面零扰动）；启用 = 同分下越早 seg.seq 越多被降（纯函数、无 wall-clock）。
+DEFAULT_RECALL_DECAY_LAMBDA = 0.0
 # P0.4 rotation advisory 阈值（引擎侧纯信号，零注入、零遥测、零 cache 影响；宿主契约 fail-safe）：
 ROTATION_PROMPT_RATIO = 0.85   # T_prompt：连续压力达标置位线
 ROTATION_RESET_RATIO = 0.75    # < 此值 = 已 compress 过，清 advisory（引擎侧等价「轮转前重读 pressure 二次确认防误轮转」）
@@ -189,6 +193,23 @@ def _load_config() -> Dict[str, Any]:
         return {}
 
 
+class _AuxMainEndpointProxy:
+    """P4 边界 LLM 端点解耦（G3：宿主主模型，0 外部 / 0 ONNX / 0 模型名硬编码）。
+
+    持有 engine 引用、**调用时刻**活读 `engine._aux.main_endpoint` → `update_model()` 重建
+    `self._aux`（新 `_CallLlmEndpoint`）后 P4 自动骑上当前宿主主模型通道（不留 stale 端点、
+    不引入第二 provider、不建模型名/provider 块）；端点两级路由/瞬态失败语义由 aux 侧统一
+    承担，P4 层只管自己的 2 档退避 + per-epoch 缓存（见 sc/semantic.py）。测试替身注入
+    （`e._aux.main_endpoint = FakeEndpoint()`）同样经本代理活读生效，零改动测试面。
+    """
+
+    def __init__(self, engine) -> None:
+        self._engine = engine
+
+    def call(self, task: str, text: str) -> str:
+        return self._engine._aux.main_endpoint.call(task, text)
+
+
 def _make_segment(msg: Dict[str, Any], tagger: Tagger, ts: float) -> Segment:
     """宿主 message → sc.Segment（接线：role→provenance；classify→tier/structural，全委托 sc.tagger）。"""
     provenance = "user" if msg.get("role") == "user" else "model"
@@ -245,6 +266,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.force_compact_ratio: float = _get("force_compact_ratio", DEFAULT_FORCE_COMPACT_RATIO)
         self.max_tail_turns: int = _get("max_tail_turns", DEFAULT_MAX_TAIL_TURNS)
         self.max_tail_tokens: int = _get("max_tail_tokens", DEFAULT_MAX_TAIL_TOKENS)
+        # P1 extended-BM25 招③：召回时间衰减接线面（按参数控制启用面；默认 0 = 钉死面不扰动）
+        self.recall_decay_lambda: float = _get("recall_decay_lambda", DEFAULT_RECALL_DECAY_LAMBDA)
         store_path = _get("external_store_path", _default_store_root())
         # 数据面：单一 active.jsonl（@data-engineer 契约：旧 chunk_* store 零携带零触碰，
         # 新 active.jsonl 是独立新文件，同住目录互不干扰）
@@ -306,6 +329,17 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.rerank_low_score_threshold: float = float(_get("rerank_low_score_threshold", 0.0))
         self._rerank_gate = RerankGate(low_score_threshold=self.rerank_low_score_threshold)
         self._rerank_cache: dict = {}
+        # P4（precision P4）：边界宿主 LLM 语义扩展（「花最少」= drift 边界那一下花一次宿主 LLM
+        # 干三件：扩词 + top-N 精排 + 重建 epoch 锚点；G3 端点 = 宿主主模型端点代理
+        # （_CallLlmEndpoint 两级路由，宿主 update_model 注入 call_llm+main_runtime，0 外部 /
+        # 0 ONNX / 0 模型名硬编码）+ per-epoch 缓存（同 epoch 不重算）+ 2 档冷却回退纯 BM25
+        # （默认 30s→180s 封顶，短于 digest 60→300→1800s——边界 LLM 更低频；aux 两级路由
+        # cooldown 阶梯模式复用；非确定性只存在于边界，常驻路径 0 LLM 确定性不破，G4）
+        self._p4_fail_cooldown: float = _get("boundary_fail_cooldown", 30.0)
+        self._p4_cache: dict = {}
+        self._p4 = BoundaryExpander(
+            _AuxMainEndpointProxy(self), cache=self._p4_cache,
+            cooldown_ladder=self._p4_cooldown_ladder())
         # P0.4 rotation advisory：纯信号置位（零注入/零遥测/零 cache 影响，宿主契约 fail-safe）；
         # 会话边界（on_session_start/on_session_reset）对称清零，防泄漏进新 session。
         # P0.4b：契约化读面——底层私有存储 _rotation_advisory（rotation_advisory 升 property，
@@ -404,6 +438,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._force_evict_mode = False
         # 重算阈值
         self.threshold_tokens = int(context_length * DISTILL_WATER_FRAC)
+        # P4：端点代理活读 self._aux.main_endpoint（update_model 重建 _aux 后自动骑上新端点）——
+        # P4 状态（per-epoch 缓存 / 冷却阶梯）为端点健康 scoped 与会话 scoped 的交叉面：
+        # 端点本身换了（新宿主运行时）→ 冷却连败归零（旧端点劣化不迁怒新端点）。
+        self._p4.consec_fails = 0
+        self._p4._cooldown_until = 0.0
         logger.info("tcm-supercompress: update_model model=%s ctx=%d aux=%s runtime=%s call_llm=%s",
                     model, context_length, type(self._aux.main_endpoint).__name__,
                     "injected" if self._main_runtime else "none",
@@ -527,6 +566,50 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 中间带：不清已置位，只重置防抖计数
             self._adv_consec = 0
 
+    def _p4_cooldown_ladder(self) -> tuple:
+        """P4 边界 LLM 2 档冷却阶梯（aux 两级路由 cooldown 模式复用：基线 × 乘数阶梯，封顶语义）。
+
+        默认 boundary_fail_cooldown=30s → (30s, 180s)——边界 LLM 低频，短于 digest 60→300→1800s；
+        =0 → 阶梯全 0 → 冷却窗恒关（fail-safe「单事件自愈」语义，与 sc 契约口径一致）。
+        纯配置规整（镜像 aux_provider 阶梯派生），壳不发明算法。"""
+        base = self._p4_fail_cooldown
+        return tuple(base * m for m in (1.0, 6.0))
+
+    def _fire_boundary_expand(self, text: str) -> None:
+        """P4：drift 边界那一下花一次宿主 LLM 干三件（扩词 + top-N 精排 + 重建 epoch 锚点）。
+
+        - 只在 `observe_user` 返回 True（drift 边界）触发——常驻路径 0 LLM（G4 确定性不破）；
+        - per-epoch 缓存命中（同 epoch 不重算）→ 直接返回（0 LLM 调用）；
+        - 种子词 = 当前 epoch 锚点词面（drift 触发 K 条重建后的「当前任务关键词集」）；
+        - 候选 = extended-BM25 粗排 top-3（Recaller.search，P1 打分核零动）；
+        - 成功 → 扩展词面喂回 P1 extended-BM25（select_context query 面）+ 精排 keep/drop
+          （verdicts 破近义误召）+ 并入 epoch 锚点（merge_anchor，与 P0 合流拆 3.4% 填充墙）；
+        - 失败/超时 → 纯 BM25 回退（degraded 保守面 + 冷却阶梯，sc/semantic 内闭环）；
+        - 壳 fail-open 契约：任何异常不炸宿主 turn（宽 catch + 留痕 log，同 on_turn_complete 既有口径）。
+        """
+        try:
+            epoch = self._drift.current_epoch
+            if epoch in self._p4_cache:               # per-epoch 缓存命中 → 0 LLM（花最少）
+                return
+            seed = self._drift.anchor_terms()          # 当前任务关键词集（锚点词面，sorted 确定性）
+            window = self._window_fresh()
+            recaller = Recaller(self.store, window)
+            candidates = recaller.search(text, k=3)    # extended-BM25 粗排 top-3（扩词后喂回同面）
+            res = self._p4.expand(epoch, seed, candidates, task_text=text)
+            if not res.degraded:
+                # ③ 重建 epoch 锚点：扩展词面并入 drift 锚点（内存面；session_topic 整数 epoch 标 /
+                # jsonl 字节零动——与 P0 合流，epoch 锚点 = 扩展后任务关键词集）
+                merged = self._drift.merge_anchor(res.expanded_terms)
+                logger.info(
+                    "tcm-supercompress: P4 boundary expand epoch=%d expanded=%d "
+                    "anchor_merged=%d verdicts=%d cache=%d",
+                    epoch, len(res.expanded_terms), merged, len(res.verdicts), len(self._p4_cache))
+            else:
+                logger.info("tcm-supercompress: P4 boundary expand epoch=%d degraded -> pure-BM25 "
+                            "fallback (cooldown=%s)", epoch, self._p4.cooldown_status())
+        except Exception as e:                          # 壳 fail-open：P4 面异常不炸宿主 turn
+            logger.warning("tcm-supercompress: P4 boundary expand no-op (pure-BM25 fallback): %s", e)
+
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None,
                          **kwargs: Any) -> None:
         """turn 末接线：新 user 消息落盘（P0 即写即 fsync）+ aux turn 边界 + Distiller.run 逐出。
@@ -553,9 +636,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     continue
                 seg = _make_segment(m, self._tagger, ts=time.time())
                 # P2.1/P2.2：user 段 epoch 打标 + 漂移检测（零 LLM 确定性，复用 P1 tokenize）
-                self._drift.observe_user(str(m.get("content") or ""))
+                text = str(m.get("content") or "")
+                triggered = self._drift.observe_user(text)
                 seg.session_topic = str(self._drift.current_epoch)
                 self.store.append(seg)
+                # P4：drift 边界那一下花一次宿主 LLM（扩词+精排+重建锚点；常驻 0 LLM，G4）
+                if triggered:
+                    self._fire_boundary_expand(text)
             self._aux.end_turn()
             # R3：force_ratio 接 engine 同源配置 force_compact_ratio（kwarg = 接线非算法）
             result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode,
@@ -594,17 +681,31 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if len(query.strip()) < 8:
                 return None
             window = self._window_fresh()
-            recaller = Recaller(self.store, window)
-            hits = recaller.search(query, k=3)
+            recaller = Recaller(self.store, window, decay_lambda=self.recall_decay_lambda)
+            # 招③ 时间衰减接线面：decay_lambda = 实例默认（engine.recall_decay_lambda，
+            # kwarg/配置 recall_decay_lambda 控制启用；默认 0 = 钉死面不扰动）
+            # P4：边界扩展词面喂回 extended-BM25（词面扩词，不是向量；命中缓存 = 该 epoch
+            # 边界 LLM 成功面 → 扩词并入 query 词面；无缓存/回退 → 原 query，常驻 100% 确定性 G4）
+            p4_terms = self._p4.expanded_terms(self._drift.current_epoch)
+            p4_query = query + ((" " + " ".join(p4_terms)) if p4_terms else "")
+            hits = recaller.search(p4_query, k=3)
             # P2.3 soft：旧 epoch 非结构 P1/P2 召回降权（P1 search 打分核零动，独立 rerank 步）
             hits = self._drift.soft_rank(hits)
+            # P4：top-N 精排 keep/drop（破近义误召；fail-safe keep-all——全 drop 回落原集合，
+            # 不强制空召回；verdicts 缺失/回退 = {} → 零行为）
+            p4_verdicts = self._p4.verdicts(self._drift.current_epoch)
+            if p4_verdicts:
+                _kept = [h for h in hits if p4_verdicts.get(h.seg.segment_id, "keep") == "keep"]
+                hits = _kept if _kept else hits
             # P3（S-Phase 4）gate LLM rerank（独立 step，P1 打分核零动）：
             # gate 三选一（召回空 / 显式搜索词 / top-1 < 低分阈值，默认保守）+ 缓存键
             # (sha256(query), store.line_count) + fail-safe（LLM 不可用/解析失败 → 原样返回）。
             # 端点 = aux 主模型端点（宿主主模型共享，零新 provider / 零模型名 / 零 provider 块）。
             # _NoEndpoint（未注入 call_llm）下 gate 触发也 fail-safe no-op（纯本地不炸）。
+            # P4：rerank gate 面用 p4_query（= 实际召回 query，含边界扩词）——gate 判定 / 提示词 /
+            # 缓存键与召回面同源；无 P4 缓存时 p4_query == query（P3 钉死面 0 扰动）。
             hits = rerank_hits(
-                hits, query, self._aux.main_endpoint,
+                hits, p4_query, self._aux.main_endpoint,
                 cache=self._rerank_cache, window_version=self.store.line_count,
                 gate=self._rerank_gate)
             recalled = [h.seg.original_text for h in hits
@@ -785,6 +886,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._adv_consec = 0
         # P3：rerank 缓存会话边界清零（防跨 session 泄漏：新 store 的窗口指纹从 0 起步）
         self._rerank_cache = {}
+        # P4：边界扩展缓存会话边界清零（对称 rerank 缓存；防跨 session 泄漏旧 epoch 扩词/精排）
+        self._p4_cache.clear()
         self.last_prompt_tokens = 0
         self.session_id = session_id
         self._bound_session = session_id
@@ -835,6 +938,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._drift.reset()   # P2：会话边界 drift 态全清（session 记忆 scope）
         # P3：rerank 缓存会话边界清零（对称 on_session_start）
         self._rerank_cache = {}
+        # P4：边界扩展缓存会话边界清零（对称 on_session_start）
+        self._p4_cache.clear()
         logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
