@@ -202,3 +202,32 @@ class DriftTracker:
                 self.anchor |= q
                 self.anchor_user_count += 1
                 self.anchor_evidence += 1      # 证据面：rehydrate 锚点实际由几条段重建（可 < N_ANCHOR）
+
+    # ── P4（precision P4）：重建 epoch 锚点（与 P0 合流，词面；jsonl 字节 / session_topic 整数 epoch 标零动）──
+    def anchor_terms(self, cap: int = 40) -> list:
+        """当前 epoch 锚点词面（sorted 确定性；截断 cap 供提示词有界）。
+
+        锚点本身是显著 token 集（P2 语义，_significant 产出）；sorted 输出保证确定性
+        （同状态两次全等）；cap 限定 P4 边界 LLM 提示词 seed 面。P4 用「当前任务关键词集」= 本方法。
+        """
+        return sorted(self.anchor)[:cap]
+
+    def merge_anchor(self, terms) -> int:
+        """P4：把 LLM 扩展词面并入当前 epoch 锚点（重建锚点，内存面；session_topic / jsonl 零动）。
+
+        锚点语义 = 显著 token 集（P2 hit_ratio 判定面）→ 每个扩展词先 tokenize 再取显著 token
+        （_significant，与锚点同构：CJK 表意字 / len≥2 词），保证并入的词**对 drift 判定有效**
+        （同义换措辞不再误报 drift）；纯标点/单字母噪声自动滤除。有新增 token →
+        anchor_source="expand"（审计面：区别于 build/drift/rehydrate）；anchor_evidence 不动
+        （证据基 = user 段数，LLM 扩词非 user 证据，诚实面不夸大）。幂等：全已在锚点 → 返回 0
+        且不改 source。返回新增 token 数（可观测面）。内存面：冷重启 rehydrate 从盘上 user 段
+        确定性重建锚点（LLM 词面不持久化）→ 下一边界事件再花一次 LLM（「花最少」语义不变）。
+        """
+        new: set = set()
+        for term in (terms or []):
+            new |= _significant(str(term))
+        new -= self.anchor
+        if new:
+            self.anchor |= new
+            self.anchor_source = "expand"
+        return len(new)
