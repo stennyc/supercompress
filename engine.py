@@ -86,18 +86,22 @@ ADVISORY_DEBOUNCE_TURNS = 2    # 连续 N turn 超阈值才置位（session-rede
 
 
 def _default_store_root() -> str:
-    """默认 store 根（安装可移植，零宿主改动）：HERMES_HOME-aware 解析。
+    """默认 store 根（安装可移植，零宿主改动）：委托 ``sc._bootstrap.store_dir()`` 单源解析。
 
     优先级：显式 ``external_store_path`` 配置（__init__ 消费）> ``HERMES_HOME`` env
     （生产 gateway 进程 per-profile 自带，指向 profile 数据根）> ``~/.hermes``（平台默认）。
     生产轮转 rebind 缺 ``hermes_home`` kwarg 时，env 回退即落对 profile 目录
     （reviewer S1 Major#1 效果达成，宿主 conversation_compression.py 零改动）；
     任意安装环境设 ``HERMES_HOME`` 指数据根即可，无 /root、/usr/local 写死。
-    与 sc/_bootstrap.hermes_home() 同源语义（同一 env 名，不 import 宿主）。
+
+    单源铁律（安装可移植性的可维护性）：store 子目录名 + HERMES_HOME 解析只在
+    ``sc/_bootstrap.store_dir()`` 一处定义；本壳不再内联复写该规则（避免「改一处漏一处」
+    的漂移——CLI 脚本与 engine 数据面共用同一解析，任意安装目录成立）。惰性 import
+    与 CLI 脚本口径一致（``from sc._bootstrap import store_dir``），壳 import sc 但不
+    import 宿主。
     """
-    hh = os.environ.get("HERMES_HOME", "").strip()
-    base = hh if hh else os.path.expanduser("~/.hermes")
-    return os.path.join(base, "supercompress_store")
+    from sc._bootstrap import store_dir
+    return store_dir()
 
 
 def sc_context_engine_base():
