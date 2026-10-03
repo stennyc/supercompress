@@ -23,6 +23,8 @@ fence：纯 sc 层算法 + engine 接线；不新增数据列（复用 session_t
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from .recall import Hit, tokenize
 
 # ── P2 定稿参数（plan P2.x；引擎配置面可覆写）──
@@ -61,13 +63,16 @@ class DriftTracker:
     因 is_old_epoch 比较 current_epoch），字节从未丢失（jsonl 单一事实源），即 hard 可逆。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, sink=None) -> None:
         self.current_epoch: int = 0
         self.anchor: set[str] = set()        # 当前 epoch 话题锚点（显著 token 并集）
         self.anchor_user_count: int = 0       # 当前 epoch 已入锚 user 段数
         self.consec_low: int = 0              # 连续低于阈值计数
         self.user_seq: int = 0               # 本 session user 段计数（drift 事件可观测）
         self.drift_events: list[dict] = []    # 宿主日志/审计面（{epoch, user_seq, ratio}）
+        # P2 telemetry 留痕面：可选 sink（list 或 callable）——_fire 那一下才记（常驻路径
+        # 零开销：observe_user 命中/未命中都不记）；None（缺省）= 纯审计面，行为与 P0 逐字一致。
+        self._sink = sink
         self._recent: list[set[str]] = []     # 最近 K 条 user 显著 token（drift 时重建锚点）
         self.anchor_source: str = "none"       # 锚点来源：build(头N) / drift(触发K重建) / rehydrate(冷重开)
         self.anchor_evidence: int = 0          # 当前锚点实际由几条 user 段构建（诚实审计面；≠ anchor_user_count 门控哨兵）
@@ -120,8 +125,17 @@ class DriftTracker:
         self.anchor_evidence = len([r for r in self._recent if r])   # 锚点实际由最近 ≤K_CONSEC 条有显著 token 段构建（≠ N_ANCHOR 门控哨兵）
         self.anchor_user_count = N_ANCHOR      # 门控哨兵：跳过建锚期；证据面见 anchor_evidence（二者分离，不夸大）
         self.consec_low = 0
-        self.drift_events.append({"epoch": self.current_epoch,
-                                   "user_seq": self.user_seq, "ratio": round(last_ratio, 4)})
+        evt = {"epoch": self.current_epoch,
+               "user_seq": self.user_seq, "ratio": round(last_ratio, 4)}
+        self.drift_events.append(evt)
+        # P2 telemetry 留痕面（常驻路径零开销：仅 _fire 记）：
+        # - list sink（测试/bench）→ append 事件 dict；
+        # - callable sink（engine 侧 TelemetryCollector 回调）→ 调 callback(dict(evt))。
+        if self._sink is not None:
+            if callable(self._sink):
+                self._sink(dict(evt))
+            else:
+                self._sink.append(dict(evt))
 
     # ── P2.3 判定/重排（引擎侧调用；本模块不逐出，逐出是 distill.form 语义）──
     def is_old_epoch(self, seg) -> bool:

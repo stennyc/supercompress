@@ -55,6 +55,7 @@ from sc.rerank import RerankGate, rerank_hits
 from sc.semantic import BoundaryExpander, BOUNDARY_TASK
 from sc.tagger import Tagger
 from sc.drift import DriftTracker
+from sc.telemetry import TelemetryCollector, filler_form_share
 from sc.version import build_id, desync_warning
 
 
@@ -317,9 +318,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.threshold_tokens_cap: Optional[int] = None
         # force_evict_mode: 禁用 digest 要求，直接逐出 resident P0/P1/P2
         self._force_evict_mode: bool = False
+        # P2 telemetry（precision P2 · 三指标数据闸门）：会话内观测 sink（append-only，
+        # 零控制流改动 G4；JSONL 跨会话攒数喂 P3；fail-open 永不炸宿主 turn）。
+        # 数据根 HERMES_HOME-aware（0 硬编码路径，G2）。
+        self.telemetry = TelemetryCollector(sink_path=self.telemetry_report_path())
         # P2（S-Phase 5）drift tracker：task epoch 状态机 + 锚点 + soft/hard 判定
-        #（纯 sc 层，零 LLM/零网络/确定性；复用 P1 tokenize）
-        self._drift = DriftTracker()
+        #（纯 sc 层，零 LLM/零网络/确定性；复用 P1 tokenize）+ P2 telemetry 留痕面
+        #（sink 回调 = 仅 _fire 那一下记会话内 drift 事件，常驻路径零开销）
+        self._drift = DriftTracker(sink=self._on_drift_fire)
         # P3（S-Phase 4）gate rerank：LLM 两步重排（独立 step，P1 打分核零动，同 P2 soft_rank 模式）。
         # 端点注入 = aux 主模型端点（宿主主模型共享，零新 provider / 零模型名 / 零 provider 块）；
         # gate 默认保守（low_score_threshold=0.0 → 只在「召回空 / 显式搜索词」触发，非常态 LLM 调用）；
@@ -503,6 +509,34 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._window = Window(self.context_length, [WindowSeg(s) for s in segs])
         self._tagger = Tagger(self._aux, "")
         return self._window
+
+    # ── P2 telemetry（precision P2 · 三指标数据闸门）：宿主可读面 + drift 留痕回调 ──
+
+    def telemetry_report_path(self) -> str:
+        """P2 telemetry sink 路径（JSONL，跨会话 append-only 攒数喂 P3）。
+
+        数据根 HERMES_HOME-aware（同 _default_store_root 单源语义；G2：0 硬编码路径）：
+        - HERMES_HOME 设置 → <HERMES_HOME>/supercompress_store/telemetry.jsonl
+          （per-profile 隔离白捡，与 on_session_start 生产 rebind 目录同住）；
+        - 未设（独立测试/bench，external_store_path 显式指定数据根）→
+          <_legacy_store_dir>/telemetry.jsonl（tmp 目录直落，测试面自洽）。
+        """
+        hh = os.environ.get("HERMES_HOME", "").strip()
+        if hh:
+            return os.path.join(os.path.expanduser(hh), "supercompress_store",
+                                "telemetry.jsonl")
+        return os.path.join(self._legacy_store_dir, "telemetry.jsonl")
+
+    def _on_drift_fire(self, evt: dict) -> None:
+        """P2 telemetry（指标③ drift 留痕面）：仅 drift 事件 _fire 那一下回调
+        （sc.drift.DriftTracker sink 缝；常驻 observe_user 路径零开销，零控制流改动 G4）。
+
+        fail-open 契约：遥测记录异常不炸宿主 turn（telemetry 非关键面，同宽 catch 口径）。
+        会话内 records 攒数，会话边界（on_session_reset / on_session_end）flush 落 JSONL。"""
+        try:
+            self.telemetry.record_drift(events=1, epoch=evt.get("epoch"), fired=True)
+        except Exception:
+            pass
 
     # ── 宿主调用面（abstract 三件 + 可选钩子）──
 
@@ -812,6 +846,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
         _forms: Dict[str, int] = {}
         for _ws, _ff, _tx in rendered:
             _forms[_ff] = _forms.get(_ff, 0) + 1
+        # P2 telemetry（指标① fill_share）：注入池填充占比观测面（镜像 choose_forms 同源
+        # 排序/池记账；append-only 零控制流改动 G4；fail-open 永不炸宿主 turn）。
+        try:
+            _fs = filler_form_share(window, query=focus_topic or "", segs=kept)
+            self.telemetry.record_compress(fill_share=_fs["fill_share"],
+                                           pool_tokens=_fs["pool_tokens"],
+                                           forms=_forms)
+        except Exception:
+            pass
         out: List[Dict[str, Any]] = list(messages[:self.protect_first_n])
         if block:
             out.append({"role": "system",
@@ -936,6 +979,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.rotation_advisory = False
         self._adv_consec = 0
         self._drift.reset()   # P2：会话边界 drift 态全清（session 记忆 scope）
+        # P2 telemetry：会话边界清会话内 records（session 记忆 scope，同 _drift.reset）；
+        # JSONL sink 文件 = 跨会话 append-only 观测面（本 reset 不动文件，文件在 end 面 flush）
+        self.telemetry.reset()
         # P3：rerank 缓存会话边界清零（对称 on_session_start）
         self._rerank_cache = {}
         # P4：边界扩展缓存会话边界清零（对称 on_session_start）
@@ -962,6 +1008,12 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 pass
         logger.info("tcm-supercompress: session %s end, store lines=%d",
                     session_id, self.store.line_count)
+        # P2 telemetry：会话末 flush 会话内 records 落 JSONL sink（跨会话 append-only
+        # 攒数喂 P3；fail-open：写失败/无 sink → 清 records，不炸宿主收尾面）
+        try:
+            self.telemetry.flush()
+        except Exception:
+            pass
 
     def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
         return bool(self.store.by_hash)
