@@ -29,7 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from engine import SupercompressContextEngine
-from sc.drift import DriftTracker, hit_ratio, N_ANCHOR, K_CONSEC
+from sc.drift import DriftTracker, hit_ratio, N_ANCHOR, K_CONSEC, SOFT_FACTOR
 from sc.recall import Hit
 from sc.schema import Segment
 from sc.distill import WindowSeg
@@ -377,3 +377,73 @@ def test_engine_on_session_start_rehydrates(tmp_path):
     e2.on_session_start("s_rehy")
     assert e2._drift.current_epoch == 1, "冷重开应 rehydrate 到盘上最大 epoch（=1）"
     assert e2._drift.is_old_epoch(_seg("x", topic="1")) is False, "重启前段不得判旧（假阳性护城河）"
+
+
+# ─────────────────────────── SC P0 负例护城河：空 epoch 段绝不被 drift 误当旧 epoch ───────────────────────────
+# task t_5ee083be DoD「负例测试：空 epoch 段不再被 drift 当旧 epoch 降级（新增 test）」。
+# 生产存量 90%+ 段（legacy global store + model-sourced 段）session_topic 恒 ""——
+# drift 的 soft/hard 判定面必须对此类段**中性**（不降权、不逐出），只有 P2 引擎打标
+# 的整数 epoch 段才参与。三层各钉一条（sc 层判定 + 确定性 + 引擎 e2e）。
+
+def test_empty_epoch_segments_never_treated_as_old_epoch():
+    """负例#1（sc 判定面）：session_topic 为 ""（空 epoch）的段——无论 current_epoch 是多少、
+    无论 soft 还是 hard——一律中性，绝不因「旧 epoch」被降权 / 逐出（防误伤整片存量数据）。"""
+    d = DriftTracker()
+    d.current_epoch = 7   # 深当前 epoch（多任务切换后）
+    # 空 epoch 段（生产 90%+ 存量态："" / legacy 非整数 topic 混存）
+    empty_p1 = _seg("存量 推理 内容", tier="P1", topic="", seq=0)
+    empty_p2 = _seg("存量 观察 内容", tier="P2", topic="", seq=1)
+    assert d.is_old_epoch(empty_p1) is False, "空 epoch P1 不得判旧（误伤护城河）"
+    assert d.is_old_epoch(empty_p2) is False, "空 epoch P2 不得判旧（误伤护城河）"
+    # 对照组：真正的旧 epoch（整数串 ≠ 当前）仍判旧
+    assert d.is_old_epoch(_seg("旧 推理", tier="P1", topic="0", seq=2)) is True
+    # soft 面：空 epoch 段得分不动，旧 epoch 段才 ×SOFT_FACTOR
+    neu_p1 = _seg("当前 推理", tier="P1", topic="7", seq=3)
+    old_p1 = _seg("旧 推理", tier="P1", topic="0", seq=4)
+    out = d.soft_rank([Hit(empty_p1, 10.0), Hit(old_p1, 10.0), Hit(neu_p1, 10.0)])
+    by = {h.seg.seq: h.score for h in out}
+    assert abs(by[empty_p1.seq] - 10.0) < 1e-9, "空 epoch 段 soft 不得降权"
+    assert abs(by[old_p1.seq] - 10.0 * SOFT_FACTOR) < 1e-9, "真旧 epoch 段才 ×SOFT_FACTOR"
+    assert abs(by[neu_p1.seq] - 10.0) < 1e-9, "当前 epoch 段不动"
+    # hard 面：空 epoch 段绝不在逐出候选里（整片存量数据不被 digest_only 误伤）
+    cands = {s.seq for s in d.hard_evict([empty_p1, empty_p2, old_p1, neu_p1])}
+    assert empty_p1.seq not in cands and empty_p2.seq not in cands, "空 epoch 段不得进 hard 逐出候选"
+    assert cands == {old_p1.seq}, f"只有真旧 epoch 非结构 P1/P2 进候选，实际 {cands}"
+
+
+def test_empty_epoch_neutrality_deterministic_across_epochs():
+    """负例#2（确定性面）：空 epoch 段在中性判定上对**所有** current_epoch 一致（无 epoch 特例分支、
+    无状态漂移）——同一段在同一 tracker 的 epoch 0/1/7 下判定全等（is_old_epoch 恒 False）。"""
+    d = DriftTracker()
+    empty = _seg("存量 内容", tier="P1", topic="", seq=0)
+    verdicts = []
+    for ep in (0, 1, 7):
+        d.current_epoch = ep
+        verdicts.append((ep, d.is_old_epoch(empty)))
+    assert verdicts == [(0, False), (1, False), (7, False)], \
+        f"空 epoch 段在任何 current_epoch 下必须恒中性（不判旧），实际 {verdicts}"
+
+
+def test_engine_compress_never_hard_evicts_empty_epoch_segments(tmp_path):
+    """负例#3（引擎 e2e 面）：compress 跑 P2.3 hard 时，窗口里的空 epoch（""）段**全文保留**
+    （不被翻 digest_only），只有真旧 epoch 整数标段被逐出——钉死「空 epoch 段不被 drift 误伤整片」。"""
+    e = _mkengine(tmp_path)
+    e.on_session_start("s_neg_empty")
+    e._drift.current_epoch = 1
+    # 存量空 epoch 段（生产 90%+ 数据态）+ 真旧 epoch 段 + 当前 epoch 段
+    legacy_p1 = _seg("LEGACY_EMPTY_EPOCH 存量 推理 FULLTEXT_LEGACY", tier="P1", topic="", seq=0)
+    old_p1 = _seg("OLD_INT_EPOCH 旧任务 推理 FULLTEXT_OLD", tier="P1", topic="0", seq=1)
+    cur_p1 = _seg("CURRENT_EPOCH 当前 任务 FULLTEXT_CUR", tier="P1", topic="1", seq=2)
+    e.store.append(legacy_p1)
+    e.store.append(old_p1)
+    e.store.append(cur_p1)
+    e.store.flush()
+    out = e.compress([{"role": "user", "content": "继续 当前 任务"}])
+    block = "\n".join(m["content"] for m in out if m["role"] == "system")
+    assert "FULLTEXT_LEGACY" in block, "空 epoch（legacy）P1 全文必须保留（不被 drift 误伤）"
+    assert "FULLTEXT_OLD" not in block, "真旧 epoch（整数 0 ≠ 当前 1）P1 全文应被 hard 逐出"
+    assert "FULLTEXT_CUR" in block, "当前 epoch P1 全文必须保留"
+    # 可逆：jsonl 单一事实源字节不动（全部三段原文仍在盘上）
+    back = {s.segment_id: s.original_text for s in e.store.replay()}
+    assert "FULLTEXT_LEGACY" in back[legacy_p1.segment_id]
+    assert "FULLTEXT_OLD" in back[old_p1.segment_id]
