@@ -117,8 +117,8 @@ class TestInstructionPrompt:
         from sc.semantic import _boundary_instruction, SEED_CAP, TASK_CONTEXT_CHARS
         hits = _hits(["x" * 2000])
         p = _boundary_instruction([f"t{i}" for i in range(200)], hits, "长" * 500)
-        assert "t19" in p, "seed 截断到 SEED_CAP"
-        assert "t20" not in p
+        assert f"t{SEED_CAP - 1}" in p, "seed 截断到 SEED_CAP（末位在）"
+        assert f"t{SEED_CAP}" not in p, "超出 SEED_CAP 的 seed 不出"
         assert ("长" * (TASK_CONTEXT_CHARS + 1)) not in p, "task 上下文截断有界"
         assert ("x" * 513) not in p, "候选文本截断有界"
 
@@ -141,11 +141,12 @@ def _exp(ep, clock=None, ladder=DEFAULT_COOLDOWN_LADDER):
 class TestExpanderCache:
     def test_success_caches_per_epoch_second_call_zero_llm(self):
         ep = FakeEndpoint()
-        ids = [f"b{i}aa-{i}" for i in range(3)]
+        hits = _hits(["a", "b", "c"])
+        ids = [h.seg.segment_id for h in hits]
         ep.responses[BOUNDARY_TASK] = json.dumps(
             {"expanded": ["hpa"], "keep": ids, "drop": []})
         exp = _exp(ep)
-        r1 = exp.expand(1, ["k8s"], _hits(["a", "b", "c"]))
+        r1 = exp.expand(1, ["k8s"], hits)
         assert len(ep.calls) == 1 and not r1.degraded
         assert exp.cached(1) is r1, "成功结果入 per-epoch 缓存"
         r2 = exp.expand(1, ["k8s"], _hits(["a", "b", "c"]))
@@ -153,7 +154,8 @@ class TestExpanderCache:
 
     def test_different_epoch_recomputes(self):
         ep = FakeEndpoint()
-        ids = [f"c{i}aa-{i}" for i in range(3)]
+        hits = _hits(["a", "b", "c"])
+        ids = [h.seg.segment_id for h in hits]
         ep.responses[BOUNDARY_TASK] = json.dumps({"expanded": [], "keep": ids, "drop": []})
         exp = _exp(ep)
         exp.expand(1, ["s"], _hits(["a", "b", "c"]))
@@ -163,9 +165,11 @@ class TestExpanderCache:
     def test_failed_result_not_cached(self):
         ep = FakeEndpoint()
         ep.fail = True
-        exp = _exp(ep)
+        clock = _FakeClock()
+        exp = _exp(ep, clock=clock)
         r1 = exp.expand(1, ["s"], _hits(["a", "b", "c"]))
         assert r1.degraded and exp.cached(1) is None, "失败面不进缓存（下边界可重试）"
+        clock.now += 31.0                               # 冷却到点（零真实 sleep，同 TestExpanderCooldown 惯例）
         ep.fail = False
         ep.responses[BOUNDARY_TASK] = json.dumps(
             {"expanded": ["x"], "keep": [h.seg.segment_id for h in _hits(["a", "b", "c"])], "drop": []})
@@ -282,14 +286,17 @@ class TestDriftAnchorP4:
         assert d.anchor_source == "expand", "幂等 merge 不扰动 source"
 
     def test_merge_anchor_keeps_hit_ratio_working(self):
-        """扩词并入后，同义换措辞的 user 段不再误报 drift（P4 拆 3.4% 填充墙的 FPR 面）。"""
+        """扩词并入后，同义换措辞的 user 段不再误报 drift（P4 拆 3.4% 填充墙的 FPR 面）。
+
+        回切旧任务需 K_CONSEC=2 条连续低相关才触发（同 1st drift 口径）：单条不单独触发。"""
         d = DriftTracker()
         for i in range(N_ANCHOR):
             d.observe_user(f"重启 服务 网关 {i}")
         d.observe_user("k8s deploy node 0")
-        assert d.observe_user("k8s pod gpu 1") is True, "先触发 drift（epoch 1）"
-        assert d.observe_user("重启 服务 网关 再来") is True, "回到旧任务 → 又一次 drift（同义未扩前）"
-        d.merge_anchor(["restart", "service"])          # 宿主 LLM 扩词面并入锚点
+        assert d.observe_user("k8s pod gpu 1") is True, "先触发 drift（epoch 1，K_CONSEC=2）"
+        assert d.observe_user("重启 服务 网关 再来") is False, "第 1 条低相关未达 K_CONSEC（不单独触发）"
+        assert d.observe_user("重启 服务 网关 恢复") is True, "第 2 条低相关 → 回切旧任务 drift（epoch 2）"
+        d.merge_anchor(["restart", "service"])          # 宿主 LLM 扩词面并入 epoch-2 锚点
         assert d.observe_user("restart service again") is False, "扩词入锚点后同义措辞不再误报"
 
 
@@ -407,21 +414,24 @@ class TestEngineBoundaryThreeActions:
         assert len(_boundary_calls(ep)) == 1, "select_context 侧 0 边界 LLM（扩词走缓存）"
 
     def test_verdicts_drop_prunes_false_positive(self, p4_engine):
-        """② 精排 keep/drop：近义误召 P1 段（旧版方案 decoy）被 drop → 不进召回块（破近义误召）。"""
+        """② 精排 keep/drop：近义误召 P1 段（旧版方案 decoy）被 drop → 不进召回块（破近义误召）。
+
+        decoy 与当前任务 k8s pod 调度 gpu 高度近义（进 BM25 top-3 候选，唯一的 P1 槽位），
+        但带「旧版方案」标记 = 近义误召（旧版）→ P4 精排 drop；P0 候选恒 keep。"""
         e = p4_engine
         ep = _BoundaryCannedEndpoint(["hpa"], drop_marker="旧版方案")
         e._aux.main_endpoint = ep
-        decoy = e.store.append(_mkseg("k8s 节点 部署 旧版方案 回滚", tier="P1", topic="1", seq=10))
-        true_seg = e.store.append(_mkseg("k8s pod 调度 gpu 弹性 扩容", tier="P1", topic="1", seq=11))
+        decoy = e.store.append(_mkseg("k8s pod 调度 gpu 旧版方案 回滚", tier="P1", topic="1"))
         e.store.flush()
         _drift_to_boundary(e)
         r = e._p4.cached(1)
         assert r is not None and not r.degraded
+        assert decoy.segment_id in r.verdicts, "decoy 进了 top-3 候选（精排才有 verdict 可判）"
         assert r.verdicts.get(decoy.segment_id) == "drop", "decoy（旧版方案）被精排 drop"
-        assert r.verdicts.get(true_seg.segment_id) == "keep", "真候选 keep"
-        q = "k8s 节点 部署 旧版 回滚"
+        q = "k8s pod 调度 gpu 旧版方案 回滚"
         out = e.select_context([{"role": "user", "content": "x"}], incoming_message={"role": "user", "content": q})
         texts = _recalled_texts(out)
+        assert texts, "精排后仍有 keep 候选进召回块（非全 drop → 保守 keep-all 兜底）"
         assert not any("旧版方案" in t for t in texts), "被 drop 的近义误召段不进召回块（破近义误召）"
 
 
@@ -452,11 +462,11 @@ class TestEngineBoundaryFallback:
         _drift_to_boundary(e)                              # epoch 1 边界 → fail（1 次调用）
         assert len(_boundary_calls(ep)) == 1 and e._p4.at_cooldown()
         e._p4._cooldown_until = 0.0                        # 冷却到点（测试 seam，同 test_r3 惯例）
+        ep.fail = False                                     # 端点恢复（须在 epoch-2 边界事件之前，重试才成功）
         # 再切任务 → epoch 2 边界事件
         e.on_turn_complete([{"role": "user", "content": "数据库 迁移 索引 0"}])
         e.on_turn_complete([{"role": "user", "content": "数据库 备份 恢复 1"}])
         assert e._drift.current_epoch == 2, "冷却到点后边界事件正常触发"
-        ep.fail = False                                     # 端点恢复
         assert 2 in e._p4_cache, "重试成功 → 新 epoch 入缓存（失败面不缓存、恢复面自愈）"
         assert e._p4.consec_fails == 0, "成功 → 连败归零"
 
