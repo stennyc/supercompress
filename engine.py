@@ -49,6 +49,9 @@ from sc import (
     est_tokens,
     nfc_hash,
 )
+# 数据子目录名单一事实源（G2）：telemetry_report_path / on_session_start 的 legacy 回退
+# 各带 env/kwarg 分支（合法独立规则），但目录名字面引用共享常量，杜绝「改一处漏一处」。
+from sc._bootstrap import STORE_SUBDIR
 from sc.inject import choose_forms, render_block, block_tokens
 from sc.recall import Recaller
 from sc.rerank import RerankGate, rerank_hits
@@ -527,8 +530,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
         """
         hh = os.environ.get("HERMES_HOME", "").strip()
         if hh:
-            return os.path.join(os.path.expanduser(hh), "supercompress_store",
-                                "telemetry.jsonl")
+            # 保留 expanduser(hh) 分支（env 值若含 ~ 亦展开，与本规则逐字口径）；
+            # 仅目录名字面收敛到共享常量（G2 单源），不改变路径语义。
+            return os.path.join(os.path.expanduser(hh), STORE_SUBDIR, "telemetry.jsonl")
         return os.path.join(self._legacy_store_dir, "telemetry.jsonl")
 
     def _on_drift_fire(self, evt: dict) -> None:
@@ -885,7 +889,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         - 同 sid 冷重开（新实例、文件已存在）→ replayed P1 中间推理内存标 stale（不动字节）
         """
         home = kwargs.get("hermes_home")
-        store_dir = (os.path.join(os.path.expanduser(home), "supercompress_store")
+        store_dir = (os.path.join(os.path.expanduser(home), STORE_SUBDIR)
                      if home else self._legacy_store_dir)
         target = os.path.join(store_dir, f"{_safe_session_name(session_id)}.jsonl")
         if self._bound_session == session_id and self.store.path == target:

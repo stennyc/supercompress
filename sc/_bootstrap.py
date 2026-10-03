@@ -20,6 +20,11 @@ from pathlib import Path
 # 换任何安装位置（/usr/local、/opt、venv、源码 checkout）都自动成立。
 INSTALL_ROOT: str = str(Path(__file__).resolve().parents[4])
 
+# 数据子目录名（单一事实源）：数据根下 supercompress 数据目录的统一名字面。
+# 全插件只在此定义一次（G2）；engine（telemetry/on_session_start）与 CLI（retag）
+# 等各处引用本常量而非各写各的字符串——日后改目录名只改这一处，不「改一处漏一处」。
+STORE_SUBDIR: str = "supercompress_store"
+
 
 def hermes_home() -> str:
     """数据根（HERMES_HOME）：进程 env 优先（per-profile），缺省 ``~/.hermes``。
@@ -38,7 +43,7 @@ def config_path() -> str:
 
 def store_dir() -> str:
     """supercompress 数据目录（数据根下）：per-session <sid>.jsonl + legacy active.jsonl 同住。"""
-    return os.path.join(hermes_home(), "supercompress_store")
+    return os.path.join(hermes_home(), STORE_SUBDIR)
 
 
 def active_store_path() -> str:

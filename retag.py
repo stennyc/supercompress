@@ -28,6 +28,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from sc.tagger import classify_user  # 单一实现源（与 A1 共用，不另造规则）
+from sc._bootstrap import STORE_SUBDIR  # 数据子目录名单一事实源（G2：不各写各的串）
 
 
 def _default_store_path() -> str:
@@ -35,7 +36,7 @@ def _default_store_path() -> str:
     缺省回退 ~/.hermes——与 engine._default_store_root / sc._bootstrap 同源语义。"""
     hh = os.environ.get("HERMES_HOME", "").strip()
     base = hh if hh else os.path.expanduser("~/.hermes")
-    return os.path.join(base, "supercompress_store", "active.jsonl")
+    return os.path.join(base, STORE_SUBDIR, "active.jsonl")
 
 
 DEFAULT_PATH = _default_store_path()
