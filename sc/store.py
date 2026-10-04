@@ -71,7 +71,7 @@ class JsonlStore:
         try:
             free_b, pct = self.disk_water_level()
             if pct >= DISK_WATER_HIGH_PCT:
-                logger.info("tcm-supercompress: disk water-level HIGH: free=%.1fGiB used=%.1f%% "
+                logger.info("supercompress: disk water-level HIGH: free=%.1fGiB used=%.1f%% "
                             "action=%s", free_b / (1024 ** 3), pct * 100.0, action)
         except Exception:
             pass   # 观测面永不炸宿主
@@ -82,7 +82,7 @@ class JsonlStore:
         try:
             free_b, pct = self.disk_water_level()
             used_txt = f"{pct * 100.0:.1f}%" if pct >= 0 else "unknown"
-            logger.warning("tcm-supercompress: disk water-level: free=%.1fGiB used=%s "
+            logger.warning("supercompress: disk water-level: free=%.1fGiB used=%s "
                           "action=%s failed: %s", free_b / (1024 ** 3), used_txt, action, exc)
         except Exception:
             pass

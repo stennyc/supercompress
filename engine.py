@@ -7,7 +7,7 @@
   register 失败则回退扫描模块属性找 ContextEngine 子类无参构造）。`probe_availability` 调
   实例 `is_available()`（若有）。
 - 宿主调用面: select_context / update_from_response / should_compress / compress（宿主按签名过滤
-  kwargs；旧 `tcmnet_hint` kwarg 保留）/ on_turn_complete / on_session_start|end / on_session_reset。
+  kwargs）/ on_turn_complete / on_session_start|end / on_session_reset。
 - 失败模式封死: 壳加载失败 → loader warn + None → 宿主静默回落内置 `compressor`。壳必须让
   probe_availability 返回 active（@reviewer 静态验收门 #1，tests/test_hermes_shell.py 复现）。
 
@@ -179,7 +179,7 @@ class _CallLlmEndpoint:
             except Exception as e:
                 last_err = e
                 if i == 0:
-                    logger.info("tcm-supercompress: aux channel task=%s short-timeout/failed (%s) "
+                    logger.info("supercompress: aux channel task=%s short-timeout/failed (%s) "
                                 "-> falling back to main model route", task, e)
                 continue
             # 兼容 dict 和 namespace 响应
@@ -320,6 +320,22 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_completion_tokens: int = 0
         self.last_total_tokens: int = 0
         self.compression_count: int = 0
+        # 宿主契约 real-usage pairing（对齐内置 ContextCompressor，_reset_real_usage_pairing 口径，
+        # context_compressor.py:2193-2196；宿主 0 改动原则：只补契约必需字段，壳不引入算法核）：
+        # - last_real_prompt_tokens：provider 真实 prompt 读数账（0 = 尚无真实读数、meter 走本地粗估）。
+        #   context_breakdown.context_display_source 靠「real 是数 且 shown!=real」判 local_estimate
+        #   （打 ~ 粗估标记）；此前壳缺此属性 → getattr 得 None → 恒判 provider_usage，粗估态被伪装
+        #   成 provider 真实读数（桌面 meter 永不出 ~，reviewer 坐实的口径反转 bug）。
+        # - awaiting_real_usage_after_compression：compact 后一次性 latch。宿主 _compress_context 提交
+        #   后置位（conversation_compression.py:3496-3501），本壳 update_from_response 消费；不清则
+        #   turn_preflight / turn_context_compaction 的 `if awaiting: return` skip 分支每轮命中，
+        #   自动/idle compact 永久锁死（只 manual /compress force=True 能绕过）。
+        # - _verify_compaction_cleared_threshold：compact 有效性 verdict latch（宿主 record_completed_
+        #   compaction 面，内置 context_compressor.py:2771 同源）；壳不 arm（无该宿主算法），仅在契约面
+        #   消费/清零，保持与内置同形以便宿主 getattr 直接读。
+        self.last_real_prompt_tokens: int = 0
+        self.awaiting_real_usage_after_compression: bool = False
+        self._verify_compaction_cleared_threshold: bool = False
         # 预检阈值读 sc.distill 软水位口径（80% 容量 = 蒸馏触发线；壳不重算）
         self.threshold_tokens: int = int(self.context_length * DISTILL_WATER_FRAC)
         # 宿主实调位（tui_gateway/session_compression.py:169）：threshold_tokens 配置的上限。
@@ -379,7 +395,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._check_version_desync()
 
         logger.info(
-            "tcm-supercompress: shell v2 initialized — store=%s, context_length=%d, "
+            "supercompress: shell v2 initialized — store=%s, context_length=%d, "
             "compact_ratio=%.2f, force_ratio=%.2f, segments_on_disk=%d, call_llm=%s, "
             "build=%s",
             self.store_path, self.context_length, self.compact_ratio,
@@ -423,13 +439,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     digest_max_tokens=self.digest_max_tokens,
                 )
                 logger.info(
-                    "tcm-supercompress: aux endpoint = injected call_llm (model=%s, "
+                    "supercompress: aux endpoint = injected call_llm (model=%s, "
                     "aux_timeout=%.0fs main_fallback_timeout=%.0fs digest_max_tokens=%d)",
                     self._main_runtime.get("model"), self.aux_timeout,
                     self.main_fallback_timeout, self.digest_max_tokens)
                 return AuxProvider(ep, fail_cooldown=self.digest_fail_cooldown)
             except Exception as e:
-                logger.warning("tcm-supercompress: injected call_llm endpoint failed: %s", e)
+                logger.warning("supercompress: injected call_llm endpoint failed: %s", e)
                 return AuxProvider(_NoEndpoint(), fail_cooldown=self.digest_fail_cooldown)
 
         # 没有运行时配置时直接返回 _NoEndpoint，不尝试 env 配置
@@ -463,7 +479,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # 端点本身换了（新宿主运行时）→ 冷却连败归零（旧端点劣化不迁怒新端点）。
         self._p4.consec_fails = 0
         self._p4._cooldown_until = 0.0
-        logger.info("tcm-supercompress: update_model model=%s ctx=%d aux=%s runtime=%s call_llm=%s",
+        logger.info("supercompress: update_model model=%s ctx=%d aux=%s runtime=%s call_llm=%s",
                     model, context_length, type(self._aux.main_endpoint).__name__,
                     "injected" if self._main_runtime else "none",
                     "available" if self._call_llm else "unavailable")
@@ -556,10 +572,45 @@ class SupercompressContextEngine(sc_context_engine_base()):
     # ── 宿主调用面（abstract 三件 + 可选钩子）──
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
-        """token 账更新（宿主每次 LLM 调用后）：直接存 canonical 桶，无算法。"""
-        self.last_prompt_tokens = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)))
-        self.last_completion_tokens = int(usage.get("completion_tokens", usage.get("output_tokens", 0)))
-        self.last_total_tokens = int(usage.get("total_tokens", 0))
+        """token 账更新（宿主每次 LLM 调用后）：直接存 canonical 桶，无算法。
+
+        宿主契约对齐内置 ContextCompressor.update_from_response（context_compressor.py:2764-2771）
+        —— 只补契约必需的 real-usage pairing + latch 生命周期，壳不引入压缩算法核（distill/recall/
+        budgets 仍全住 sc/）：
+
+        - **`-1` 哨兵保护**：宿主 _compress_context 提交 compact 时写 `last_prompt_tokens = -1` 并 arm
+          `awaiting_real_usage_after_compression`（conversation_compression.py:3496-3501，#36718 哨兵
+          语义：「压缩刚跑完、等下一次真实读数」）。provider 某响应无 usage 时，宿主调
+          `update_from_response({})`（turn_usage.py:87-91）—— 若裸 `int(get(...,0))` 会把 `-1` 冲成 0，
+          破坏哨兵（preflight 的 `last_prompt_tokens == -1` 分支、宿主 meter 粗估判据都会失真）。故真实
+          prompt 读数在场（prompt_tokens/input_tokens 有值）才写 `last_prompt_tokens`；无 usage 时保留
+          既有哨兵态（镜像内置 rollback_interrupted_preflight_display_tokens 对 `-1` 的保护，
+          context_compressor.py:2816-2820）。
+        - **`last_real_prompt_tokens`**（provider 真实读数账，acceptance #4）：真实 prompt_tokens>0 时
+          记账。`context_breakdown.context_display_source` 靠「real 是数 且 shown != real」判 local_
+          estimate（打 `~` 粗估标记）；此前壳缺此属性 → getattr 得 None → 恒判 provider_usage，粗估态
+          被伪装成 provider 真实读数。
+        - **latch 消费**：真实 usage 到达后清 `awaiting_real_usage_after_compression`（即使无 prompt_
+          tokens 也消费，使 auto/idle compact 的 `if awaiting: return` skip 分支不再每轮命中、永久锁死）。
+        """
+        # 真实 usage 才写 token 桶；无 usage（宿主 {} no-usage 路径）→ 全保留既有桶（含 -1 哨兵），
+        # 只消费 latch（镜像内置 rollback 对 -1 的保护 context_compressor.py:2816-2820 + turn_usage
+        # no-usage 契约 turn_usage.py:87-91：裸 int(get(...,0)) 会把 -1 冲成 0，破坏 #36718 哨兵）。
+        prompt = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+        completion = usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        if prompt != 0 or completion != 0:
+            self.last_prompt_tokens = int(prompt)
+            self.last_completion_tokens = int(completion)
+            _total = usage.get("total_tokens")
+            self.last_total_tokens = int(
+                _total if _total else self.last_prompt_tokens + self.last_completion_tokens)
+            # provider 真实 prompt 读数（>0）记账：context_breakdown.context_display_source 判
+            # local_estimate（打 ~ 粗估）的依据（acceptance #4；此前壳缺此属性 → getattr 得 None）。
+            if self.last_prompt_tokens > 0:
+                self.last_real_prompt_tokens = self.last_prompt_tokens
+        # 消费 real-usage latches（一次 usage 到达即清，防 auto/idle compact 永久 skip）：
+        # 与内置 update_from_response 末行同源（context_compressor.py:2771）。
+        self._verify_compaction_cleared_threshold = self.awaiting_real_usage_after_compression = False
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """sc.distill 软水位语义：当前 token 账 > 生效触发线（80% 容量，宿主 cap 收紧）→ 本 turn 触发蒸馏逐出。"""
@@ -609,7 +660,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if self._adv_consec >= ADVISORY_DEBOUNCE_TURNS and not self.rotation_advisory:
                 self.rotation_advisory = True
                 logger.info(
-                    "tcm-supercompress: rotation advisory set (pressure=%.2f, "
+                    "supercompress: rotation advisory set (pressure=%.2f, "
                     "consecutive_turns=%d)", pressure, self._adv_consec)
         else:
             # 中间带：不清已置位，只重置防抖计数
@@ -650,14 +701,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 # jsonl 字节零动——与 P0 合流，epoch 锚点 = 扩展后任务关键词集）
                 merged = self._drift.merge_anchor(res.expanded_terms)
                 logger.info(
-                    "tcm-supercompress: P4 boundary expand epoch=%d expanded=%d "
+                    "supercompress: P4 boundary expand epoch=%d expanded=%d "
                     "anchor_merged=%d verdicts=%d cache=%d",
                     epoch, len(res.expanded_terms), merged, len(res.verdicts), len(self._p4_cache))
             else:
-                logger.info("tcm-supercompress: P4 boundary expand epoch=%d degraded -> pure-BM25 "
+                logger.info("supercompress: P4 boundary expand epoch=%d degraded -> pure-BM25 "
                             "fallback (cooldown=%s)", epoch, self._p4.cooldown_status())
         except Exception as e:                          # 壳 fail-open：P4 面异常不炸宿主 turn
-            logger.warning("tcm-supercompress: P4 boundary expand no-op (pure-BM25 fallback): %s", e)
+            logger.warning("supercompress: P4 boundary expand no-op (pure-BM25 fallback): %s", e)
 
     def on_turn_complete(self, messages: List[Dict[str, Any]], usage: Dict[str, Any] = None,
                          **kwargs: Any) -> None:
@@ -678,7 +729,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 单源谓词（可观测性行：拒绝类必须留痕，不做静默 no-op drop）。
             _skel = [m for m in fresh if is_room_skeleton(str(m.get("content") or ""))]
             if _skel:
-                logger.info("tcm-supercompress: ingress rejected %d room-skeleton user msg(s) "
+                logger.info("supercompress: ingress rejected %d room-skeleton user msg(s) "
                             "[Group chat skeleton is transient; never durable", len(_skel))
             for m in fresh:
                 if is_room_skeleton(str(m.get("content") or "")):
@@ -697,14 +748,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
             result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode,
                                force_ratio=self.force_compact_ratio).run()
             if result.status not in ("ok", "backpressure"):
-                logger.warning("tcm-supercompress: distill status=%s events=%s",
+                logger.warning("supercompress: distill status=%s events=%s",
                                result.status, result.events)
             # P0.4：turn 末 pressure 检查（防抖口径）+ 会话边界外不触碰任何持久态
             self._check_rotation_advisory()
         except StoreError as e:
-            logger.error("tcm-supercompress: store error (fail-safe, window untouched): %s", e)
+            logger.error("supercompress: store error (fail-safe, window untouched): %s", e)
         except Exception as e:  # 壳永不把宿主 turn 炸掉（fail-open，宿主契约）
-            logger.error("tcm-supercompress: on_turn_complete degraded: %s", e)
+            logger.error("supercompress: on_turn_complete degraded: %s", e)
 
     def select_context(
         self, request_messages: List[Dict[str, Any]],
@@ -765,7 +816,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 仅把房间骨架逐出自动注入面，观测行留痕）。
             _skel_out = [t for t in recalled if is_room_skeleton(t)]
             if _skel_out:
-                logger.info("tcm-supercompress: recall egress cut %d room-skeleton segment(s) "
+                logger.info("supercompress: recall egress cut %d room-skeleton segment(s) "
                             "(legacy P0 group-chat residue)", len(_skel_out))
             recalled = [t for t in recalled if not is_room_skeleton(t)]
             if not recalled:
@@ -774,30 +825,26 @@ class SupercompressContextEngine(sc_context_engine_base()):
             out = list(head) + [{"role": "system",
                                  "content": "[supercompress recall]\n" + "\n\n".join(recalled)}]
             out += [m for m in request_messages if m.get("role") != "system"]
-            logger.info("tcm-supercompress: select_context recalled %d segment(s), breach=%d",
+            logger.info("supercompress: select_context recalled %d segment(s), breach=%d",
                         len(recalled), len(recaller.breach_log))
             return out
         except Exception as e:
-            logger.warning("tcm-supercompress: select_context no-op (recall degraded): %s", e)
+            logger.warning("supercompress: select_context no-op (recall degraded): %s", e)
             return None
 
     def compress(
         self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None,
         focus_topic: Optional[str] = None, force: bool = False, memory_context: str = "",
-        tcmnet_hint: Optional[Dict] = None,
     ) -> List[Dict[str, Any]]:
         """sc.distill 接线 + 宿主消息面输出：蒸馏后 = system head + P0/P1 常驻段 + 尾部。
-
-        tcmnet_hint kwarg 保留（旧引擎宿主调用面兼容；本壳不消费 TCM bridge——
-        旧 integration/ 面随旧目录进备份，数据面零携带）。
         """
         self.compression_count += 1
         tokens = current_tokens or self.last_prompt_tokens
         if not force and tokens < self.threshold_tokens * self.force_compact_ratio:
-            logger.info("tcm-supercompress: compress (light trim) tokens=%d threshold=%d",
+            logger.info("supercompress: compress (light trim) tokens=%d threshold=%d",
                         tokens, self.threshold_tokens)
         else:
-            logger.info("tcm-supercompress: compress (distill) tokens=%d force=%s", tokens, force)
+            logger.info("supercompress: compress (distill) tokens=%d force=%s", tokens, force)
         try:
             window = self._window_fresh()
             # 检查是否需要启用 force_evict_mode
@@ -807,7 +854,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 push_cap = int(self.context_length * 0.15)
                 # 如果 overflow 超过 push cap，说明 P0 常驻集过大，需要强制逐出
                 if p0_tokens > push_cap and overflow > push_cap * 0.5:
-                    logger.warning("tcm-supercompress: overflow %d tokens > 50%% push_cap %d, "
+                    logger.warning("supercompress: overflow %d tokens > 50%% push_cap %d, "
                                    "enabling force_evict_mode", overflow, push_cap)
                     self._force_evict_mode = True
             # 执行 distill（R3：force_ratio 接同源配置 force_compact_ratio）
@@ -815,14 +862,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
                                force_ratio=self.force_compact_ratio).run()
             # 如果 normal distill 失败（transient_skip）且未启用 force_evict，自动降级
             if result.status == "backpressure" and not self._force_evict_mode:
-                logger.warning("tcm-supercompress: distill backpressure, trying force_evict")
+                logger.warning("supercompress: distill backpressure, trying force_evict")
                 self._force_evict_mode = True
                 result = Distiller(window, self.store, self._aux, force_evict=True,
                                    force_ratio=self.force_compact_ratio).run()
-                logger.info("tcm-supercompress: force_evict result status=%s events=%s",
+                logger.info("supercompress: force_evict result status=%s events=%s",
                             result.status, result.events)
             if result.status not in ("ok", "backpressure"):
-                logger.warning("tcm-supercompress: distill status=%s events=%s",
+                logger.warning("supercompress: distill status=%s events=%s",
                                result.status, result.events)
         except (StoreError, OSError) as e:
             # R2：full-disk 时 store 交互抛 OSError（EIO/ENOSPC）——store 写路径已归一为
@@ -830,7 +877,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 优雅降级：log warning + 磁盘水位观测（剩余空间 + 触发动作，ops 监控），
             # 本轮跳过持久化，不炸宿主（压缩失败 ≠ turn 失败；与 on_turn_complete 宽
             # catch 口径对齐——fail-open 返回原 messages，宿主本 turn 原样继续）
-            logger.warning("tcm-supercompress: compress degraded (store error, "
+            logger.warning("supercompress: compress degraded (store error, "
                            "skipping this round's persistence, host untouched): %s", e)
             try:
                 self.store.log_water_warn("compress-failed", e)
@@ -853,7 +900,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # anchor-manifest 注入面——否则压缩时群聊骨架仍驻留进 durable 段块。
         _skel = [ws for ws in kept if is_room_skeleton(ws.segment.original_text)]
         if _skel:
-            logger.info("tcm-supercompress: compress egress cut %d room-skeleton segment(s) "
+            logger.info("supercompress: compress egress cut %d room-skeleton segment(s) "
                         "from anchor manifest", len(_skel))
         kept = [ws for ws in kept if not is_room_skeleton(ws.segment.original_text)]
         # P3 30% 零成本剔除档已于 2026-10-04 撤销（用户拍板 B）：活体 P1=0 → fill_share 恒 0.0，
@@ -920,11 +967,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
             old_file = os.path.join(store_dir, f"{_safe_session_name(old_sid)}.jsonl")
             if os.path.exists(old_file):
                 self.store = JsonlStore.materialize(old_file, target, reopen_from=old_sid)
-                logger.info("tcm-supercompress: carry_over handoff %s -> %s (%d segs)",
+                logger.info("supercompress: carry_over handoff %s -> %s (%d segs)",
                             old_sid, session_id, self.store.line_count)
             else:
                 self.store = JsonlStore(target)
-                logger.warning("tcm-supercompress: carry_over requested but archive for %s not found (%s)",
+                logger.warning("supercompress: carry_over requested but archive for %s not found (%s)",
                                old_sid, old_file)
         else:
             existed = os.path.exists(target) and os.path.getsize(target) > 0
@@ -934,10 +981,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 for seg in self.store.by_hash.values():
                     if seg.tier == "P1":
                         seg.stale = True
-                logger.info("tcm-supercompress: session %s reopened, %d segs replayed (P1 stale-marked), build=%s",
+                logger.info("supercompress: session %s reopened, %d segs replayed (P1 stale-marked), build=%s",
                             session_id, self.store.line_count, self.build_id)
             else:
-                logger.info("tcm-supercompress: session %s start (fresh), store=%s, build=%s",
+                logger.info("supercompress: session %s start (fresh), store=%s, build=%s",
                             session_id, target, self.build_id)
         # P2：会话边界 drift 态恢复——有盘内容（carry_over/冷重开）rehydrate（取盘上
         # 最大整数 epoch + 重建锚点，避免冷重启 epoch 失配假阳性漂移）；fresh session reset。
@@ -955,6 +1002,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # P4：边界扩展缓存会话边界清零（对称 rerank 缓存；防跨 session 泄漏旧 epoch 扩词/精排）
         self._p4_cache.clear()
         self.last_prompt_tokens = 0
+        # 宿主契约 real-usage pairing 会话边界清零（对称 on_session_reset，对齐内置
+        # _reset_real_usage_pairing context_compressor.py:2193-2196）：compact 后一次性 latch
+        # 属旧 session 压缩后态，rebind/轮转 不得泄漏进新 session（否则新 session 首 turn 仍被
+        # auto/idle compact 的 `if awaiting: return` 锁死）；置于幂等早退之后 → live 重入不清。
+        self.last_real_prompt_tokens = 0
+        self.awaiting_real_usage_after_compression = False
+        self._verify_compaction_cleared_threshold = False
         self.session_id = session_id
         self._bound_session = session_id
 
@@ -981,7 +1035,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # StoreError("io_error: ...")，双 catch 防裸 OSError 逃逸到宿主 /new 面）。
             # 优雅降级：log warning + 水位观测，跳过本轮持久化（pending 批留内存可重试，
             # 断电丢批上界不变），重置流程继续走完——不炸宿主 /new。
-            logger.warning("tcm-supercompress: session-reset flush failed (degraded, "
+            logger.warning("supercompress: session-reset flush failed (degraded, "
                            "pending P1/P2 kept in memory, reset proceeds): %s", e)
             try:
                 self.store.log_water_warn("session-reset-flush-failed", e)
@@ -997,6 +1051,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.compression_count = 0
+        # 宿主契约 real-usage pairing 会话边界清零（对齐内置 _reset_session_compaction_state /
+        # _reset_real_usage_pairing，context_compressor.py:2193-2220）：compact 后一次性 latch
+        # （awaiting）属旧 session 的压缩后态，不得泄漏进 /new 新 session（否则新 session 首 turn
+        # 仍被 turn_preflight/turn_context_compaction 的 `if awaiting: return` 锁死 auto/idle compact）；
+        # 与 P0.4 rotation advisory / rerank / p4 缓存的会话边界清零同口径（同在本函数末尾对称清零）。
+        self.last_real_prompt_tokens = 0
+        self.awaiting_real_usage_after_compression = False
+        self._verify_compaction_cleared_threshold = False
         self._force_evict_mode = False
         # P0.4：rotation advisory 会话边界清零（对称 on_session_start，防泄漏进新 session）
         self.rotation_advisory = False
@@ -1009,7 +1071,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._rerank_cache = {}
         # P4：边界扩展缓存会话边界清零（对称 on_session_start）
         self._p4_cache.clear()
-        logger.info("tcm-supercompress: session reset (flush), store lines=%d", self.store.line_count)
+        logger.info("supercompress: session reset (flush), store lines=%d", self.store.line_count)
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         # 会话边界：先汇合异步 digest worker（在途段尽量 ready，缩短会话收尾等待），
@@ -1023,13 +1085,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
         except (StoreError, OSError) as e:
             # R2：与 on_session_reset 同口径（full-disk OSError 优雅降级 + 水位观测）——
             # 会话收尾面同样不炸宿主（pending 批留内存，断电丢批上界不变）。
-            logger.warning("tcm-supercompress: session-end flush failed (degraded, "
+            logger.warning("supercompress: session-end flush failed (degraded, "
                            "pending P1/P2 kept in memory): %s", e)
             try:
                 self.store.log_water_warn("session-end-flush-failed", e)
             except Exception:
                 pass
-        logger.info("tcm-supercompress: session %s end, store lines=%d",
+        logger.info("supercompress: session %s end, store lines=%d",
                     session_id, self.store.line_count)
         # P2 telemetry：会话末 flush 会话内 records 落 JSONL sink（跨会话 append-only
         # 攒数喂 P3；fail-open：写失败/无 sink → 清 records，不炸宿主收尾面）

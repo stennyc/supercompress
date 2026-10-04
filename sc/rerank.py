@@ -159,13 +159,13 @@ def rerank_hits(hits, query, llm_endpoint, *, cache, window_version,
         response = llm_endpoint.call(RERANK_TASK, _rerank_prompt(query, topk))
     except Exception as e:
         # step2 fail-safe：LLM 不可用 / 超时 → 原样返回入参（不降级不炸），留痕
-        logger.warning("tcm-supercompress: rerank LLM unavailable/timeout (%s) "
+        logger.warning("supercompress: rerank LLM unavailable/timeout (%s) "
                        "-> fail-safe, hits returned unchanged", e)
         return hits
     order = parse_rerank_response(response, valid_ids)
     if order is None:
         # step2 fail-safe：解析失败（多对象 / 纯文本 / 缺 id）→ 原样返回，留痕；不写缓存
-        logger.warning("tcm-supercompress: rerank LLM response not parseable "
+        logger.warning("supercompress: rerank LLM response not parseable "
                        "-> fail-safe, hits returned unchanged")
         return hits
 

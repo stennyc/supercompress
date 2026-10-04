@@ -161,7 +161,7 @@ def desync_warning(running_dir: Optional[Path] = None, log: Optional[logging.Log
     msg = f"version desync: running={build_id(running_dir)} repo={build_id(repo_dir)}"
     if log is not None:
         try:
-            log.warning("tcm-supercompress: %s", msg)
+            log.warning("supercompress: %s", msg)
         except Exception:
             pass
     return msg

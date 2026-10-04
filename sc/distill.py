@@ -194,7 +194,7 @@ class Distiller:
                 store.log_water_warn("distill-flush-failed", e)
             except Exception:
                 pass
-            logger.warning("tcm-supercompress: distill final flush degraded (lossy, "
+            logger.warning("supercompress: distill final flush degraded (lossy, "
                            "pending kept for retry): %s", e)
         result.anchor_manifest = self._emit_anchors(result, store)
         result.status = "backpressure" if w.used_tokens > cap else "ok"
