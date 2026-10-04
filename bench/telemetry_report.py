@@ -4,7 +4,7 @@
 本脚本 = 三指标的**出数层**（sc/telemetry.py 是内核，engine 是生产埋点；本脚本跑
 bench 侧基线读数 + 读生产 JSONL sink 的跨会话攒数）：
 
-指标① **填充占比 fill_share**（>40% 才 re-add 30% 零成本剪除档，G5）：
+指标① **填充占比 fill_share**（30% 零成本剪除档已于 2026-10-04 撤销——活体 P1=0 恒 0.0，纯审计面 G5）：
   基线 = gold 语料 + P1 填充流（`_filler_pool` 合成 6K 注入池，镜像 engine compress 面
   的 kept 池构成）→ ``filler_form_share``（sc/telemetry.py，choose_forms 同排序镜像）；
   两个压力臂：normal（细节池 4K 生效）vs high-pressure（细节池归零，同语义）。
@@ -128,7 +128,8 @@ def metric1_fill_share() -> dict:
         "high_pressure": press,
         "pool_segs": len(pool),
         "filler_segs": _FILLER_N,
-        "note": ("gate_re_add_30pct=True 即 G5 证据面（>40% 才 re-add 30% 零成本剪除档）；"
+        "note": ("gate_re_add_30pct=True 即 G5 审计证据面（>40% 才 re-add 30% 零成本剪除档；"
+                 "该档已于 2026-10-04 撤销——活体 P1=0 → fill_share 恒 0.0，纯记录无下游消费者）；"
                  "normal vs high-pressure 两臂 = P3 梯级定案的压力对照"),
     }
 
@@ -357,7 +358,7 @@ def render_md(r: dict, det: bool) -> str:
         f"commit={r['commit']}  drift 标定参数 DRIFT_THRESH={r['drift_params']['DRIFT_THRESH']} "
         f"/ K_CONSEC={r['drift_params']['K_CONSEC']}（sc/drift.py:30-32）",
         "",
-        "## 指标① 填充占比 fill_share（>40% 才 re-add 30% 零成本剪除档，G5）",
+        "## 指标① 填充占比 fill_share（30% 零成本剪除档已于 2026-10-04 撤销——纯审计面 G5）",
         f"- 合成 6K 池：{m1['pool_segs']} 段（gold {m1['pool_segs'] - m1['filler_segs']} + "
         f"P1 填充 {m1['filler_segs']}），双压力臂：",
         f"  - normal：pool={n['pool_tokens']}t  P0 高信号={n['high_signal_tokens']}t  "
