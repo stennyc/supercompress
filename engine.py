@@ -339,11 +339,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._drift = DriftTracker(sink=self._on_drift_fire)
         # P3（S-Phase 4）gate rerank：LLM 两步重排（独立 step，P1 打分核零动，同 P2 soft_rank 模式）。
         # 端点注入 = aux 主模型端点（宿主主模型共享，零新 provider / 零模型名 / 零 provider 块）；
-        # gate 默认保守（low_score_threshold=0.0 → 只在「召回空 / 显式搜索词」触发，非常态 LLM 调用）；
+        # gate 默认（low_score_threshold=3.0）：BM25 活体分数分布 2026-10-04 probe（463 段 store）：
+        #   强匹配 14–16 / 中等 5–14 / 弱匹配 2.08–2.13 / 不相关 0（空档 2.13–5.22）。
+        #   threshold=3.0 落在空档中位：top1 < 3.0 → 触发 LLM 重排（兜弱/空/歧义面），
+        #   ≥ 3.0 → BM25 有把握、零 LLM（正常搜索面常态不放大）。非常态 LLM 调用不变。
         # 缓存键 (sha256(query), store.line_count) 会话内幂等（plain dict：CPython GIL 下
         # get/set 原子，并发最坏 = 一次良性的 LLM 调用重复，不炸不脏）；
         # 会话边界（on_session_start/on_session_reset）清零，防跨 session 泄漏。
-        self.rerank_low_score_threshold: float = float(_get("rerank_low_score_threshold", 0.0))
+        self.rerank_low_score_threshold: float = float(_get("rerank_low_score_threshold", 3.0))
         self._rerank_gate = RerankGate(low_score_threshold=self.rerank_low_score_threshold)
         self._rerank_cache: dict = {}
         # P4（precision P4）：边界宿主 LLM 语义扩展（「花最少」= drift 边界那一下花一次宿主 LLM

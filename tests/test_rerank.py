@@ -214,7 +214,8 @@ class TestDeterminism:
 
 class TestSelectContextRerankWiring:
     """engine 钩子（sc.recall → P2 soft_rank → P3 gate rerank → recalled）：
-    端点注入 _aux.main_endpoint（宿主主模型共享模式），gate 默认保守（0.0）。"""
+    端点注入 _aux.main_endpoint（宿主主模型共享模式），gate 默认（low_score_threshold=3.0，
+    活体分数分布空档中位：top1 < 3.0 → LLM 重排兜弱/空/歧义面，≥ 3.0 → 零 LLM）。"""
 
     @pytest.fixture()
     def engine(self, tmp_path):
@@ -298,3 +299,36 @@ class TestSelectContextRerankWiring:
         assert engine._rerank_cache == {}, "on_session_reset 必须清 rerank 缓存"
         engine.on_session_start("s_rerank")
         assert engine._rerank_cache == {}, "on_session_start 必须清 rerank 缓存"
+
+
+# ───────────────────────── 3.0 默认阈值锁定（活体分数分布空档中位）────────────────────────
+
+class TestRerankGate3Point0Default:
+    """gate① 默认阈值 3.0（活体 463 段 store probe 2026-10-04：
+    强匹配 14–16 / 中等 5–14 / 弱 2.08–2.13 / 不相关 0，空档 2.13–5.22 → 3.0 中位）。
+    锁定 engine 默认 + gate① 在 (0,3.0) 触发 / ≥3.0 不触发 / 边界等号不触发。"""
+
+    def test_engine_default_threshold_3_0(self, tmp_path):
+        """engine 级默认 = 3.0（无 config.yaml 覆盖时）。"""
+        from engine import SupercompressContextEngine
+        e = SupercompressContextEngine(external_store_path=str(tmp_path))
+        assert e.rerank_low_score_threshold == 3.0, \
+            "engine 默认 rerank_low_score_threshold 应 = 3.0（活体分数分布空档中位）"
+
+    def test_gate1_fires_for_weak_top1(self):
+        """top1=2.5 < 3.0 → gate① 触发（弱/空/歧义召回兜底 LLM 重排）。"""
+        gate = RerankGate(low_score_threshold=3.0)
+        assert gate.should_fire(_hits([2.5, 1.0, 0.5]), "弱召回查询") is True, \
+            "top1=2.5 < 3.0 → gate① 应触发"
+
+    def test_gate1_not_fire_for_medium_top1(self):
+        """top1=5.0 ≥ 3.0 → gate① 不触发（BM25 有把握、零 LLM 常态面）。"""
+        gate = RerankGate(low_score_threshold=3.0)
+        assert gate.should_fire(_hits([5.0, 3.5, 1.0]), "中等召回查询") is False, \
+            "top1=5.0 ≥ 3.0 → gate① 不触发"
+
+    def test_gate1_boundary_exactly_3_0(self):
+        """top1=3.0（等号）→ 不触发（RerankGate 用严格 < 判定：≥ 不触发）。"""
+        gate = RerankGate(low_score_threshold=3.0)
+        assert gate.should_fire(_hits([3.0, 2.5, 1.0]), "边界") is False, \
+            "top1=3.0 不 < 3.0 → gate① 不触发（等号归 ≥ 面）"
