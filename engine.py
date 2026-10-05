@@ -60,6 +60,7 @@ from sc.tagger import Tagger
 from sc.drift import DriftTracker
 from sc.telemetry import TelemetryCollector, filler_form_share
 from sc.version import build_id, desync_warning
+from sc import digest_pool as sc_digest_pool
 
 
 def _get_call_llm():
@@ -536,9 +537,105 @@ class SupercompressContextEngine(sc_context_engine_base()):
     def _window_fresh(self) -> Window:
         """窗口 = 磁盘 replay 段（单一事实源；内存工作态崩溃清零 = session 重启已知边界）。"""
         segs = self.store.replay()
+        # P4 钩子①（replay 查池，t_026a17f8）：池命中段 → 内存态 digest_ref=done + digest_text/
+        # key_fact 回填，重启后该段免重蒸（distill 的 pending/digest_ready 门不再触达它）；
+        # jsonl 源层字节零动（done 是内存态，不回写行）。未命中 → 现有 pending 流程不变。
+        self._digest_pool_replay_hook(segs)
         self._window = Window(self.context_length, [WindowSeg(s) for s in segs])
         self._tagger = Tagger(self._aux, "")
         return self._window
+
+    # ── P4 digest sidecar 水池（engine 薄接线，算法全在 sc/digest_pool.py，t_026a17f8）─────
+
+    def _digest_pool(self):
+        """当前 session 池 = 与源层 store 文件**同目录、同 sid 前缀**的派生池（`<sid>.jsonl`
+        → `<sid>.digests.json`）；路径解析全在池模块（pool_path_for_jsonl 单源，零硬编码路径，
+        生产 hermes_home 目录 / 测试 external_store_path 临时目录两种落点都对、GC 联动同目录
+        语义自洽）。store 为 legacy active.jsonl 时池名 active.digests.json（同源同住）。"""
+        return sc_digest_pool.DigestPool(sc_digest_pool.pool_path_for_jsonl(self.store.path))
+
+    def _digest_pool_replay_hook(self, segs) -> None:
+        """钩子①（replay 查池）：池命中且 model_version 匹配 → 段内存态 digest_ref=done，跳过重蒸。
+
+        薄壳纪律：保险丝/版本失配整池作废（guard）、fail-open 读（load → {hash: entry}，
+        缺失/损坏/结构不符一律空池回落现状）、逐段「命中且版本匹配」判定（load 结果 dict 查）
+        全在 sc/digest_pool.py；壳只做 命中 → Segment 内存字段 的接线翻译，jsonl 行字节零动。
+        marker 语义：spec 的「digest_ref=done」落在既有取值域 = `ready:<refid>`（digest_ready
+        唯一判据即 startswith("ready:")，done = digest 已就绪免再生）——本壳钉 `ready:pool`
+        （池水合标记，refid 不参与任何下游判定，跨进程稳定靠 content_hash 键）；digest_text/
+        key_fact 回填使注入面 L2/L3 直接可用（DoD1：重启后注入未降级 head-80）。
+        异常一律 fail-open（池=不可信派生层，零崩溃，行为=现状 pending + head-80，DoD2）。
+        """
+        if not segs:
+            return
+        try:
+            pool = self._digest_pool()
+            # 前置闸（读池前）：保险丝（>5MB / 条目>段数）+ model_version 失配 → 整池作废重蒸。
+            # guard 纯判+作废一体（池模块）；命中 → 池已清空，直接回落现状 pending（= DoD2）。
+            if pool.guard(model_version=self._current_model_version(),
+                          segment_count=len(segs)):
+                return
+            entries = pool.load()                     # 单读全量（池模块 docstring 既定引擎读法）
+            n_hit = 0
+            for seg in segs:
+                if seg.structural_p0:
+                    continue                          # 结构地板（goal/ledger/用户指令）免蒸馏，不入池
+                entry = entries.get(seg.content_hash)
+                if entry is None:
+                    continue                          # 未命中 → 现有 pending 流程不变
+                seg.digest_ref = "ready:pool"         # done 语义：digest_ready=True，跳过重蒸
+                seg.digest_text = str(entry.get("digest_text") or "")
+                seg.key_fact = str(entry.get("key_fact") or "")
+                n_hit += 1
+            if n_hit:
+                logger.info("supercompress: digest-pool replay hydrated %d segment(s) "
+                            "digest_ref=done (re-distill skipped; jsonl bytes untouched)",
+                            n_hit)
+        except Exception as e:                        # 池=缓存，读面任何异常零崩（DoD2 回落现状）
+            logger.warning("supercompress: digest-pool replay hook no-op (fail-open): %s", e)
+
+    def _digest_pool_write_hook(self) -> None:
+        """钩子②（digest 完成回写池）：新成功生成的 digest 即时原子 append（不批量，池模块
+        upsert = load → 覆盖 → tmp+rename fsync 全在池模块）。
+
+        调用点 = 「digest 刚可能新完成」的三处（on_turn_complete 蒸馏后 / compress 蒸馏后 /
+        on_session_end aux.flush 汇合后）：此刻 digest_text 已填充的段 = 成功生成（端点真调用
+        成功或钩子①池水合回填）；transient 跳过的段 digest_text 保持 ""（[no digest] marker 路径）
+        不入池（下事件再生，池只兜成功产物）。
+
+        去重 = **池即事实源**（壳无实例账，无生命周期可漂移）：shell 先内存薄过滤候选
+        （digest_ready + 非结构地板 + digest_text 非空，零 IO）；有候选才 load() 池快照一次，
+        只 upsert 池里尚无的 content_hash——幂等（已含条目跳过，不重复写盘）且 guard 整池作废
+        后自愈（清空池 → 快照空 → 全量重写）。写失败（full-disk ENOSPC/EIO → PoolWriteError）
+        fail-open：池=缓存，下事件再生，宿主收尾面零炸。"""
+        try:
+            cand = [seg for seg in self.store.by_hash.values()
+                    if seg.digest_ready and not seg.structural_p0
+                    and getattr(seg, "digest_text", "")]
+            if not cand:
+                return
+            pool = self._digest_pool()
+            pooled = pool.load()                      # 池即去重事实源（快照一次）
+            mv = (self._main_runtime or {}).get("model", "")
+            new = [seg for seg in cand if seg.content_hash not in pooled]
+            if not new:
+                return                                 # 全在池 → 零写盘（幂等）
+            for seg in new:
+                pool.upsert(content_hash=seg.content_hash, model_version=mv,
+                            key_fact=str(seg.key_fact or ""),
+                            digest_text=str(seg.digest_text or ""))
+            logger.info("supercompress: digest-pool write-back appended %d entr(y/ies)", len(new))
+        except sc_digest_pool.PoolWriteError as e:    # 池写 OSError 归一：缓存失败非致命
+            logger.warning("supercompress: digest-pool write-back failed (fail-open, "
+                           "re-generates next event): %s", e)
+        except Exception as e:                        # 池=缓存，写面任何异常零崩（DoD2）
+            logger.warning("supercompress: digest-pool write-back no-op (fail-open): %s", e)
+
+    def _current_model_version(self):
+        """池的「当前模型」锚点 = 宿主 update_model() 注入的主模型名（_main_runtime.model）；
+        未注入 → None（guard 跳过版本判、只做保险丝；池 upsert 的 model_version 落 ""——
+        段自身 model_version 非壳注入面，宿主零改动约束下取 当前运行时模型 为池条目版本键）。"""
+        return (self._main_runtime or {}).get("model") or None
 
     # ── P2 telemetry（precision P2 · 三指标数据闸门）：宿主可读面 + drift 留痕回调 ──
 
@@ -750,6 +847,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if result.status not in ("ok", "backpressure"):
                 logger.warning("supercompress: distill status=%s events=%s",
                                result.status, result.events)
+            # P4 钩子②（digest 完成回写池，t_026a17f8）：本事件蒸馏可能新完成 digest
+            # （sync 即时 / async 经 end_turn 入队）→ 池落盘；幂等零 IO 快退，fail-open 不炸宿主。
+            self._digest_pool_write_hook()
             # P0.4：turn 末 pressure 检查（防抖口径）+ 会话边界外不触碰任何持久态
             self._check_rotation_advisory()
         except StoreError as e:
@@ -871,6 +971,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if result.status not in ("ok", "backpressure"):
                 logger.warning("supercompress: distill status=%s events=%s",
                                result.status, result.events)
+            # P4 钩子②（digest 完成回写池，t_026a17f8）：本事件蒸馏结算的 digest（sync 即时；
+            # async 在途部分由会话末 aux.flush 汇合点兜底）→ 池落盘；幂等零 IO 快退，
+            # fail-open（钩子自含宽 catch，不炸宿主 compress 返回面）。
+            self._digest_pool_write_hook()
         except (StoreError, OSError) as e:
             # R2：full-disk 时 store 交互抛 OSError（EIO/ENOSPC）——store 写路径已归一为
             # StoreError("io_error: ...")，此处双 catch 防御 replay/aux 面裸 OSError 逃逸。
@@ -1093,6 +1197,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 pass
         logger.info("supercompress: session %s end, store lines=%d",
                     session_id, self.store.line_count)
+        # P4 钩子②（digest 完成回写池，t_026a17f8）：会话末 = 重启前权威汇合点
+        # （上方 aux.flush 已汇合在途 digest worker）——此刻新 ready 段全部落池，
+        # 重启后 replay 查池命中免重蒸（P4 核心目标）。幂等零 IO 快退，fail-open。
+        self._digest_pool_write_hook()
         # P2 telemetry：会话末 flush 会话内 records 落 JSONL sink（跨会话 append-only
         # 攒数喂 P3；fail-open：写失败/无 sink → 清 records，不炸宿主收尾面）
         try:
