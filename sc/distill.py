@@ -181,7 +181,8 @@ class Distiller:
             result.kept_p0_ids = self._kept_p0_ids(w)
             return result
 
-        # 7. 正常收尾：P1/P2 lazy 批 flush（size trigger / turn 末），之后才发射锚点。
+        # 7. 正常收尾：P1/P2 lazy 批 flush（append 内 size trigger 累积 ≥cap 已即时触发；
+        #    此处 = turn 末兜底 flush 点，之后才发射锚点），之后才发射锚点。
         # R2：full-disk 时 flush 抛 StoreError("io_error: ...") / OSError——distill 是异步面，
         # 本就允许丢一个 pending 批（断电丢批上界不变）；不上抛、不炸宿主：
         # 水位 WARNING 留痕 + pending 保留在内存（store.flush 失败语义：批未清、可重试），

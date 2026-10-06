@@ -22,7 +22,7 @@
 | 层 | 写盘行为 |
 |---|---|
 | P0（含账本 + 顶层 goal） | **即写即 fsync + 读回校验**，过了才发射锚点（write-before-compress 硬 gate） |
-| P1/P2 | lazy 批：≤256 KB 或 ~2 s 触发 flush，**不逐行 fsync**（append + 批量，无随机 IO 惩罚） |
+| P1/P2 | lazy 批：≤256 KB size trigger（append 累积 ≥ `lazy_batch_cap` 即 flush），**不逐行 fsync**（append + 批量，无随机 IO 惩罚） |
 
 未 fsync 的 segment **永不发锚点** → 崩溃后死指针数量恒为零（`verify_anchor_closure` 单一实现，`scdata.py`）。
 Torn-tail 重放免费：每行自带 `content_hash`，坏行/截断行静默丢弃，从有效头部重建索引。

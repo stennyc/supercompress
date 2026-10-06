@@ -18,7 +18,7 @@ Zero vector DB · zero external services · no daemon. **Pure Python stdlib at r
 | 能力 / Capability | 行为 / Behavior |
 |---|---|
 | **P0 写前即持久 / write-before-compress durability** | 目标、决策、护栏等 P0 段**即写即 fsync + 读回**，过了才发射锚点；源写失败 = 全量不压缩、零锚点。P0 is fsync'd + read back on write, *before* compression; the anchor is only emitted once durable. A failed source write aborts compression with zero anchors. |
-| **断电上界有界 / bounded power-loss window** | 断电最多丢一批可重跑的 P1/P2 pending 输出（上界 **256 KB**，默认可配）；已 durable 的 P0 不丢。Power loss loses at most one re-runnable P1/P2 pending batch (≤ **256 KB**, configurable); durable P0 is never lost. |
+| **断电上界有界 / bounded power-loss window** | 断电最多丢一个 ≤256 KB 的 P1/P2 pending 批（size trigger 已实装：pending ≥ `lazy_batch_cap` 即 flush，批上界恒 ≤ cap；默认可配）；已 durable 的 P0 不丢。Power loss loses at most one P1/P2 pending batch ≤ **256 KB** (size trigger implemented: pending ≥ `lazy_batch_cap` flushes immediately, so batch is always ≤ cap; configurable); durable P0 is never lost. |
 | **可逆压缩 / reversible compression** | 逐出后原文可全量取回（jsonl 单一事实源），非单向有损。Evicted original text is fully retrievable from the single jsonl source of truth — compression is reversible, not lossy. |
 | **语义召回 / recall** | 点查 O(1)（`segment_id`→原文）+ BM25 语义 top-k（P0 boost、stale P1 降权）+ Pull 预算 enforce。无 embedding、无向量库。O(1) point-fetch + BM25-semantic top-k (P0 boost, stale-P1 downweight) + pull-budget enforcement. No embeddings, no vector store. |
 | **活账本 / live ledger** | 顶层 goal 永久钉死；新 user 指令 supersede 旧 phase（未完成 task 关为 `blocked`，jsonl 留审计不删行）；DONE 三级证据（verified / declared / missed）。Top-level goal is permanently pinned; a new user instruction supersedes the old phase (open tasks close as `blocked`, kept in the jsonl audit trail, never deleted). DONE has three evidence levels. |
@@ -32,7 +32,7 @@ Zero vector DB · zero external services · no daemon. **Pure Python stdlib at r
 
 | 模块 / Module | 一句话 / One-liner |
 |---|---|
-| ① `sc/distill.py` 蒸馏器 / distiller | 纯无状态 tiering → P0 写前持久 → P1/P2 lazy 批（≤256KB）→ 锚点 + jsonl 行。Stateless tiering → P0 write-before-compress → P1/P2 lazy batches → anchors + jsonl rows. |
+| ① `sc/distill.py` 蒸馏器 / distiller | 纯无状态 tiering → P0 写前持久 → P1/P2 lazy 批（size trigger：pending ≥ 256KB 即 flush）→ 锚点 + jsonl 行。Stateless tiering → P0 write-before-compress → P1/P2 lazy batches (size trigger: flush when pending ≥ 256KB) → anchors + jsonl rows. |
 | ② `sc/recall.py` 检索 / recall | 点查 O(1) + 纯 BM25 top-k（P0 boost）+ Pull 预算 20% enforce。O(1) point-fetch + pure BM25 top-k + pull budget. |
 | ③ `sc/ledger.py` 活账本 / ledger | 双层（goal 永不裁 / 子目标可 supersede）+ 确定性触发 + DONE 三级证据。Two-layer ledger + deterministic triggers + three-level DONE evidence. |
 | ④ `sc/tagger.py` 标记 / tagger | P0 确定性结构地板（语言无关）+ LLM tiering（机器可解析 JSON）。Deterministic language-agnostic P0 floor + LLM tiering via machine-parseable JSON. |

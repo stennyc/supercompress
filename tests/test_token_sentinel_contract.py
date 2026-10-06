@@ -46,7 +46,8 @@ except Exception:  # pragma: no cover - 宿主源树缺席
 def _mkengine(tmp_path: Path, context_length: int = 256000) -> SupercompressContextEngine:
     """独立隔离的 engine 实例（external_store_path → tmp，不碰全局 active.jsonl）。
 
-    context_length 默认 256000 → threshold_tokens = 0.8*256000 = 204800（sc.distill 软水位）；
+    context_length 默认 256000 → threshold_tokens = 0.55*256000 = 140800（engine 侧 0.55 水线
+    = DISTILL_WATER_FRAC；注意 ≠ sc.distill 内部 80% evict-to 软水位——两者是不同常量）；
     验收场景用 prompt_tokens < threshold（compact 成功后 prompt 回落）。"""
     return SupercompressContextEngine(context_length=context_length,
                                       external_store_path=str(tmp_path))

@@ -57,6 +57,11 @@ class RerankGate:
 
     默认保守（low_score_threshold=0.0）：BM25 score ≥ 0 → ① 实际不触发，
     只在「召回空（③）/ 显式搜索词（②）」时开——非常态 LLM 调用（硬 DoD）。
+
+    注：0.0 只是 sc 层独立构造的默认；生产 engine 构造时覆写为 3.0
+    （engine.py:366 `float(_get("rerank_low_score_threshold", 3.0))`，tests/test_rerank.py:315
+    `assert e.rerank_low_score_threshold == 3.0` 钉死）——勿把 sc 层默认读成生产 gate 阈值，
+    正常搜索面 LLM 放大率由 3.0 决定。
     """
 
     def __init__(self, low_score_threshold: float = 0.0) -> None:

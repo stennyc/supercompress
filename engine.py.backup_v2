@@ -1,0 +1,1777 @@
+"""
+Supercompress Context Engine v2 - Aligned with Reasonix architecture
+
+Key changes from v1:
+1. Compaction: Generate structured summary (like Reasonix's compaction-summary)
+2. Auto-recall: BM25 semantic search instead of keyword matching
+3. Recall format: Preamble + structured output (like Reasonix)
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import re
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from agent.context_engine import ContextEngine
+from agent.model_metadata import estimate_messages_tokens_rough
+
+# TCM-Net Integration
+try:
+    from integration import get_bridge, CompressionHint
+    TCMNET_INTEGRATION = True
+except ImportError:
+    TCMNET_INTEGRATION = False
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)  # Only WARNING and above to reduce CLI noise
+
+# Ensure logger has handlers (inherit from root if needed)
+if not logger.handlers:
+    # Propagate to root logger which has handlers configured by Hermes
+    logger.propagate = True
+
+# Load config at module level
+try:
+    from hermes_cli.config import cfg_get, load_config
+    _config = load_config()
+except ImportError:
+    _config = {}
+
+
+def _cfg_get(key: str, default=None):
+    """Wrapper for cfg_get that handles dot-notation keys."""
+    if not _config:
+        return default
+    keys = key.split('.')
+    result = _config
+    for k in keys:
+        if isinstance(result, dict):
+            result = result.get(k, default)
+        else:
+            return default
+    return result if result is not None else default
+
+
+# Default configuration
+DEFAULT_MAX_TAIL_TURNS = 15
+DEFAULT_MAX_TAIL_TOKENS = 32000
+DEFAULT_EXTERNAL_STORE_PATH = "~/.hermes/supercompress_store/"
+DEFAULT_COMPACT_RATIO = 0.50
+DEFAULT_FORCE_COMPACT_RATIO = 0.75
+
+# Reasonix-style constants
+SUMMARY_TAG_OPEN = "<compaction-summary>"
+SUMMARY_TAG_CLOSE = "</compaction-summary>"
+AUTO_RECALL_PREAMBLE = "Automatically recalled context from previous turns. May be stale; verify before relying on."
+MAX_RECALL_RESULTS = 4
+MAX_RECALL_CHARS = 2400
+
+# Dynamic recall thresholds
+DEFAULT_RECALL_THRESHOLD = 50000  # Pre-compression threshold
+DEFAULT_COMPRESSED_RECALL_THRESHOLD = 32000  # Post-compression threshold (2x max_tail_tokens)
+
+# Max messages to process per compaction batch
+MAX_COMPACT_BATCH = 50
+
+# Required summary sections (must be present for task continuity)
+REQUIRED_SUMMARY_SECTIONS = [
+    "## Standing facts & constraints",
+    "## Goal",
+    "## Pending & next step",
+]
+
+# Optional but recommended sections
+RECOMMENDED_SUMMARY_SECTIONS = [
+    "## Decisions & rationale",
+    "## Files & code",
+    "## Commands & outcomes",
+    "## Errors & fixes",
+]
+
+# Default placeholder for missing required sections
+DEFAULT_SECTION_PLACEHOLDER = {
+    "## Standing facts & constraints": "[No constraints recorded - verify current state]",
+    "## Goal": "[No explicit goal - continue current task]",
+    "## Pending & next step": "[No pending items - refer to recent messages]",
+}
+
+# LLM summary generation config
+SUMMARY_SYSTEM_PROMPT = """You are compacting the earlier part of a coding agent's conversation to save context.
+The agent keeps your summary alongside the user's own turns (kept verbatim) and the recent tail; your job is to fold the assistant/tool work into a briefing it can resume from.
+
+**Fill in the content under each heading. Do NOT change or remove the headings.**
+
+## Standing facts & constraints
+[Fill in: names, paths, IDs, versions, preferences, rules]
+
+## Goal
+[Fill in: user's request and intent]
+
+## Decisions & rationale
+[Fill in: key choices made so far, or "(none)" if none]
+
+## Files & code
+[Fill in: files read/modified with signatures, lines, exact edits, or "(none)"]
+
+## Commands & outcomes
+[Fill in: commands run and results, or "(none)"]
+
+## Errors & fixes
+[Fill in: problems and resolutions, or "(none)"]
+
+## Current Task
+[Fill in: what the model was ACTUALLY DOING right now - the immediate next action, or "(none) if no active task]
+IMPORTANT: This is the MOST CRITICAL section. State the exact next step the model should take.
+
+## Pending & next step
+[Fill in: in-progress work and next action, or "(none)"]
+
+## Compressed Context
+The following chunk files contain the original messages. The agent will reference them by filename when details are needed.
+
+**How to use chunk files:**
+- To read a chunk file: use `read_file("~/.hermes/supercompress_store/{filename}")`
+- Each chunk contains a time-ordered conversation segment
+- The agent will decide when to recall based on relevance
+
+[COMPRESSED CONTEXT IDS]
+{chunk_ids_section}
+[/COMPRESSED CONTEXT IDS]
+
+IMPORTANT RULES:
+1. Keep ALL headings exactly as shown — do not modify, remove, or rename them
+2. Be terse — bullet points and fragments, not prose
+3. Preserve identifiers, paths, and numbers exactly
+4. Do NOT invent anything not present in the messages
+"""
+
+# Freshness decay constants
+FRESHNESS_HALF_LIFE_HOURS = 24.0  # Score halves after this many hours
+FRESHNESS_MAX_AGE_HOURS = 168.0   # Drop stale memories after this many hours (1 week)
+
+# Recall cache TTL
+RECALL_CACHE_TTL = 300  # 5 minutes
+
+# Storage cleanup config
+MAX_STORE_AGE_HOURS = 168.0       # Delete chunks older than 1 week
+MAX_STORE_TOTAL_MB = 50.0         # Maximum total storage size
+CLEANUP_INTERVAL_HOURS = 6.0     # Check cleanup every 6 hours
+PROTECT_REFERENCED_CHUNKS = True  # Never delete chunks still referenced by summaries
+
+# Recall quality metrics
+RECALL_MIN_SCORE_RATIO = 0.24     # Minimum score ratio (24% of best)
+RECALL_MAX_RESULTS = 4            # Maximum results to return
+RECALL_MAX_CHARS = 2400           # Maximum characters in recall block
+
+# Tokenization config
+CJK_TOKEN_MIN_LENGTH = 1          # Minimum CJK token length
+WESTERN_TOKEN_MIN_LENGTH = 2      # Minimum Western token length
+
+
+class SupercompressContextEngine(ContextEngine):
+    """
+    Three-zone context management engine aligned with Reasonix.
+    
+    Zone A (Immutable Prefix): system + tools, hashed at construction, never modified
+    Zone B (Append-Only Log): conversation history, trim from tail when full  
+    Zone C (Volatile Scratch): reasoning process, cleared every turn
+    
+    Features:
+    - Compaction with structured summary generation
+    - BM25 semantic auto-recall
+    - Prefix cache stability (99%+ hit rate target)
+    """
+    
+    # Configuration
+    max_tail_turns: int = DEFAULT_MAX_TAIL_TURNS
+    max_tail_tokens: int = DEFAULT_MAX_TAIL_TOKENS
+    external_store_path: Path = Path(DEFAULT_EXTERNAL_STORE_PATH).expanduser()
+    compact_ratio: float = DEFAULT_COMPACT_RATIO
+    force_compact_ratio: float = DEFAULT_FORCE_COMPACT_RATIO
+    
+    def __init__(self, **kwargs: Any):
+        """Initialize the Supercompress context engine."""
+        try:
+            _comp_cfg = _cfg_get("compression.supercompress", {}) or {}
+
+            self.max_tail_turns = kwargs.get('max_tail_turns', _comp_cfg.get('max_tail_turns', self.max_tail_turns))
+            self.max_tail_tokens = kwargs.get('max_tail_tokens', _comp_cfg.get('max_tail_tokens', self.max_tail_tokens))
+            self.external_store_path = Path(kwargs.get('external_store_path', _comp_cfg.get('external_store_path', str(self.external_store_path)))).expanduser()
+            self.compact_ratio = kwargs.get('compact_ratio', _comp_cfg.get('compact_ratio', self.compact_ratio))
+            self.force_compact_ratio = kwargs.get('force_compact_ratio', _comp_cfg.get('force_compact_ratio', self.force_compact_ratio))
+
+            # Dynamic recall threshold: lower after compression to enable earlier recall
+            self.recall_threshold_compressed = kwargs.get('recall_threshold_compressed', _comp_cfg.get('recall_threshold_compressed', DEFAULT_COMPRESSED_RECALL_THRESHOLD))
+
+            logger.info(
+                "tcm-supercompress: initialized - compact_ratio=%.2f, force_ratio=%.2f, max_turns=%d, max_tokens=%d",
+                self.compact_ratio,
+                self.force_compact_ratio,
+                self.max_tail_turns,
+                self.max_tail_tokens
+            )
+            logger.info(
+                "tcm-supercompress: recall thresholds - pre_compression=%d, post_compression=%d",
+                DEFAULT_RECALL_THRESHOLD, self.recall_threshold_compressed
+            )
+        except Exception as e:
+            logger.warning("tcm-supercompress: failed to load config, using defaults: %s", e)
+        
+        # Zone A: Immutable Prefix
+        self._prefix_hash: Optional[str] = None
+        self._prefix_messages: List[Dict[str, Any]] = []
+        
+        # Zone B: Append-Only Log
+        self._tail_buffer: List[Dict[str, Any]] = []
+        self._compact_summaries: List[Dict[str, Any]] = []  # Store compaction summaries
+        self._summarized_chunk_ids: set = set()  # Track which chunks have been summarized
+        self._chunk_refs: Dict[str, set] = {}  # chunk_id -> set of summary indices
+
+        # Zone C: Volatile Scratch
+        self._scratch: Dict[str, Any] = {}
+        
+        # Debounce and tracking
+        self._last_compression_time: float = 0.0
+        self._last_summary_hash: str = ""
+        self._total_trimmable_tokens: int = 0
+
+        # Token tracking
+        self.last_prompt_tokens: int = 0
+        self.last_completion_tokens: int = 0
+        self.last_total_tokens: int = 0
+        self.context_length: int = 256000
+        self.threshold_tokens: int = int(self.context_length * self.compact_ratio)
+        self.compression_count: int = 0
+        self.compression_enabled: bool = True  # Add this for Hermes integration
+        
+        # Fallback: estimate tokens from message count when usage data unavailable
+        self._estimated_tokens: int = 0  # Legacy field for future use
+        self._message_count: int = 0
+
+        # Anti-thrash protection
+        self._fallback_compression_streak: int = 0
+
+        # Stats
+        self._total_trimmable_tokens: int = 0
+        self._total_stored_tokens: int = 0
+
+        # BM25 parameters
+        self._bm25_params = {'k1': 1.5, 'b': 0.75}
+        
+        # Dynamic recall parameters (initialized to defaults, updated when model changes)
+        self.recall_max_results = RECALL_MAX_RESULTS
+        self.recall_max_chars = RECALL_MAX_CHARS
+        self.recall_min_score_ratio = RECALL_MIN_SCORE_RATIO
+
+        # Recall cache
+        self._recall_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # query -> (timestamp, result)
+        self._max_recall_cache_size = 100  # Maximum cache entries
+
+        # Storage cleanup tracking
+        self._last_cleanup_time: float = 0.0
+        self._cleanup_interval = CLEANUP_INTERVAL_HOURS * 3600  # Convert to seconds
+
+        # Active reference tracking: chunk_id -> set of summary indices
+        self._chunk_refs: Dict[str, set] = {}
+
+        # BM25 document frequency index (for faster IDF calculation)
+        self._df_index: Dict[str, int] = {}  # term -> document frequency
+
+        # LLM client for enhanced summary generation
+
+
+        logger.info(
+            "tcm-supercompress: engine ready (context_length=%d, threshold=%d tokens)",
+            self.context_length,
+            self.threshold_tokens
+        )
+    
+    @property
+    def name(self) -> str:
+        return "supercompress"
+    
+    @property
+    def emit_automatic_compaction_status(self) -> bool:
+        return False
+    
+    # -------------------------------------------------------------------------
+    # Zone A: Immutable Prefix
+    # -------------------------------------------------------------------------
+    
+    def _build_prefix(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Extract immutable prefix (system + tool definitions)."""
+        prefix = []
+        tool_call_ids_seen = set()
+
+        for msg in messages:
+            role = msg.get("role", "")
+
+            if role == "system":
+                prefix.append(msg)
+                continue
+
+            # Keep tool results that match known tool calls
+            if role == "tool":
+                tool_call_id = msg.get("tool_call_id", "")
+                if tool_call_id and tool_call_id not in tool_call_ids_seen:
+                    tool_call_ids_seen.add(tool_call_id)
+                    prefix.append(msg)
+                continue
+
+            # Stop at first user/assistant message
+            if role in ("user", "assistant"):
+                break
+
+        return prefix
+
+    def _populate_tail_from_messages(self, messages: List[Dict[str, Any]]) -> int:
+        """Load historical messages into tail buffer when session starts with history.
+
+        Called when compression is triggered but _tail_buffer is empty (e.g.,
+        session loaded from database with pre-existing messages).
+        """
+        if self._tail_buffer:
+            return 0  # Already populated
+
+        # Extract user/assistant/tool messages (skip system)
+        history_msgs = [m for m in messages if m.get("role") in ("user", "assistant", "tool")]
+        if not history_msgs:
+            return 0
+
+        # Keep only recent messages that fit in buffer
+        loaded = 0
+        for msg in reversed(history_msgs):
+            if len(self._tail_buffer) >= self.max_tail_turns:
+                break
+            self._tail_buffer.append(msg)
+            loaded += 1
+
+        # Reverse to maintain order
+        self._tail_buffer = list(reversed(self._tail_buffer))
+        logger.info(
+            "tcm-supercompress: populated tail from history - %d messages loaded",
+            loaded
+        )
+        return loaded
+    
+    def _compute_prefix_hash(self, prefix: List[Dict[str, Any]]) -> str:
+        """Compute stable hash of immutable prefix."""
+        prefix_text = json.dumps(prefix, sort_keys=True, default=str)
+        return hashlib.sha256(prefix_text.encode()).hexdigest()
+    
+    def _ensure_prefix_built(self, messages: List[Dict[str, Any]]) -> None:
+        """Build prefix if not already constructed."""
+        if self._prefix_messages:
+            return
+        
+        self._prefix_messages = self._build_prefix(messages)
+        self._prefix_hash = self._compute_prefix_hash(self._prefix_messages)
+        
+        prefix_tokens = self._estimate_tokens(self._prefix_messages)
+        logger.info(
+            "tcm-supercompress: prefix built (%d messages, %d tokens, hash: %s...)",
+            len(self._prefix_messages),
+            prefix_tokens,
+            self._prefix_hash[:8] if self._prefix_hash else "none"
+        )
+    
+    # -------------------------------------------------------------------------
+    # Zone B: Append-Only Log with Compaction
+    # -------------------------------------------------------------------------
+    
+    def _trim_tail_if_needed(self) -> None:
+        """Trim old content from TAIL only (preserves prefix hash).
+
+        Stage 1: context > 35% -> store chunks + generate LLM summary with chunk_ids
+
+        Batches messages into chunks of MAX_COMPACT_BATCH to ensure each summary
+        has sufficient context for quality generation.
+        """
+        import time
+        now = time.time()
+
+        # Debounce: skip if compressed too recently (less than 60 seconds)
+        if now - self._last_compression_time < 60:
+            logger.info(
+                "tcm-supercompress: skipping trim - debounce active (%.1fs since last compression)",
+                now - self._last_compression_time
+            )
+            return
+
+        # Mark compression start time immediately to prevent race conditions
+        self._last_compression_time = now
+        
+        # Process in batches to ensure quality summaries
+        total_removed = 0
+        total_chunks = []
+
+        while len(self._tail_buffer) > self.max_tail_turns:
+            # Calculate how many to remove in this batch
+            if len(self._tail_buffer) - self.max_tail_turns <= MAX_COMPACT_BATCH:
+                # Last batch: remove all remaining excess
+                remove_count = len(self._tail_buffer) - self.max_tail_turns
+            else:
+                # Not the last batch: remove MAX_COMPACT_BATCH
+                remove_count = MAX_COMPACT_BATCH
+
+            # Extract the batch to remove
+            removed = self._tail_buffer[:remove_count]
+            self._tail_buffer = self._tail_buffer[remove_count:]
+
+            total_removed += len(removed)
+            logger.info(
+                "tcm-supercompress: batch trim - removing %d messages, tail now %d turns",
+                len(removed), len(self._tail_buffer)
+            )
+
+            # Store externally to get chunk_ids
+            chunk_ids = self._store_external(removed)
+            total_chunks.extend(chunk_ids)
+            self._total_trimmable_tokens += self._estimate_tokens(removed)
+
+            # Skip if all chunks already summarized
+            new_chunks = [cid for cid in chunk_ids if cid not in self._summarized_chunk_ids]
+            if not new_chunks:
+                logger.info(
+                    "tcm-supercompress: skipping - all %d chunks already summarized",
+                    len(chunk_ids)
+                )
+                continue
+            
+            # Generate LLM summary with chunk_ids (Stage 1 compaction)
+            tcmnet_hint = None  # TCM-Net integration hint (optional)
+            logger.info("tcm-supercompress: Calling _generate_compaction_summary, _llm_client=%s, removed=%d messages", self._llm_client, len(removed))
+            try:
+                summary = self._generate_compaction_summary(removed, None, chunk_ids, tcmnet_hint)
+                logger.info("tcm-supercompress: _generate_compaction_summary returned: type=%s, bool=%s, len=%d", type(summary).__name__, bool(summary), len(summary) if summary else 0)
+            except Exception as e:
+                logger.error("tcm-supercompress: _generate_compaction_summary exception: %s", e, exc_info=True)
+                summary = None
+            if summary:
+                # Check for duplicate summary (same content)
+                summary_hash = hashlib.md5(summary.encode()).hexdigest()
+                is_duplicate = any(
+                    s.get('hash') == summary_hash
+                    for s in self._compact_summaries
+                )
+
+                # Always mark chunks as summarized to prevent re-processing
+                self._summarized_chunk_ids.update(chunk_ids)
+
+                if is_duplicate:
+                    logger.info(
+                        "tcm-supercompress: skipping duplicate summary (hash=%s)",
+                        summary_hash[:8]
+                    )
+                else:
+                    summary_idx = len(self._compact_summaries)
+                    self._compact_summaries.append({
+                        'summary': summary,
+                        'timestamp': time.time(),
+                        'messages_count': len(removed),
+                        'tokens': self._estimate_tokens(removed),
+                        'chunk_ids': chunk_ids,
+                        'hash': summary_hash
+                    })
+                    # Track references: each chunk_id is referenced by this summary
+                    for cid in chunk_ids:
+                        if cid not in self._chunk_refs:
+                            self._chunk_refs[cid] = set()
+                        self._chunk_refs[cid].add(summary_idx)
+                    logger.info(
+                        "tcm-supercompress: compaction (light) - stored %d messages as %s, summary (%d chars)",
+                        len(removed), chunk_ids, len(summary)
+                    )
+
+        # Always update compression time (even if no messages removed due to all-chunks-summarized)
+        self._last_compression_time = time.time()
+        logger.info(
+            "tcm-supercompress: tail trim complete - removed %d total messages in batches, tail now %d turns, %d chunks summarized",
+            total_removed, len(self._tail_buffer), len(self._summarized_chunk_ids)
+        )
+
+    def _aggressive_trim(self, messages: List[Dict[str, Any]], focus_topic: Optional[str] = None) -> None:
+        """Stage 2: Clean up old summaries when context > 75%.
+        
+        This method is called when context exceeds force_compact_ratio (75%).
+        It removes the oldest summaries to free context space.
+        """
+        # Protection: Keep high-priority summaries (behavior constraints)
+        protected = []
+        removable = []
+        for s in self._compact_summaries:
+            if s.get('type') == 'high_priority':
+                protected.append(s)
+            else:
+                removable.append(s)
+        
+        # Only trim removable summaries (keep only recent 3)
+        if len(protected + removable) > 3:
+            to_remove = len(protected + removable) - 3
+            removable = removable[to_remove:]
+            self._compact_summaries = protected + removable
+            logger.info(
+                "tcm-supercompress: aggressive trim - protected %d high-weight, removed %d low-weight",
+                len(protected), to_remove
+            )
+        elif len(self._compact_summaries) > 3:
+            removed = self._compact_summaries[:-3]
+            self._compact_summaries = self._compact_summaries[-3:]
+            logger.info(
+                "tcm-supercompress: aggressive trim - removed %d old summaries, kept %d",
+                len(removed), len(self._compact_summaries)
+            )
+            # Clean up chunk references for removed summaries
+            self._cleanup_chunk_references(removed)
+    
+    def _generate_compaction_summary(self, messages: List[Dict[str, Any]], focus_topic: Optional[str] = None, chunk_ids: Optional[List[str]] = None, tcmnet_hint: Optional[Dict] = None) -> str:
+        """Generate structured compaction summary with optional LLM enhancement and TCM-Net integration."""
+        # Try LLM-enhanced generation first
+        if self._llm_client:
+            llm_summary = self._llm_generate_summary(messages, focus_topic, chunk_ids)
+            if llm_summary:
+                # Validate and fix missing sections
+                llm_summary = self._validate_summary_structure(llm_summary)
+                logger.info("tcm-supercompress: LLM summary generated (%d chars)", len(llm_summary))
+                
+                # Inject TCM-Net insights if available
+                if tcmnet_hint and TCMNET_INTEGRATION:
+                    llm_summary = self._inject_tcmnet_insights(llm_summary, tcmnet_hint)
+                
+                return llm_summary
+
+        # Fallback to rule-based generation
+        summary = self._rule_based_summary(messages, focus_topic)
+        # Validate rule-based summary too
+        summary = self._validate_summary_structure(summary)
+        
+        # Inject TCM-Net insights if available
+        if tcmnet_hint and TCMNET_INTEGRATION:
+            summary = self._inject_tcmnet_insights(summary, tcmnet_hint)
+        
+        return summary
+    
+    def _inject_tcmnet_insights(self, summary: str, hint: Dict) -> str:
+        """Inject TCM-Net insights into the summary."""
+        # Check for high-energy events
+        high_energy = hint.get('high_energy_events', [])
+        if not high_energy:
+            return summary
+        
+        # Build insight section
+        lines = ["\n## TCM-Net 洞察", ""]
+        
+        # Add high-energy events
+        sorted_events = sorted(high_energy, key=lambda x: x.get('energy_score', 0), reverse=True)[:3]
+        for event in sorted_events:
+            energy = event.get('energy_score', 0)
+            action = event.get('anchor_action', 'Unknown')
+            importance = "🔴 CRITICAL" if energy >= 0.8 else "🟠 HIGH" if energy >= 0.6 else "🟡 MEDIUM"
+            lines.append(f"- {importance} {action} (能量: {energy:.2f})")
+        
+        # Add strategy notes
+        strategy = hint.get('strategy_notes', '')
+        if strategy:
+            lines.append("")
+            lines.append("### 建议策略")
+            lines.append(strategy)
+        
+        # Add language hint
+        language = hint.get('language', 'en')
+        if language and language != 'en':
+            lines.append("")
+            lines.append(f"### 语言提示")
+            lines.append(f"此摘要包含{language}内容，请注意理解上下文中的文化背景和语义细节。")
+        
+        insight_section = "\n".join(lines)
+        
+        # Insert before the closing tag or at the end
+        if "</compaction-summary>" in summary:
+            summary = summary.replace("</compaction-summary>", f"{insight_section}\n</compaction-summary>")
+        else:
+            summary += insight_section
+        
+        logger.info(f"tcm-supercompress: injected TCM-Net insights ({len(high_energy)} high-energy events)")
+        return summary
+
+    def _validate_summary_structure(self, summary: str) -> str:
+        """Validate and clean summary structure.
+
+        Returns the summary with:
+        - Nested <compaction-summary> tags removed
+        - Missing required sections added
+        """
+        # 清理嵌套的 <compaction-summary> 标签
+        # 移除所有开头的 <compaction-summary> 和结尾的 </compaction-summary>
+        # 这样可以处理嵌套结构
+        cleaned = re.sub(r'<compaction-summary>\s*', '', summary)
+        cleaned = re.sub(r'\s*</compaction-summary>', '', cleaned)
+        if cleaned != summary:
+            logger.info("tcm-supercompress: cleaned %d nested summary tags", summary.count('<compaction-summary>'))
+            summary = cleaned
+
+        lines = summary.split('\n')
+        found_sections = set()
+        section_positions = {}
+        
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            for section in REQUIRED_SUMMARY_SECTIONS + RECOMMENDED_SUMMARY_SECTIONS:
+                if stripped == section:
+                    found_sections.add(section)
+                    section_positions[section] = i
+        
+        # Check for missing required sections
+        missing_required = [s for s in REQUIRED_SUMMARY_SECTIONS if s not in found_sections]
+        if missing_required:
+            # INFO level instead of WARNING - many chunks only have assistant/tool messages, no user messages
+            logger.info(
+                "tcm-supercompress: summary missing optional sections (expected for tool-only chunks): %s",
+                missing_required
+            )
+            # Insert missing sections before the last non-empty line
+            insert_pos = len(lines)
+            for i in range(len(lines) - 1, -1, -1):
+                if lines[i].strip():
+                    insert_pos = i + 1
+                    break
+            
+            # Add missing required sections
+            for section in missing_required:
+                placeholder = DEFAULT_SECTION_PLACEHOLDER.get(section, f"[No content for {section}]")
+                lines.insert(insert_pos, section)
+                lines.insert(insert_pos + 1, placeholder)
+                lines.insert(insert_pos + 2, "")  # Empty line after section
+                insert_pos += 3
+            
+            summary = '\n'.join(lines)
+            logger.info("tcm-supercompress: added %d missing required sections", len(missing_required))
+        
+        return summary
+
+    def _rule_based_summary(self, messages: List[Dict[str, Any]], focus_topic: Optional[str] = None) -> str:
+        """Rule-based summary generation (fallback)."""
+        # Extract key information from messages
+        user_messages = [m for m in messages if m.get('role') == 'user']
+        assistant_messages = [m for m in messages if m.get('role') == 'assistant']
+        tool_messages = [m for m in messages if m.get('role') == 'tool']
+
+        lines = []
+
+        # Helper to extract text from multimodal content
+        def _extract_text(content):
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                # Multimodal: extract text parts
+                parts = []
+                for item in content:
+                    if isinstance(item, dict) and item.get('type') == 'text':
+                        parts.append(item.get('text', ''))
+                return ' '.join(parts)
+            return ''
+
+        # Standing facts & constraints
+        if user_messages:
+            facts = []
+            for msg in user_messages[-3:]:  # Last 3 user messages
+                content = _extract_text(msg.get('content', ''))
+                if content:
+                    facts.append(f"- {content[:200]}")
+            if facts:
+                lines.append("## Standing facts & constraints")
+                lines.extend(facts)
+                lines.append("")
+        else:
+            # Add placeholder when no user messages
+            lines.append("## Standing facts & constraints")
+            lines.append("[No user messages in this chunk - this is expected for tool-only segments]")
+            lines.append("")
+
+        # Goal
+        if user_messages:
+            goal = _extract_text(user_messages[0].get('content', ''))
+            if goal and goal.strip():
+                lines.append("## Goal")
+                lines.append(goal[:300])
+                lines.append("")
+        else:
+            # Add placeholder when no user messages
+            lines.append("## Goal")
+            lines.append("[No user messages to extract goal from]")
+            lines.append("")
+
+        # Decisions & rationale
+        if assistant_messages:
+            decisions = []
+            for msg in assistant_messages[-2:]:
+                content = msg.get('content', '')
+                if content and isinstance(content, str) and len(content) > 50:
+                    decisions.append(f"- {content[:200]}")
+            if decisions:
+                lines.append("## Decisions & rationale")
+                lines.extend(decisions[:3])
+                lines.append("")
+
+        # Commands & outcomes (from tool messages)
+        if tool_messages:
+            commands = []
+            for msg in tool_messages[-2:]:
+                name = msg.get('name', 'unknown')
+                content = msg.get('content', '')
+                if content and isinstance(content, str):
+                    commands.append(f"- {name}: {content[:100]}")
+            if commands:
+                lines.append("## Commands & outcomes")
+                lines.extend(commands)
+                lines.append("")
+
+        # Current Task (extract from recent assistant messages)
+        lines.append("## Current Task")
+        if assistant_messages:
+            # Get the last assistant response content
+            last_assistant = assistant_messages[-1]
+            content = last_assistant.get('content', '')
+            if content and isinstance(content, str) and len(content) > 0:
+                # Extract key action from assistant's last response
+                lines.append(f"- Last action: {content[:200]}")
+            else:
+                lines.append("- [No active task detected from last response]")
+        else:
+            lines.append("- [No assistant messages to extract current task]")
+        lines.append("")
+
+        # Pending & next step
+        lines.append("## Pending & next step")
+        lines.append("Continue from current task above")
+
+        return "\n".join(lines)
+    
+    def _estimate_tail_tokens(self) -> int:
+        return self._estimate_tokens(self._tail_buffer)
+    
+    def _estimate_tokens(self, messages: List[Dict[str, Any]]) -> int:
+        if not messages:
+            return 0
+        return estimate_messages_tokens_rough(messages)
+    
+    def _store_external(self, messages: List[Dict[str, Any]]) -> List[str]:
+        """Store trimmed messages for potential recall. Returns chunk_ids."""
+        if not messages:
+            return []
+
+        try:
+            self.external_store_path.mkdir(parents=True, exist_ok=True)
+
+            timestamp = int(time.time())
+            store_file = self.external_store_path / f"chunk_{timestamp}.jsonl"
+
+            with open(store_file, 'w', encoding='utf-8') as f:
+                for msg in messages:
+                    f.write(json.dumps(msg, ensure_ascii=False) + '\n')
+
+            stored_tokens = self._estimate_tokens(messages)
+            self._total_stored_tokens += stored_tokens
+            chunk_id = store_file.name
+
+            # Track active reference (initially no summaries reference it)
+            self._chunk_refs[chunk_id] = set()
+
+            logger.info(
+                "tcm-supercompress: external store - %d messages, %d tokens -> %s (total stored: %d tokens)",
+                len(messages), stored_tokens, chunk_id, self._total_stored_tokens
+            )
+            return [chunk_id]
+        except Exception as e:
+            logger.error(
+                "tcm-supercompress: failed to store external messages: %s", e
+            )
+            return []
+    
+    # -------------------------------------------------------------------------
+    # BM25 Semantic Recall
+    # -------------------------------------------------------------------------
+    
+    def _tokenize(self, text: str) -> List[str]:
+        """改进分词 - 保留短语结构，语言无关"""
+        text = text.lower()
+        tokens = []
+
+        # 1. 中文/日文/韩文：保留 2-4 字短语 + 单字
+        # 基于 Unicode 范围，语言无关
+        cjk_phrases = re.findall(r'[\u4e00-\u9fff]{2,4}', text)
+        tokens.extend(cjk_phrases)  # 短语优先
+        tokens.extend(re.findall(r'[\u4e00-\u9fff]', text))  # 也保留单字
+
+        # 2. 英文：保留完整单词
+        english_words = re.findall(r'[a-z]{2,}', text)
+        tokens.extend(english_words)
+
+        # 3. 数字：保留完整数字
+        number_tokens = re.findall(r'\d+', text)
+        tokens.extend(number_tokens)
+
+        return tokens
+    
+    def _bm25_score(self, doc_terms: List[str], query_terms: List[str]) -> float:
+        """Calculate BM25 score for a document against query."""
+        if not query_terms:
+            return 0.0
+
+        k1 = self._bm25_params['k1']
+        b = self._bm25_params['b']
+
+        doc_len = len(doc_terms)
+        # Average document length (approximation)
+        avg_dl = 50.0
+
+        score = 0.0
+        # Count term frequencies in document
+        doc_freq = {}
+        for t in doc_terms:
+            doc_freq[t] = doc_freq.get(t, 0) + 1
+
+        for query_term in query_terms:
+            df = doc_freq.get(query_term, 0)
+            if df == 0:
+                continue
+
+            # 短语匹配权重 2x（长度>2的token视为短语）
+            weight = 2.0 if len(query_term) > 2 else 1.0
+
+            # IDF (using document frequency index if available)
+            global_df = self._df_index.get(query_term, df) or df
+            idf = math.log(1 + (1 + global_df) / (global_df + 0.5))
+
+            # TF with BM25 adjustment
+            tf = (df * (k1 + 1)) / (df + k1 * (1 - b + b * doc_len / avg_dl))
+
+            score += idf * tf * weight
+
+        return score
+
+    def _bm25_score_with_df(self, doc_terms: List[str], query_terms: List[str]) -> float:
+        """Optimized BM25 score using document frequency index."""
+        # Alias for backward compatibility
+        return self._bm25_score(doc_terms, query_terms)
+    
+    def _load_recall_corpus(self) -> List[Dict[str, Any]]:
+        """Load all stored messages for recall with metadata."""
+        corpus = []
+        if not self.external_store_path.exists():
+            return corpus
+
+        # Get list of chunks first
+        try:
+            chunk_files = sorted(self.external_store_path.glob("chunk_*.jsonl"))
+        except Exception as e:
+            logger.debug("tcm-supercompress: failed to list chunks: %s", e)
+            return corpus
+
+        for chunk_file in chunk_files:
+            try:
+                # Check if file still exists (race condition protection)
+                if not chunk_file.exists():
+                    logger.debug("tcm-supercompress: chunk %s vanished during iteration", chunk_file.name)
+                    continue
+
+                # Extract timestamp from filename
+                timestamp = self._extract_timestamp_from_filename(chunk_file.name)
+                with open(chunk_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            try:
+                                msg = json.loads(line)
+                                # Extract searchable text
+                                content = msg.get('content', '')
+                                # Handle multimodal messages (content can be list)
+                                if isinstance(content, list):
+                                    # Extract text from content blocks
+                                    text_parts = []
+                                    for block in content:
+                                        if isinstance(block, dict) and block.get('type') == 'text':
+                                            text_parts.append(block.get('text', ''))
+                                    content = ' '.join(text_parts)
+                                if content and isinstance(content, str):
+                                    tokens = self._tokenize(content)
+                                    corpus.append({
+                                        'text': content,
+                                        'tokens': tokens,
+                                        'message': msg,
+                                        'source': chunk_file.name,
+                                        'timestamp': timestamp,
+                                        'freshness': self._calculate_freshness(timestamp)
+                                    })
+                                    # Update document frequency index
+                                    for token in tokens:
+                                        self._df_index[token] = self._df_index.get(token, 0) + 1
+                            except json.JSONDecodeError:
+                                continue
+            except FileNotFoundError:
+                # File was deleted between check and open - skip it
+                logger.debug("tcm-supercompress: chunk %s deleted during read", chunk_file.name)
+                continue
+            except Exception as e:
+                logger.debug("tcm-supercompress: failed to load recall corpus: %s", e)
+
+        return corpus
+
+    def _cleanup_old_storage(self) -> None:
+        """Clean up old chunk files to prevent storage bloat.
+
+        Safe deletion mechanism:
+        1. Never delete chunks still referenced by active summaries
+        2. Check file existence before deletion (race condition protection)
+        3. Log all deletion decisions for audit
+        """
+        now = time.time()
+        if now - self._last_cleanup_time < self._cleanup_interval:
+            return
+
+        self._last_cleanup_time = now
+
+        if not self.external_store_path.exists():
+            return
+
+        # Calculate total size
+        try:
+            total_size = sum(f.stat().st_size for f in self.external_store_path.glob("chunk_*.jsonl"))
+        except FileNotFoundError:
+            logger.debug("tcm-supercompress: storage path vanished during cleanup")
+            return
+
+        max_size_bytes = int(MAX_STORE_TOTAL_MB * 1024 * 1024)
+
+        # Get current chunks and sort by age
+        try:
+            chunks = sorted(
+                self.external_store_path.glob("chunk_*.jsonl"),
+                key=lambda f: self._extract_timestamp_from_filename(f.name)
+            )
+        except Exception as e:
+            logger.debug("tcm-supercompress: failed to list chunks: %s", e)
+            return
+
+        deleted = 0
+        skipped_referenced = 0
+
+        for chunk in chunks:
+            try:
+                chunk_age = now - self._extract_timestamp_from_filename(chunk.name)
+                chunk_size = chunk.stat().st_size
+            except FileNotFoundError:
+                # File was deleted between glob and stat - skip it
+                continue
+            except Exception as e:
+                logger.debug("tcm-supercompress: failed to stat chunk %s: %s", chunk.name, e)
+                continue
+
+            chunk_id = chunk.name
+
+            # Safety check: never delete chunks still referenced by summaries
+            if PROTECT_REFERENCED_CHUNKS and chunk_id in self._chunk_refs:
+                active_refs = len(self._chunk_refs[chunk_id])
+                if active_refs > 0:
+                    logger.info(
+                        "tcm-supercompress: skipping deletion of %s (referenced by %d active summary/ies, age=%.1fh)",
+                        chunk_id, active_refs, chunk_age / 3600
+                    )
+                    skipped_referenced += 1
+                    continue
+
+            should_delete = False
+            reason = None
+
+            # Rule 1: Age-based deletion
+            if chunk_age > MAX_STORE_AGE_HOURS * 3600:
+                should_delete = True
+                reason = f"age={chunk_age/3600:.1f}h > max={MAX_STORE_AGE_HOURS}h"
+
+            # Rule 2: Size-based deletion (only if under age limit)
+            elif max_size_bytes > 0 and total_size > max_size_bytes and deleted < len(chunks) // 2:
+                should_delete = True
+                reason = f"size={total_size/1024/1024:.1f}MB > max={max_size_bytes/1024/1024:.1f}MB"
+
+            if should_delete:
+                try:
+                    chunk.unlink()
+                    deleted += 1
+                    total_size -= chunk_size
+
+                    # Clean up reference tracking
+                    if chunk_id in self._chunk_refs:
+                        del self._chunk_refs[chunk_id]
+
+                    logger.info(
+                        "tcm-supercompress: cleaned up %s (%s)",
+                        chunk_id, reason
+                    )
+                except FileNotFoundError:
+                    # File disappeared between check and delete - ignore
+                    continue
+                except Exception as e:
+                    logger.error("tcm-supercompress: failed to delete %s: %s", chunk_id, e)
+
+        if deleted > 0:
+            logger.info(
+                "tcm-supercompress: storage cleanup - deleted %d chunks, skipped %d referenced chunks",
+                deleted, skipped_referenced
+            )
+
+    def _cleanup_chunk_references(self, removed_summaries: List[Dict[str, Any]]) -> None:
+        """Clean up chunk reference tracking when summaries are removed."""
+        for summary in removed_summaries:
+            chunk_ids = summary.get('chunk_ids', [])
+            summary_idx = self._compact_summaries.index(summary) if summary in self._compact_summaries else -1
+
+            for chunk_id in chunk_ids:
+                if chunk_id in self._chunk_refs:
+                    self._chunk_refs[chunk_id].discard(summary_idx)
+                    # Remove entry if no more references
+                    if not self._chunk_refs[chunk_id]:
+                        del self._chunk_refs[chunk_id]
+
+        logger.debug(
+            "tcm-supercompress: cleaned up references for %d summaries, %d chunks still referenced",
+            len(removed_summaries),
+            len(self._chunk_refs)
+        )
+
+    def _extract_timestamp_from_filename(self, filename: str) -> float:
+        """Extract timestamp from chunk filename."""
+        try:
+            # Format: chunk_1786271342.jsonl
+            match = re.search(r'chunk_(\d+)\.jsonl', filename)
+            if match:
+                return float(match.group(1))
+        except Exception:
+            pass
+        return time.time()  # Fallback to current time
+
+    def _calculate_freshness(self, timestamp: float) -> float:
+        """Calculate freshness score (1.0 = fresh, 0.0 = stale)."""
+        age_hours = (time.time() - timestamp) / 3600.0
+        if age_hours > FRESHNESS_MAX_AGE_HOURS:
+            return 0.0
+        # Exponential decay with half-life
+        half_lives = age_hours / FRESHNESS_HALF_LIFE_HOURS
+        return 2 ** (-half_lives)
+    
+    def auto_recall(self, query: str, limit: int = MAX_RECALL_RESULTS, max_chars: int = MAX_RECALL_CHARS) -> Dict[str, Any]:
+        """
+        Auto-recall relevant context using BM25 semantic search with freshness scoring.
+
+        Returns dict with:
+        - hits: List of relevant messages
+        - omitted: Number of matched but omitted results
+        - chars_used: Total characters in result
+        """
+        if not query or not query.strip():
+            return {'hits': [], 'omitted': 0, 'chars_used': 0}
+
+        # Check cache
+        cache_key = hashlib.md5(query.encode()).hexdigest()
+        cached = self._recall_cache.get(cache_key)
+        if cached:
+            cached_time, cached_result = cached
+            if time.time() - cached_time < RECALL_CACHE_TTL:
+                logger.debug("tcm-supercompress: recall cache hit for query: %s", query[:50])
+                return cached_result
+
+        # Tokenize query
+        query_terms = self._tokenize(query)
+        if not query_terms:
+            return {'hits': [], 'omitted': 0, 'chars_used': 0}
+
+        # Load corpus
+        corpus = self._load_recall_corpus()
+        if not corpus:
+            return {'hits': [], 'omitted': 0, 'chars_used': 0}
+
+        # Calculate BM25 scores with freshness boost
+        scored = []
+        for doc in corpus:
+            base_score = self._bm25_score_with_df(doc['tokens'], query_terms)
+            if base_score > 0:
+                # Apply freshness boost (fresh content gets slight preference)
+                freshness = doc.get('freshness', 1.0)
+                adjusted_score = base_score * (0.8 + 0.2 * freshness)  # 20% freshness weight
+                scored.append((adjusted_score, doc))
+
+        if not scored:
+            return {'hits': [], 'omitted': 0, 'chars_used': 0}
+
+        # Sort by score (descending)
+        scored.sort(key=lambda x: -x[0])
+
+        # Apply score threshold (relative scoring)
+        best_score = scored[0][0]
+        threshold = best_score * 0.24  # Keep results within 24% of best score
+        scored = [(s, d) for s, d in scored if s >= threshold]
+
+        # Limit results with diversification
+        diversified = []
+        seen_topics = set()
+        for score, doc in scored:
+            # Simple topic diversity: check if content has different keywords
+            content_hash = hashlib.md5(doc['text'][:100].encode()).hexdigest()[:8]
+            if content_hash not in seen_topics or len(diversified) < 2:
+                diversified.append((score, doc))
+                seen_topics.add(content_hash)
+
+        if len(diversified) > limit:
+            omitted = len(scored) - len(diversified[:limit])
+            scored = diversified[:limit]
+        else:
+            omitted = 0
+            scored = diversified
+
+        # Build result with char budget - 不截断单条消息
+        hits = []
+        chars_used = 0
+        for score, doc in scored:
+            content = doc['text']
+
+            # 跳过超长的消息（保持完整性）
+            if len(content) > max_chars:
+                continue
+
+            # 如果加上这条会超预算，停止
+            if chars_used + len(content) > max_chars:
+                break
+
+            hits.append({
+                'content': content,
+                'score': score,
+                'source': doc['source'],
+                'freshness': doc.get('freshness', 1.0)
+            })
+            chars_used += len(content)
+
+        # 如果 hits 为空但有匹配结果，尝试返回最短的一条
+        if not hits and scored:
+            shortest = min(scored, key=lambda x: len(x[1]['text']))
+            hits.append({
+                'content': shortest[1]['text'],
+                'score': shortest[0],
+                'source': shortest[1]['source'],
+                'freshness': shortest[1].get('freshness', 1.0)
+            })
+            chars_used = len(hits[0]['content'])
+
+        result = {
+            'hits': hits,
+            'omitted': len(scored) - len(hits),
+            'chars_used': chars_used
+        }
+
+        # Update cache with eviction
+        if len(self._recall_cache) >= self._max_recall_cache_size:
+            # Evict oldest entry
+            oldest_key = min(self._recall_cache.keys(), key=lambda k: self._recall_cache[k][0])
+            del self._recall_cache[oldest_key]
+        self._recall_cache[cache_key] = (time.time(), result)
+
+        logger.info(
+            "tcm-supercompress: auto-recall complete - %d hits, %d omitted, %d chars, cache_size=%d, df_index=%d",
+            len(hits), omitted, chars_used, len(self._recall_cache), len(self._df_index)
+        )
+
+        return result
+    
+    def _build_recall_block(self, recall_result: Dict[str, Any], query: str) -> str:
+        """Build formatted recall block (Reasonix-style) with freshness indicators."""
+        if not recall_result.get('hits'):
+            return ""
+
+        lines = [f"[RECALLED CONTEXT] Query: {query}"]
+        lines.append(AUTO_RECALL_PREAMBLE)
+        lines.append("")
+
+        for i, hit in enumerate(recall_result['hits'], 1):
+            freshness = hit.get('freshness', 1.0)
+            freshness_label = "fresh" if freshness > 0.7 else "stale" if freshness < 0.3 else "aged"
+            lines.append(f"--- Hit {i} (score: {hit['score']:.3f}, freshness: {freshness_label}) ---")
+            lines.append(hit['content'])
+            lines.append("")
+
+        if recall_result.get('omitted', 0) > 0:
+            lines.append(f"... and {recall_result['omitted']} more results omitted")
+
+        lines.append("[/RECALLED CONTEXT]")
+
+        return "\n".join(lines)# 拼接召回内容
+        context_text = "\n\n".join([h['content'] for h in recall_hits])
+
+        # 使用 LLM 生成摘要
+        prompt = f"""用户查询: "{query}"
+
+相关历史内容：
+{context_text[:3000]}
+
+请生成一份简洁的补充摘要，包含：
+1. 关键事实和约束
+2. 重要决策和理由
+3. 相关文件和操作
+4. 待办事项
+
+要求：简洁、结构化、保留关键细节（500-1000字符）"""
+
+        summary = self._call_llm_simple(prompt)
+        if isinstance(summary, str):
+            return summary[:1000]
+        return ""# -------------------------------------------------------------------------
+    # Context Building
+    # -------------------------------------------------------------------------
+    
+    def _build_context(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Build final context: prefix + compaction summaries + tail."""
+        self._ensure_prefix_built(messages)
+
+        context = list(self._prefix_messages)
+
+        # Add compaction summaries (most recent first, max 3)
+        recent_summaries = self._compact_summaries[-3:][::-1]
+        for summary in recent_summaries:
+            context.append({
+                'role': 'user',
+                'content': f"{SUMMARY_TAG_OPEN}\n{summary['summary']}\n{SUMMARY_TAG_CLOSE}",
+                '_is_compaction_summary': True
+            })
+
+        # Add current tail
+        context.extend(self._tail_buffer)
+
+        # CRITICAL FIX: Ensure context is never empty
+        # If prefix and tail are both empty, include a minimal marker
+        if not context:
+            logger.warning(
+                "tcm-supercompress: context would be empty, adding minimal marker"
+            )
+            context.append({
+                'role': 'system',
+                'content': '[CONTEXT COMPACTED — Resume from last assistant response]'
+            })
+
+        return context
+    
+    # -------------------------------------------------------------------------
+    # ContextEngine Interface
+    # -------------------------------------------------------------------------
+    
+    def update_model(self, model: str, context_length: int, **kwargs: Any) -> None:
+        self.context_length = context_length
+        self.threshold_tokens = int(context_length * self.compact_ratio)
+        
+        # Dynamic parameter adjustment based on context window
+        self._update_recall_params_dynamically()
+        
+        logger.info(
+            "tcm-supercompress: model updated - context_length=%d, threshold=%d",
+            context_length, self.threshold_tokens
+        )
+        logger.info(
+            "tcm-supercompress: dynamic recall params - max_results=%d, max_chars=%d",
+            self.recall_max_results, self.recall_max_chars
+        )
+    
+    def _update_recall_params_dynamically(self) -> None:
+        """Update recall parameters based on context window size."""
+        # Formula: scale with window size
+        # 8K window -> 2 results, 800 chars
+        # 64K window -> 2 results, 800 chars (minimum)
+        # 256K window -> 4 results, 2400 chars (current default)
+        # 1M window -> 8 results, 4800 chars (maximum)
+        
+        self.recall_max_results = min(8, max(2, self.context_length // 64000))
+        self.recall_max_chars = min(4800, max(800, self.context_length // 100))
+        logger.info(
+            "tcm-supercompress: dynamic recall params adjusted - context=%d, results=%d, chars=%d",
+            self.context_length, self.recall_max_results, self.recall_max_chars
+        )
+    
+    def update_tool_schemas(self, tool_schemas: List[Dict[str, Any]]) -> None:
+        """Update tool schemas (triggers prefix rebuild)."""
+        self._prefix_messages = []
+        self._prefix_hash = None
+        logger.info("tcm-supercompress: tool schemas updated, prefix will rebuild")
+
+    def select_context(
+        self,
+        request_messages: List[Dict[str, Any]],
+        *,
+        conversation_messages: Optional[List[Dict[str, Any]]] = None,
+        incoming_message: Optional[Dict[str, Any]] = None,
+        budget_tokens: int = 0,
+        **kwargs: Any,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Select context - handles auto-recall based on behavior signals."""
+        if not incoming_message:
+            return None
+
+        # Check for chunk_ids in recent summaries and inject usage hint
+        recent_summaries = self._compact_summaries[-3:]
+        has_chunk_ids = any(s.get('chunk_ids') for s in recent_summaries)
+        if has_chunk_ids:
+            # Inject usage hint for model-driven recall
+            max_chunks = self._get_max_chunk_ids()
+            usage_hint = (
+                f"[RECALL INSTRUCTIONS]\n"
+                f"Compressed context is available in chunk files.\n"
+                f"Found {len(recent_summaries)} recent summaries with chunk references.\n"
+                f"To recall details, use: read_file(\"~/.hermes/supercompress_store/{{filename}}\")\n"
+                f"Max chunks to recall at once: {max_chunks}\n"
+                f"[/RECALL INSTRUCTIONS]\n"
+            )
+            return [{'role': 'user', 'content': usage_hint}] + request_messages
+
+        msg_text = incoming_message.get("content", "")
+        if not isinstance(msg_text, str):
+            return None
+
+        # Behavior signal detection (language-independent)
+        signal = self._detect_recall_signal(msg_text, conversation_messages or [])
+        if not signal:
+            return None
+
+        # Extract recall query (simple heuristics)
+        query = self._extract_recall_query(msg_text)
+        if not query:
+            return None
+
+        logger.info(
+            "tcm-supercompress: auto-recall triggered - signal=%s, query='%s'",
+            signal['type'], query[:50]
+        )
+        
+        # BM25 retrieval
+        recall_result = self.auto_recall(query)
+        if recall_result.get('hits'):
+            recall_block = self._build_recall_block(recall_result, query)
+            return [{'role': 'user', 'content': recall_block}] + request_messages
+
+        return None
+    
+    def _get_max_chunk_ids(self) -> int:
+        """根据上下文窗口大小动态调整 chunk_id 数量限制"""
+        # 基础限制 5 条
+        base_limit = 5
+        # 根据 context_length 动态调整：每 50K tokens 增加 1 条
+        dynamic_limit = base_limit + int(self.context_length / 50000)
+        # 上限 20 条
+        return min(dynamic_limit, 20)
+    
+    def _detect_recall_signal(self, message: str, history: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+        """
+        Detect recall signals based on behavior patterns (language-independent).
+        
+        Returns:
+            dict with 'type' and 'reason' keys, or None if no signal detected
+        """
+        signals = []
+        
+        # Signal 1: Error recovery pattern
+        errors = self._count_recent_errors(history)
+        if errors >= 2:
+            signals.append({
+                'type': 'error_recovery',
+                'reason': f"errors={errors}",
+                'weight': 0.9
+            })
+        
+        # Signal 2: Context pressure (after compression)
+        if self.compression_count > 0:
+            tail_ratio = len(self._tail_buffer) / max(1, self._message_count)
+            if tail_ratio < 0.3:
+                signals.append({
+                    'type': 'context_pressure',
+                    'reason': f"tail_ratio={tail_ratio:.2f}",
+                    'weight': 0.7
+                })
+        
+        # Signal 3: Tool failure pattern
+        failures = self._count_tool_failures(history)
+        if failures >= 2:
+            signals.append({
+                'type': 'tool_failure',
+                'reason': f"failures={failures}",
+                'weight': 0.8
+            })
+        
+        # Signal 4: Topic jump detection
+        if self._detect_topic_jump(history):
+            signals.append({
+                'type': 'topic_jump',
+                'reason': 'abrupt_topic_change',
+                'weight': 0.6
+            })
+        
+        # Signal 5: Historical reference patterns (language-neutral)
+        if self._detect_historical_reference(message):
+            signals.append({
+                'type': 'historical_reference',
+                'reason': 'implicit_history_query',
+                'weight': 0.7
+            })
+        
+        if not signals:
+            return None
+        
+        # Return highest weight signal
+        return max(signals, key=lambda s: s['weight'])
+    
+    def _count_recent_errors(self, history: List[Dict[str, Any]], n: int = 5) -> int:
+        """Count recent errors in conversation history."""
+        errors = 0
+        for msg in reversed(history[-n:]):
+            if msg.get('role') == 'tool':
+                content = str(msg.get('content', '')).lower()
+                if any(kw in content for kw in ['error', 'failed', 'exception', 'timeout', 'refused']):
+                    errors += 1
+        return errors
+    
+    def _count_tool_failures(self, history: List[Dict[str, Any]], n: int = 5) -> int:
+        """Count recent tool call failures."""
+        failures = 0
+        for msg in reversed(history[-n:]):
+            if msg.get('role') == 'tool':
+                if msg.get('status') == 'error' or 'error' in str(msg.get('content', '')).lower():
+                    failures += 1
+        return failures
+    
+    def _detect_topic_jump(self, history: List[Dict[str, Any]]) -> bool:
+        """Detect abrupt topic changes."""
+        if len(history) < 3:
+            return False
+        
+        # Get recent user messages
+        recent_msgs = [m for m in reversed(history) if m.get('role') == 'user'][:3]
+        if len(recent_msgs) < 2:
+            return False
+        
+        last_msg = recent_msgs[0].get('content', '')
+        prev_msg = recent_msgs[1].get('content', '')
+        
+        # Check for transition words (language-neutral: look for length change)
+        transition_words = ['continue', 'then', 'next', 'also', 'additionally', 
+                           '继续', '然后', '另外', '此外', '还有']
+        has_transition = any(tw in last_msg.lower() for tw in transition_words)
+        
+        length_ratio = len(last_msg) / max(1, len(prev_msg))
+        
+        # No transition + significant length change = potential jump
+        return not has_transition and (length_ratio < 0.3 or length_ratio > 3.0)
+    
+    def _detect_historical_reference(self, message: str) -> bool:
+        """Detect implicit references to previous conversations."""
+        # Language-neutral patterns: question about state/status
+        state_keywords = ['status', 'progress', 'done', 'complete', 'finished',
+                         '进度', '完成', '状态', '做到哪', '怎么样了']
+        
+        # Time reference patterns (common across languages)
+        time_keywords = ['before', 'previously', 'earlier', 'earlier',
+                        '之前', '刚才', '上次', '以前', 'last time']
+        
+        return any(kw in message.lower() for kw in state_keywords) or \
+               any(kw in message for kw in time_keywords)
+    
+    def _extract_recall_query(self, message: str) -> str:
+        """Extract recall query from message using simple heuristics."""
+        import re
+        
+        # Remove question particles and modal verbs
+        cleaned = re.sub(r'(what|how|why|which|who|when|where|什么|如何|怎么|为什么|哪些|怎么)', '', message, flags=re.IGNORECASE)
+        cleaned = re.sub(r'(please|could you|can you|do you|did you|请|能|可以|帮我|让我)', '', cleaned, flags=re.IGNORECASE)
+        
+        # Take first sentence or first 50 chars
+        sentences = re.split(r'[.!?。！？]', cleaned)
+        if sentences:
+            query = sentences[0].strip()[:50]
+            return query if query else message[:50]
+        
+        return message[:50]
+    
+    def should_compress(self, prompt_tokens: int = None) -> bool:
+        """Check if compression should fire."""
+        tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
+        
+        # Fallback: if no usage data, estimate from message count
+        if tokens == 0 and self._message_count > 0:
+            # Rough estimate: ~150 tokens per message
+            tokens = self._message_count * 150
+            logger.info(
+                "tcm-supercompress: using estimated tokens=%d (from %d messages, no usage data)",
+                tokens, self._message_count
+            )
+        
+        if tokens == 0:
+            return False
+        
+        if tokens < self.threshold_tokens:
+            return False
+        
+        # Anti-thrash protection
+        if self._fallback_compression_streak >= 2:
+            return False
+        
+        logger.info(
+            "tcm-supercompress: should_compress=%s (tokens=%d, threshold=%d)",
+            tokens >= self.threshold_tokens, tokens, self.threshold_tokens
+        )
+        return True
+    
+    def compress(
+        self,
+        messages: List[Dict[str, Any]],
+        current_tokens: Optional[int] = None,
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+        memory_context: str = "",
+        tcmnet_hint: Optional[Dict] = None,
+    ) -> List[Dict[str, Any]]:
+        """Compress context with structured summary generation.
+        
+        Args:
+            tcmnet_hint: Optional dict from TCM-Net with high-energy events and strategy notes
+        """
+        self.compression_count += 1
+        old_count = len(self._tail_buffer)
+
+        # CRITICAL FIX: Populate tail buffer from history if empty
+        # This handles sessions loaded from database with pre-existing messages
+        if not self._tail_buffer and messages:
+            loaded = self._populate_tail_from_messages(messages)
+            if loaded > 0:
+                old_count = loaded  # Adjust old_count for delta calculation
+
+        tokens = current_tokens or self.last_prompt_tokens
+        if tokens == 0:
+            tokens = self._estimate_tokens(messages)
+
+        force_ratio = self.force_compact_ratio
+        if tokens < self.threshold_tokens * force_ratio and not force:
+            # Light trim
+            logger.info(
+                "tcm-supercompress: compressing (light) - tokens=%d, threshold=%d",
+                tokens, self.threshold_tokens
+            )
+            self._trim_tail_if_needed()
+        else:
+            # Heavy compression with summary
+            logger.info(
+                "tcm-supercompress: compressing (heavy) - tokens=%d, threshold=%d, force=%s",
+                tokens, self.threshold_tokens, force
+            )
+            self._aggressive_trim(messages, focus_topic)
+
+        new_count = len(self._tail_buffer)
+        removed = old_count - new_count
+
+        logger.info(
+            "tcm-supercompress: compression complete - removed %d messages, %d remaining",
+            removed, new_count
+        )
+
+        return self._build_context(messages)
+    
+    def on_turn_complete(
+        self,
+        messages: List[Dict[str, Any]],
+        usage: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        """Observe finished turn and update state."""
+        logger.info(
+            "tcm-supercompress: on_turn_complete called with %d messages",
+            len(messages)
+        )
+        new_msgs = [m for m in messages if m.get("role") in ("user", "assistant", "tool")]
+        if new_msgs:
+            old_count = len(self._tail_buffer)
+            for msg in new_msgs:
+                self._tail_buffer.append(msg)
+            new_count = len(self._tail_buffer) - old_count
+            self._message_count += new_count  # Track message count for fallback
+            logger.info(
+                "tcm-supercompress: turn complete - added %d messages, tail now %d",
+                new_count, len(self._tail_buffer)
+            )
+
+        # Check if we need to compress (either flagged during tool loop or tail is too long)
+        if getattr(self, '_pending_compression', False) or len(self._tail_buffer) > self.max_tail_turns:
+            self._trim_tail_if_needed()
+            self._pending_compression = False
+        elif self.last_prompt_tokens > self.threshold_tokens:
+            # Tokens exceed threshold but tail_buffer is empty (shouldn't happen, but safety check)
+            logger.info(
+                "tcm-supercompress: tokens exceed threshold but tail_buffer empty, flagging compression"
+            )
+            self._pending_compression = True
+
+        # Periodic storage cleanup
+        self._cleanup_old_storage()
+
+        self._scratch.clear()
+    
+    def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        """Initialize on session start."""
+        self._tail_buffer = []
+        self._prefix_messages = []
+        self._prefix_hash = None
+        self._scratch = {}
+        self._compact_summaries = []
+        self._summarized_chunk_ids = set()  # Reset chunk tracking per session
+        self.compression_count = 0
+        self._fallback_compression_streak = 0
+        self._last_compression_time = 0.0  # Reset debounce timer
+        # Clear chunk references on session start (each session has its own references)
+        self._chunk_refs.clear()
+
+        logger.info("tcm-supercompress: session started - session_id=%s", session_id)
+    
+    def on_session_end(self, session_id: str, **kwargs: Any) -> None:
+        """Cleanup on session end."""
+        stats = self.get_stats()
+        logger.info(
+            "tcm-supercompress: session ended - compressions=%d, prefix_msgs=%d, tail_msgs=%d",
+            stats["compression_count"],
+            stats["prefix_messages"],
+            stats["tail_messages"]
+        )
+    
+    def on_session_reset(self, session_id: str) -> None:
+        """Reset on session reset."""
+        self._tail_buffer = []
+        self._scratch = {}
+        self._compact_summaries = []
+        self._summarized_chunk_ids = set()  # Reset chunk tracking
+        self._chunk_refs = {}  # Reset chunk references
+        self._last_compression_time = 0.0  # Reset debounce timer
+        self._prefix_hash = None  # Reset prefix hash
+        self._prefix_messages = []  # Reset prefix messages
+        self._total_trimmable_tokens = 0  # Reset token counter
+        logger.info("tcm-supercompress: session reset - session_id=%s", session_id)
+    
+    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        return []
+    
+    def handle_tool_call(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        return {"error": "Tool call not implemented"}
+    
+    def update_from_response(self, usage: Dict[str, Any]) -> None:
+        """Update internal state after a model response."""
+        self.last_prompt_tokens = usage.get('prompt_tokens', 0)
+        self.last_completion_tokens = usage.get('completion_tokens', 0)
+        self.last_total_tokens = usage.get('total_tokens', 0)
+        logger.info(
+            "tcm-supercompress: response updated - prompt=%d, completion=%d, total=%d",
+            self.last_prompt_tokens, self.last_completion_tokens, self.last_total_tokens
+        )
+        logger.info(
+            "tcm-supercompress: should_compress=%s (last_prompt_tokens=%d, threshold=%d)",
+            self.should_compress(), self.last_prompt_tokens, self.threshold_tokens
+        )
+        
+        # If we're in a tool loop (tail_buffer is empty but tokens are high),
+        # mark that we need to compress on next turn_complete
+        if self.last_prompt_tokens > self.threshold_tokens and len(self._tail_buffer) == 0:
+            self._pending_compression = True
+            logger.info(
+                "tcm-supercompress: pending compression flagged (tool loop, tokens=%d)",
+                self.last_prompt_tokens
+            )
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {
+            "prefix_messages": len(self._prefix_messages),
+            "tail_messages": len(self._tail_buffer),
+            "tail_tokens": self._estimate_tail_tokens(),
+            "compact_summaries": len(self._compact_summaries),
+            "compression_count": self.compression_count,
+            "total_trimmable_tokens": self._total_trimmable_tokens,
+            "total_stored_tokens": self._total_stored_tokens,
+            "context_length": self.context_length,
+            "threshold_tokens": self.threshold_tokens,
+            "recall_cache_size": len(self._recall_cache),
+            "df_index_size": len(self._df_index),
+            "stored_chunks": len(list(self.external_store_path.glob("chunk_*.jsonl"))) if self.external_store_path.exists() else 0,
+        }
+
+    def get_recall_stats(self) -> Dict[str, Any]:
+        """Get recall performance statistics."""
+        # Calculate average result size from cache
+        total_chars = 0
+        hit_count = 0
+        for _, result in self._recall_cache.values():
+            total_chars += result.get('chars_used', 0)
+            if result.get('hits'):
+                hit_count += 1
+
+        avg_chars = total_chars / hit_count if hit_count > 0 else 0
+
+        return {
+            "total_queries": len(self._recall_cache),
+            "queries_with_hits": hit_count,
+            "hit_rate": hit_count / len(self._recall_cache) if self._recall_cache else 0,
+            "avg_result_size": avg_chars,
+            "df_index_size": len(self._df_index),
+            "current_max_results": self.recall_max_results,
+            "current_max_chars": self.recall_max_chars,
+            "context_length": self.context_length,
+        }
+
+    def clear_recall_cache(self) -> None:
+        """Clear the recall cache."""
+        self._recall_cache.clear()
+        logger.info("tcm-supercompress: recall cache cleared")
+
+    def clear_stale_summaries(self, max_age_hours: float = 24.0) -> int:
+        """Clear compact summaries older than max_age_hours."""
+        now = time.time()
+        stale = []
+        for summary in self._compact_summaries:
+            if now - summary.get('timestamp', 0) > max_age_hours * 3600:
+                stale.append(summary)
+
+        if stale:
+            self._compact_summaries = [s for s in self._compact_summaries if s not in stale]
+            logger.info("tcm-supercompress: cleared %d stale summaries (age > %.1f hours)", len(stale), max_age_hours)
+            return len(stale)
+        return 0
+
+    def __repr__(self) -> str:
+        return (
+            f"SupercompressContextEngine("
+            f"prefix_hash={self._prefix_hash[:8] if self._prefix_hash else 'none'}, "
+            f"tail={len(self._tail_buffer)} msgs, "
+            f"compact_summaries={len(self._compact_summaries)}, "
+            f"compressions={self.compression_count}, "
+            f"recall_cache={len(self._recall_cache)}, "
+            f"df_index={len(self._df_index)})"
+        )
+
+    def health_check(self) -> Dict[str, Any]:
+        """Perform health check on the engine."""
+        return {
+            "status": "healthy",
+            "engine": self.name,
+            "stats": self.get_stats(),
+            "recall_stats": self.get_recall_stats(),
+            "storage_path": str(self.external_store_path),
+            "storage_exists": self.external_store_path.exists(),
+        }
+
+
+# Note: get_engine() is defined in __init__.py to ensure config is loaded correctly.
+# This file intentionally does not define get_engine() to avoid shadowing.
+
+
+def is_available() -> bool:
+    return True

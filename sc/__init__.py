@@ -3,7 +3,7 @@
 模块边界：
 - schema   Segment 信封 / NFC content_hash / token 估计
 - store    单一事实源 jsonl（数据面委托 scdata 单一权威实现：replay/materialize/闭合校验；
-           写路径 = tier-aware fsync：P0 即写即 fsync+读回，P1/P2 lazy 批）
+           写路径 = tier-aware fsync：P0 即写即 fsync+读回，P1/P2 lazy 批（size trigger：pending ≥ lazy_batch_cap 即 flush））
 - budgets  共享分母（post-distill usable tokens，Pull 20% / Push 15% 一处定义）
 - aux      (A) 零新 provider：主模型端点直调 tagging/scoring + 原生 compression 任务 digest；
            gate⑤ 故障注入 marker off-by-default（测试替身住 tests/fakes.py，不进生产 import 面）

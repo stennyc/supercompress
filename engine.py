@@ -61,6 +61,8 @@ from sc.drift import DriftTracker
 from sc.telemetry import TelemetryCollector, filler_form_share
 from sc.version import build_id, desync_warning
 from sc import digest_pool as sc_digest_pool
+from sc import model_store as sc_model_store
+
 
 
 def _get_call_llm():
@@ -316,6 +318,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.digest_fail_cooldown: float = _get("digest_fail_cooldown", 60.0)
         self._aux = self._build_aux(cfg)
 
+        # B 卡（t_98809671）：model 旁路独立 store 配置面（compression.supercompress 块，
+        # 逐键 _get 默认、缺失 = 安全默认；保留 kill-switch；不新增 provider/model/endpoint 配置）。
+        self.model_store_enabled: bool = bool(_get("model_store_enabled", True))
+        self.model_min_chars: int = int(_get("model_min_chars", 200))
+        self._model_store = None            # 懒构造（on_session_start 三分支按 session 绑定；_model_store() 为 rebind-safe 访问器）
+        self._model_fused: bool = False     # 保险丝态（fused → 召回并集 / T4 注入跳过该 store；内存 reset、文件保留）
+
         # token 账（宿主 run_agent.py 直接读这些字段）
         self.last_prompt_tokens: int = 0
         self.last_completion_tokens: int = 0
@@ -337,10 +346,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_real_prompt_tokens: int = 0
         self.awaiting_real_usage_after_compression: bool = False
         self._verify_compaction_cleared_threshold: bool = False
-        # 预检阈值读 sc.distill 软水位口径（80% 容量 = 蒸馏触发线；壳不重算）
+        # 预检阈值 = context_length × DISTILL_WATER_FRAC（0.55 engine 水线 = 压缩/蒸馏触发线；壳不重算——
+        # sc/distill.py 内部 80% evict-to 软水位是组件内独立常量、勿混同，见 :84-85 语义边界注释）
         self.threshold_tokens: int = int(self.context_length * DISTILL_WATER_FRAC)
         # 宿主实调位（tui_gateway/session_compression.py:169）：threshold_tokens 配置的上限。
-        # 默认 None = 不加 cap（保持 80% 软水位）；宿主下发正整数 cap 且更小时，蒸馏触发线收紧到 cap。
+        # 默认 None = 不加 cap（保持 context_length × 0.55 engine 水线）；宿主下发正整数 cap 且更小时，触发线收紧到 cap。
         # 纯配置规整（镜像内置 ContextCompressor._coerce_threshold_tokens_cap，context_compressor.py:2602-2611），
         # 壳不发明新算法——缺这个方法正是宿主 "Could not apply live compression config" WARNING 的根因。
         self.threshold_tokens_cap: Optional[int] = None
@@ -484,6 +494,12 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     model, context_length, type(self._aux.main_endpoint).__name__,
                     "injected" if self._main_runtime else "none",
                     "available" if self._call_llm else "unavailable")
+        # B 卡：model_version 变更 = 保险丝 fused（决策 2）：stamped 行 ≠ 新 model 的旁路
+        # 不可信——check_fuse 三选一（sc/model_store，仿 digest pool guard()）；fused →
+        # 召回并集 / T4 注入跳过该 store（文件保留不删，下 session 重放再判）
+        if self.model_store_enabled and self._model_store is not None and not self._model_fused:
+            if self._model_store.check_fuse(self.store.line_count, model):
+                self._model_fused = True
 
     @property
     def force_evict_mode(self) -> bool:
@@ -637,6 +653,183 @@ class SupercompressContextEngine(sc_context_engine_base()):
         段自身 model_version 非壳注入面，宿主零改动约束下取 当前运行时模型 为池条目版本键）。"""
         return (self._main_runtime or {}).get("model") or None
 
+    # ── B 卡 model 旁路 store（engine 薄壳接线，算法全在 sc/model_store.py；仿 P4 digest pool 钩子形）──
+
+    def _model_store_path(self) -> str:
+        """model 旁路路径 = 主 store 路径 splitext + '.model.jsonl'（sc.model_store 单源，
+        与 digest 池同目录同 sid 前缀；legacy active.jsonl → active.model.jsonl）。"""
+        return sc_model_store.model_path_for_jsonl(self.store.path)
+
+    def _model_model_version(self) -> str:
+        """入库 stamp = 当前 model（宿主 update_model 注入 _main_runtime.model）；未注入 → ""
+        （空 stamp 行 = 版本保险丝判定中性，沿用 digest pool guard 判定口径）。"""
+        return (self._main_runtime or {}).get("model", "")
+
+    def _model_tier_one(self, seg) -> bool:
+        """tier 队列单段精化回调（宿主接线）：sc/tagger classify(text, "model") LLM 分支
+        （宿主共享 call_llm，aux 两级路由 + fail cooldown 60→300→1800s + 连败 ≥3 degraded，
+        全在既有 sc/aux_provider 语义内；壳零新 provider / 零模型名 / 零 provider 块）。
+
+        True = 精化已应用（aux_ok，仅更新内存 tier 字段）；False = 保持 P0 地板（aux_floor：
+        aux 失败/degraded/队列丢弃 → 磁盘 tier 恒 P0，冷重启全 P0 重放 = 保守地板，已文档化
+        取舍；structural_p0 恒 False —— model 段可被 push cap 逐，P0/P1 注入门放行）。"""
+        tagger = self._tagger or Tagger(self._aux, "")
+        _tier, _structural, regime, _reason = tagger.classify(seg.original_text, "model")
+        if regime == "transient_fail":
+            return False                    # 瞬态失败/degraded → P0 地板（保守，永不当 P2 丢）
+        seg.tier = _tier                    # 精化仅内存（never re-tier on replay，scdata 锁定）
+        return True
+
+    def _model_store_live(self):
+        """当前 session model 旁路访问器（rebind-safe，仿 _digest_pool()；kill-switch 感知）：
+        on_session_start 三分支先绑定（_build_model_store）；本方法按 store.path 失配懒重建，
+        fused 态同步落壳标志。命名 = 与 self._model_store **实例属性**（当前旁路对象 / None）
+        区分——属性优先，本访问器是路径失配重建面（同名方法会被 __init__ 赋的属性遮蔽，
+        前轮遗留命名碰撞已消解）。"""
+        if not self.model_store_enabled:
+            return None
+        expected = self._model_store_path()
+        ms = self._model_store
+        if ms is not None and ms.path == expected:
+            return ms
+        ms = sc_model_store.ModelStore(expected, tier_fn=self._model_tier_one)
+        self._model_store = ms
+        self._model_fused = ms.fused
+        return ms
+
+    def _model_replay_hook(self) -> None:
+        """钩子①（on_session_start 三分支统一入口）：model store replay hydrate marker
+        （`model-store replay hydrated N segment(s)`，N>0 才打；缺失 = 空池合法态不 marker；
+        损坏/IO 不可读已在 ModelStore 构造 fail-open fused、marker 在 sc 层）+ 保险丝三选一
+        检查（行数比 / 5MB / model 版本失配，算法在 sc/model_store.check_fuse，仿 digest pool
+        guard()）。fused → 壳 _model_fused 标志（召回并集 + T4 注入跳过该 store；文件保留不删）。"""
+        if not self.model_store_enabled:
+            self._model_fused = False
+            return
+        ms = self._model_store
+        if ms is None:
+            return
+        if ms.line_count > 0:
+            logger.info("model-store replay hydrated %d segment(s)", ms.line_count)
+        ms.check_fuse(self.store.line_count, self._model_model_version())
+        self._model_fused = ms.fused
+
+    def _model_ingest_hook(self, messages: List[Dict[str, Any]]) -> None:
+        """钩子②（on_turn_complete）：model/assistant 段选择性入库 gate（确定性零 LLM，B 卡决策 3）。
+
+        - 只 role=='assistant' 面（role=='tool' 永不入库；user 段主 store 路径零行为变化）；
+        - 持久化 = len(text) ≥ model_min_chars（默认 200，可配）OR 命中有意义 marker
+          （sc/tagger _P1/_P2 marker 族同口径；压缩摘要类无论长度恒持久化）；
+        - text 空 strip → skip（tool-call-only）；nfc_hash 命中 model 旁路或主 store → dedup skip；
+        - 命中 → 临时档 P0 非结构落盘 + 读回 + tier 队列（先持久化再精化，B 卡决策 4）；
+        - marker：`model-store: ingested N assistant segment(s) (gate=…)`，N>0 才打（宿主侧 grep 验证）；
+        - fail-open：fused 跳过 / sidecar 写失败由 on_turn_complete 外层 catch 吞掉，不炸宿主 turn。"""
+        if not self.model_store_enabled or self._model_fused:
+            return
+        ms = self._model_store
+        if ms is None:
+            ms = self._model_store_live()
+            if self._model_fused or ms is None:
+                return
+        counts: Dict[str, int] = {}
+        ingested = 0
+        for m in (messages or []):
+            if m.get("role") != "assistant":
+                continue
+            ok, gate = ms.ingest_assistant(
+                str(m.get("content") or ""), min_chars=self.model_min_chars,
+                model_version=self._model_model_version(), main_by_hash=self.store.by_hash)
+            if ok:
+                ingested += 1
+                counts[gate] = counts.get(gate, 0) + 1
+        if ingested:
+            gate_txt = ",".join("%s=%d" % (k, v) for k, v in sorted(counts.items()))
+            logger.info("model-store: ingested %d assistant segment(s) (gate=%s)",
+                        ingested, gate_txt)
+
+    def _model_session_flush(self, action: str) -> None:
+        """会话边界 flush 点（aux worker flush 后，model 旁路 P1/P2 lazy 批 flush；
+        镜像 on_session_reset/end 主 store flush 块，OSError/StoreError 优雅降级 + 水位观测）。
+
+        磁盘 tier 恒 P0 不变量 → lazy 批实际恒空（生命周期语义镜像；未来若 P1/P2 落盘即自动
+        生效）；marker 复用既有 flush 族 + store=main|model 判别；fused 旁路 = no-op。"""
+        ms = self._model_store
+        if not self.model_store_enabled or ms is None:
+            return
+        try:
+            n = ms.flush_lazy()
+        except (StoreError, OSError) as e:
+            logger.warning("supercompress: %s model-store flush failed (degraded, "
+                           "pending P1/P2 kept in memory, store=model): %s", action, e)
+            try:
+                ms.log_water_warn(action + "-model-flush-failed", e)
+            except Exception:
+                pass
+            return
+        if n:
+            logger.info("supercompress: %s model-store flushed %d segment(s) (store=model)",
+                        action, n)
+        # B 卡：tier worker 队列汇合点（会话边界 = 重启前权威汇合点，同 aux flush(timeout=5.0) 对称；
+        # 先持久化再精化 → 超时/在途段保持 P0 地板（磁盘行恒 P0，下事件再生，已文档化取舍）；
+        # sync 面（测试注入）= 立即 drain 返回 True，零线程、确定性。marker 复用既有 flush 族。
+        try:
+            if ms.flush(timeout=2.0):
+                logger.info("supercompress: %s model-store tier worker joined (store=model)",
+                            action)
+        except Exception:
+            pass
+
+    def _recall_union_window(self, window: "Window") -> "Window":
+        """召回语料并集（B 卡决策 5）：主 store 窗口 replay + model 旁路内存 live 段
+        （fused / 关闭 / 空旁路 → 原样返回主窗口）；打分权重不变（P0×1.5 等按段自带 tier，
+        P2 tag 的 model 段可命中排序但不注入 —— P0/P1-only 注入门对 model 段同语义生效，
+        与主 P2 同语义）。仅召回 / P4 候选面；distill 窗口（主 store 独占）不变——
+        push cap / 水位语义零扰动。"""
+        if not self.model_store_enabled or self._model_fused:
+            return window
+        ms = self._model_store
+        if ms is None:
+            return window
+        mseg = ms.live_segments()
+        if not mseg:
+            return window
+        return Window(self.context_length, list(window.segs) + [WindowSeg(s) for s in mseg])
+
+    def point_fetch(self, segment_id: str):
+        """L0 指针 O(1) 点查（B 卡决策 6，文档化解析顺序）：主 store 优先、model 旁路次
+        （`store.get(id) or model_store.get(id)`）——evicted model 段仍可 O(1) 点查。
+
+        跨 store id 冲突安全性（id = content_hash[:16]+seq；不同内容 → 16-hex 前缀不同，
+        同文已被入库 gate dedup 封死双写 → 两 store 间无重 id）由 tests/test_model_store.py 验证。"""
+        seg = self.store.get(segment_id)
+        if seg is None and self.model_store_enabled and not self._model_fused:
+            ms = self._model_store
+            if ms is not None:
+                seg = ms.get(segment_id)
+        return seg
+
+    def _build_model_store(self, old_file: str = None, old_sid: str = None):
+        """model 旁路构造点（B 卡 kill-switch 语义闭环，decision 8/9）：
+
+        - `model_store_enabled=False` → None（零文件 / 零 tier 线程——开关即关，不留半态）；
+        - carry 分支（old_file + old_sid 传入）：旧 model 文件存在 → 并行 materialize
+          （字节稳定拷贝 + P1 stale 标记，与主 store JsonlStore.materialize 平行），
+          否则全新空池（旧文件缺失 = 合法态，不 fuse）；
+        - new / cold 分支（无参）：构造即 replay（与主 store 平行，同 sid 前缀）。
+
+        旁路路径单源 = sc.model_store.model_path_for_jsonl（与主 store splitext + '.model.jsonl'，
+        决策 1 同住同 sid 前缀 / G2 单源）。"""
+        if not self.model_store_enabled:
+            return None
+        if old_file is not None:
+            old_model_file = sc_model_store.model_path_for_jsonl(old_file)
+            if os.path.exists(old_model_file):
+                return sc_model_store.ModelStore.materialize(
+                    old_model_file, self._model_store_path(), reopen_from=old_sid,
+                    tier_fn=self._model_tier_one)
+        return sc_model_store.ModelStore(self._model_store_path(),
+                                         tier_fn=self._model_tier_one)
+
     # ── P2 telemetry（precision P2 · 三指标数据闸门）：宿主可读面 + drift 留痕回调 ──
 
     def telemetry_report_path(self) -> str:
@@ -710,13 +903,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self._verify_compaction_cleared_threshold = self.awaiting_real_usage_after_compression = False
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
-        """sc.distill 软水位语义：当前 token 账 > 生效触发线（80% 容量，宿主 cap 收紧）→ 本 turn 触发蒸馏逐出。"""
+        """engine 水线语义：当前 token 账 > 生效触发线（= min(宿主 cap, context_length × DISTILL_WATER_FRAC 0.55)；
+        sc/distill.py 内部 80% evict-to 软水位是组件内独立常量、非本触发线）→ 本 turn 触发蒸馏逐出。"""
         tokens = prompt_tokens if prompt_tokens else self.last_prompt_tokens
         return tokens > self._effective_threshold()
 
     def _effective_threshold(self) -> int:
-        """生效触发线：sc.distill 软水位（80% 容量），宿主下发 `threshold_tokens_cap`（session_compression.py:169）
-        且更小则收紧到 cap；无 cap / cap 更大则保持软水位。纯配置规整，壳不重算算法。"""
+        """生效触发线：context_length × DISTILL_WATER_FRAC（0.55 engine 水线；sc/distill.py 内部 80% cap 是
+        evict-to 软水位、非本阈值），宿主下发 `threshold_tokens_cap`（session_compression.py:169）
+        且更小则收紧到 cap；无 cap / cap 更大则保持 0.55 水线。纯配置规整，壳不重算算法。"""
         cap = self.threshold_tokens_cap
         return cap if (cap is not None and cap < self.threshold_tokens) else self.threshold_tokens
 
@@ -789,7 +984,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             if epoch in self._p4_cache:               # per-epoch 缓存命中 → 0 LLM（花最少）
                 return
             seed = self._drift.anchor_terms()          # 当前任务关键词集（锚点词面，sorted 确定性）
-            window = self._window_fresh()
+            window = self._recall_union_window(self._window_fresh())
             recaller = Recaller(self.store, window)
             candidates = recaller.search(text, k=3)    # extended-BM25 粗排 top-3（扩词后喂回同面）
             res = self._p4.expand(epoch, seed, candidates, task_text=text)
@@ -812,7 +1007,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
         """turn 末接线：新 user 消息落盘（P0 即写即 fsync）+ aux turn 边界 + Distiller.run 逐出。
 
         全委托 sc：tagger.classify → store.append（tier-aware fsync）→ aux.end_turn → Distiller.run
-        （80% 水位逐出 + push cap + 锚点发射）。壳内无任何逐出/预算算法体。
+        （sc.distill 内部 80% evict-to 软水位逐出 + push cap + 锚点发射；engine 侧触发线是 0.55 水线，见 :84-85）。壳内无任何逐出/预算算法体。
         """
         try:
             self._aux.start_turn()
@@ -841,6 +1036,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 if triggered:
                     self._fire_boundary_expand(text)
             self._aux.end_turn()
+            # B 卡：model/assistant 段选择性入库 gate（确定性零 LLM；user 段主 store 路径零行为变化）
+            self._model_ingest_hook(messages)
             # R3：force_ratio 接 engine 同源配置 force_compact_ratio（kwarg = 接线非算法）
             result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode,
                                force_ratio=self.force_compact_ratio).run()
@@ -880,7 +1077,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
             query = str(incoming.get("content") or "")
             if len(query.strip()) < 8:
                 return None
-            window = self._window_fresh()
+            window = self._recall_union_window(self._window_fresh())
             recaller = Recaller(self.store, window, decay_lambda=self.recall_decay_lambda)
             # 招③ 时间衰减接线面：decay_lambda = 实例默认（engine.recall_decay_lambda，
             # kwarg/配置 recall_decay_lambda 控制启用；默认 0 = 钉死面不扰动）
@@ -1007,6 +1204,16 @@ class SupercompressContextEngine(sc_context_engine_base()):
             logger.info("supercompress: compress egress cut %d room-skeleton segment(s) "
                         "from anchor manifest", len(_skel))
         kept = [ws for ws in kept if not is_room_skeleton(ws.segment.original_text)]
+        # B 卡 T4 注入（决策 6）：model P0/P1 段进 kept 集（主 store kept 面同形扩展），
+        # 与主 store 段共用固定池 2K/4K + 既有确定性选档 + seq 稳定序（池预算不变；
+        # 高压判定仍读主 window，细节池归零语义不变）；model 段不喂 DriftTracker
+        # （user-only by design，决策 7，不受 P2.3 hard 逐出）；egress 房间骨架过滤同语义生效。
+        if self.model_store_enabled and not self._model_fused:
+            _mstore = self._model_store
+            if _mstore is not None:
+                for _mseg in _mstore.live_segments():
+                    if _mseg.tier in ("P0", "P1") and not is_room_skeleton(_mseg.original_text):
+                        kept.append(WindowSeg(_mseg))
         # P3 30% 零成本剔除档已于 2026-10-04 撤销（用户拍板 B）：活体 P1=0 → fill_share 恒 0.0，
         # 该档在活体上永远 no-op（纯 bench 保护逻辑）。注入路径回到 fill_prune 引入前逐字行为。
         # filler_form_share 仅保留给 telemetry record（撤档正确性的佐证观测面，纯审计、G4）。
@@ -1077,9 +1284,19 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 self.store = JsonlStore(target)
                 logger.warning("supercompress: carry_over requested but archive for %s not found (%s)",
                                old_sid, old_file)
+            # B 卡：model 旁路平行交接（旧 model 文件存在 → materialize 字节稳定拷贝，否则新建；
+            # 不新增自动 carry，仍只认宿主 carry_over_context kwarg，决策 8；kill-switch OFF → 不建）
+            self._model_store = self._build_model_store(old_file=old_file, old_sid=old_sid)
+            self._model_fused = self._model_store.fused if self._model_store is not None else False
         else:
             existed = os.path.exists(target) and os.path.getsize(target) > 0
             self.store = JsonlStore(target)
+            # B 卡：model 旁路新建 / 冷重开（旧 model 文件存在 → 构造即 replay，与主 store 平行，决策 8）。
+            # 定序：主 store 先 rebind 到 target，旁路路径才 = splitext(target) + '.model.jsonl' —
+            # 先建 model 再 rebind 会把旁路错写到上一个 session 的 <prev>.model.jsonl（决策 1 同住同 sid 前缀、G2 单源）。
+            # kill-switch OFF → 不建（零文件零线程，开关语义闭环）。
+            self._model_store = self._build_model_store()
+            self._model_fused = self._model_store.fused if self._model_store is not None else False
             if existed:
                 # 同 session 冷重开（进程重启）：replayed P1 中间推理内存标 stale（文件字节不动）
                 for seg in self.store.by_hash.values():
@@ -1087,6 +1304,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
                         seg.stale = True
                 logger.info("supercompress: session %s reopened, %d segs replayed (P1 stale-marked), build=%s",
                             session_id, self.store.line_count, self.build_id)
+                # B 卡：冷重开 model store P1 行内存标 stale（与主 store 同语义 ×0.5，字节不动，决策 7）
+                for mseg in (self._model_store.live_segments() if self._model_store else []):
+                    if mseg.tier == "P1":
+                        mseg.stale = True
             else:
                 logger.info("supercompress: session %s start (fresh), store=%s, build=%s",
                             session_id, target, self.build_id)
@@ -1096,6 +1317,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
             self._drift.rehydrate(list(self.store.by_hash.values()))
         else:
             self._drift.reset()
+        # B 卡：model 旁路 replay hydrate marker + 保险丝检查（三分支统一入口；N>0 才打；
+        # fused → 召回并集 / T4 注入跳过该 store，文件保留不删）
+        self._model_replay_hook()
         # 新 session 窗口重置：force_evict 是会话级升级态，fresh 窗口不应继承
         self._force_evict_mode = False
         # P0.4：rotation advisory 会话边界清零（对称 on_session_reset，防泄漏进新 session）
@@ -1140,11 +1364,15 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # 优雅降级：log warning + 水位观测，跳过本轮持久化（pending 批留内存可重试，
             # 断电丢批上界不变），重置流程继续走完——不炸宿主 /new。
             logger.warning("supercompress: session-reset flush failed (degraded, "
-                           "pending P1/P2 kept in memory, reset proceeds): %s", e)
+                           "pending P1/P2 kept in memory, reset proceeds, store=main): %s", e)
             try:
                 self.store.log_water_warn("session-reset-flush-failed", e)
             except Exception:
                 pass
+        # B 卡：model 旁路 lazy 批 flush（会话边界原子点，镜像主 store flush 块）+ fused 态清零
+        self._model_session_flush("session-reset")
+        self._model_fused = False
+
         # 基类重置集（若宿主真基类在 MRO 中则委托 super；object 基类则手动 4 字段）
         try:
             if hasattr(super(), "on_session_reset"):
@@ -1190,11 +1418,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # R2：与 on_session_reset 同口径（full-disk OSError 优雅降级 + 水位观测）——
             # 会话收尾面同样不炸宿主（pending 批留内存，断电丢批上界不变）。
             logger.warning("supercompress: session-end flush failed (degraded, "
-                           "pending P1/P2 kept in memory): %s", e)
+                           "pending P1/P2 kept in memory, store=main): %s", e)
             try:
                 self.store.log_water_warn("session-end-flush-failed", e)
             except Exception:
                 pass
+        # B 卡：model 旁路 lazy 批 flush（aux worker flush 后；OSError 优雅降级，镜像主 store 块，marker + store=model 判别）
+        self._model_session_flush("session-end")
+
         logger.info("supercompress: session %s end, store lines=%d",
                     session_id, self.store.line_count)
         # P4 钩子②（digest 完成回写池，t_026a17f8）：会话末 = 重启前权威汇合点

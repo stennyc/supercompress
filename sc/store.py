@@ -6,9 +6,12 @@
 （全树恰好 1 个 live 定义，本模块只做委托，不另造第二套）。
 写路径 = 本模块 own 的 tier-aware fsync 策略：
 - P0（含全部 ledger / 顶层 goal）：写入即强制 fsync + 读回校验（write-before-compress 硬 gate 的一半）；
-- P1/P2：lazy 批（size trigger ≤256KB 先到即 flush；不逐行 fsync）；
+- P1/P2：lazy 批（不逐行 fsync；size trigger 已实装：append 累积 pending 字节 ≥ lazy_batch_cap
+  立即 flush；另有 turn 末 / 会话边界 flush 点 = Distiller.run 收尾 step 7（sc/distill.py）+
+  会话边界（engine.py on_session_reset / on_session_end））；
 - 锚点只发射「已 durable（fsync+读回）」的段——pending 字节物理上无指针。
-崩溃语义：断电 = 丢一个 P1/P2 pending 批（≤ lazy cap），P0 + ledger 全 durable；
+崩溃语义：断电 = 丢一个 P1/P2 pending 批（上界 = 一个 ≤ lazy_batch_cap 的批，size trigger 已实装），
+P0 + ledger 全 durable；
 重开 = materialize(archive, active, reopen_from) 字节稳定拷贝 + 单 replay 路径。
 """
 from __future__ import annotations
@@ -35,6 +38,8 @@ class JsonlStore:
     def __init__(self, path: str, lazy_batch_cap: int = 256 * 1024):
         self.path = path
         self.lazy_batch_cap = lazy_batch_cap
+        # size-triggered flush 已实装（2026-10-06）：append 累积 _pending_bytes ≥ lazy_batch_cap 立即
+        # flush；另有 turn 末 / 会话边界 flush 点 = distill step7（sc/distill.py）+ 会话边界（engine.py）。
         self.by_hash: dict[str, Segment] = {}      # content_hash -> Segment（replay 后 = 磁盘态）
         self.index: dict[str, Segment] = {}        # segment_id -> Segment（点查 O(1)）
         self.durable: set[str] = set()             # 已 fsync 确认的 content_hash
@@ -119,6 +124,9 @@ class JsonlStore:
             self._pending.append(seg)
             self._pending_bytes += len(line.encode("utf-8")) + 1
             self._record(seg, durable=False)
+            # size trigger：pending 累积 ≥ lazy_batch_cap 立即 flush（断电丢批上界 = 一个 ≤cap 的批）
+            if self._pending_bytes >= self.lazy_batch_cap:
+                self.flush()
         self._line_count += 1
         return seg
 
