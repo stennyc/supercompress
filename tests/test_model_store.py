@@ -181,17 +181,19 @@ class TestReplayFailOpen:
 class TestFuseTriggers:
     """B 卡决策 2：三选一命中即 fuse（内存 reset、文件保留、marker）。"""
 
-    def test_line_count_over_2x_main(self, tmp_path):
+    def test_line_count_no_longer_fuses(self, tmp_path):
+        """2026-10-09 用户裁定：fuse①（行数比 2× 主 store）已撤——carry-over 旁路池跨
+        session 累积，新 session 主 store 刚起步，基准错配，每个新 session 都误熔断砍召回。
+        行数再多也不 fuse（唯一保留保险丝 = ② 5MB 体积上限，由 test_size_over_cap 钉死）。"""
         main = JsonlStore(str(tmp_path / "s.jsonl"))
         main.append(Segment(tier="P0", provenance="user", original_text="main line"))
         ms = sc_model_store.ModelStore(_model_path(tmp_path), sync=True)
         for i in range(3):
             ms.ingest_assistant(f"model line {i}" + "a" * 300, min_chars=MIN, model_version="m1", main_by_hash=main.by_hash)
-        assert ms.check_fuse(main.line_count, "m1") != []  # 3 > 2*1
-        assert ms.fused
-        assert "line_count_over_2x_main" in ms.fuse_reasons[0]
-        assert ms.line_count == 0  # 内存 reset
-        assert os.path.getsize(_model_path(tmp_path)) > 0  # 文件保留
+        # 3 model 行 vs 1 主 store 行（3 > 2*1）：旧逻辑 fuse① 命中，现撤 → 不 fuse
+        assert ms.check_fuse(main.line_count, "m1") == []
+        assert not ms.fused
+        assert ms.line_count == 3  # 内存未 reset（旁路池保留，召回正常）
 
     def test_size_over_cap(self, tmp_path):
         p = _model_path(tmp_path)
@@ -203,22 +205,27 @@ class TestFuseTriggers:
         assert any("size_over_cap" in r for r in reasons)
         assert ms.fused
 
-    def test_model_version_mismatch(self, tmp_path):
+    def test_model_version_change_no_longer_fuses(self, tmp_path):
+        """2026-10-09 用户裁定：fuse③（model 版本失配）已撤——旁路 store 自动适配任何
+        model / 任何版本，不再因版本 stamp 失配而熔断。model_version 仅作行级 audit 数据
+        （digest 再生三元组用），不作 fuse 判定。"""
         p = _model_path(tmp_path)
         ms = sc_model_store.ModelStore(p, sync=True)
         ms.ingest_assistant("stamped " + "s" * 300, min_chars=MIN, model_version="old-model", main_by_hash={})
-        assert ms.check_fuse(0, "new-model") != []  # stamped=old ≠ new
-        assert ms.fused
-        assert "model_version_mismatch" in ms.fuse_reasons[0]
+        # stamped=old-model，current=new-model：旧逻辑 fuse③ 命中，现撤 → 不 fuse
+        reasons = ms.check_fuse(0, "new-model")
+        assert reasons == []  # 版本失配不再触发 fuse
+        assert not ms.fused
+        assert "model_version_mismatch" not in (reasons or [])
 
     def test_empty_stamp_is_neutral(self, tmp_path):
         """空 stamp 行 = 版本判定中性（digest pool guard 同口径，B 卡决策 2）。"""
         p = _model_path(tmp_path)
         ms = sc_model_store.ModelStore(p, sync=True)
         ms.ingest_assistant("unstamped " + "u" * 300, min_chars=MIN, model_version="", main_by_hash={})
-        # 主 store 需 ≥1 行，否则 fuse① (model 1 > 2*0) 先行命中；这里验证「空 stamp 中性」
-        # 单独语义，故喂一个主 store 行数让 fuse① 不触发，只剩版本判定面。
-        assert ms.check_fuse(1, "m1") == []  # 空 stamp 行不触发版本 fuse；主 1 行挡住 fuse①
+        # 2026-10-09：fuse①/fuse③ 均撤，check_fuse 不再因行数比或版本失配命中；
+        # 任何主 store 行数 / 任何 model 版本组合下只要文件 ≤ 5MB 即不 fuse。
+        assert ms.check_fuse(1, "m1") == []
         assert not ms.fused
 
     def test_fused_is_idempotent(self, tmp_path):
@@ -478,18 +485,19 @@ class TestEngineIngest:
 
 
 class TestEngineFuse:
-    def test_model_version_change_fuses(self, tmp_path):
+    def test_model_version_change_no_longer_fuses(self, tmp_path):
+        """2026-10-09 用户裁定：fuse③（model 版本失配）已撤——update_model 换 model
+        不再触发旁路 fuse；旁路 store 自动适配任何 model / 任何版本。"""
         e = _mkengine(tmp_path / "fv")
         e.on_session_start("s1")
         e._main_runtime = {"model": "m-old", "provider": "", "base_url": "", "api_key": "", "api_mode": ""}
         e._model_store.ingest_assistant("stamped " + "s" * 300, min_chars=e.model_min_chars,
                                         model_version="m-old", main_by_hash=e.store.by_hash)
         assert not e._model_fused
-        e.update_model("m-new", 256000)  # model_version 变更 = 保险丝 fused
-        assert e._model_fused is True
-        assert e._model_store.fused is True
-        assert "model_version_mismatch" in e._model_store.fuse_reasons[0]
-        assert os.path.getsize(_model_path(tmp_path / "fv", "s1")) > 0, "fused 保留文件不删"
+        e.update_model("m-new", 256000)  # 旧逻辑 = 保险丝 fused；现 fuse③ 已撤 → 不 fuse
+        assert e._model_fused is False
+        assert e._model_store.fused is False
+        assert os.path.getsize(_model_path(tmp_path / "fv", "s1")) > 0, "旁路 store 保留（可召回）"
 
     def test_fused_recall_union_skips_store(self, tmp_path):
         e = _mkengine(tmp_path / "fr")
@@ -576,7 +584,7 @@ class TestEngineSessionLifecycle:
         # 新实例冷重开（同 sid，model 文件已存在 → 构造即 replay）
         e2 = _mkengine(d)
         e2.on_session_start("s1")
-        assert not e2._model_fused, "主 store 已 seed（1 行）→ fuse① 1>2*1 不触发"
+        assert not e2._model_fused, "fuse① 已撤（carry-over 基准错配误熔断）→ 冷重开不误 fuse"
         mseg = e2._model_store.live_segments()[0]
         assert mseg.tier == "P0", "磁盘恒 P0（never re-tier on replay）"
         assert mseg.stale is False, "P0 地板行不标 stale（P1-stale ×0.5 = 文档化 no-op）"
@@ -614,7 +622,7 @@ class TestEngineSessionLifecycle:
         assert Path(old_model).exists()
         e2 = _mkengine(d)
         e2.on_session_start("new", old_session_id="old", carry_over_context=True)
-        assert not e2._model_fused, "main store 已 seed → fuse① 不触发"
+        assert not e2._model_fused, "fuse① 已撤（carry-over 基准错配误熔断）→ carry 重开不误 fuse"
         assert e2._model_store.line_count == 1, "model 旁路平行 materialize"
         carried = e2._model_store.live_segments()[0]
         assert carried.reopened_from == "old", "跨期重开标记（materialize 语义）"
@@ -622,7 +630,10 @@ class TestEngineSessionLifecycle:
             "P0 地板行不因 materialize 标 stale（P1-stale = 文档化 no-op）"
 
     def test_fused_reopen_preserves_file(self, tmp_path):
-        """fused 重启保留文件（不删）+ fused 标志（召回跳过）。"""
+        """fused（经保留的 fuse② 体积上限）重启保留文件（不删）+ fused 标志（召回跳过）。
+
+        2026-10-09：fuse③（model 版本失配）已撤，update_model 换 model 不再 fuse——本测试
+        改经 fuse②（旁路文件 > 5MB）触发 fused，钉死「fused → 重启保留文件 + 召回跳过」生命周期。"""
         d = tmp_path / "fused_reopen"
         e1 = _mkengine(d)
         e1.on_session_start("s1")
@@ -631,13 +642,15 @@ class TestEngineSessionLifecycle:
         p = _model_path(d, "s1")
         size_before = os.path.getsize(p)
         assert size_before > 0
-        e1._main_runtime = {"model": "m2", "provider": "", "base_url": "", "api_key": "", "api_mode": ""}
-        e1.update_model("m2", 256000)  # model_version 失配 → fused
-        assert e1._model_fused
+        # fuse②：旁路文件膨胀超 5MB 体积上限 → check_fuse 命中 fuse（保留文件不删）
+        with open(p, "ab") as f:
+            f.write(b"\x00" * (sc_model_store.MODEL_MAX_BYTES))
+        e1._model_replay_hook()   # 保险丝检查钩子（engine 面）→ check_fuse 命中 fuse②
+        assert e1._model_fused, "fuse② 体积超限 → fused"
         # 重启重放 → 再次 fused（文件仍在、再判）
         e2 = _mkengine(d)
         e2.on_session_start("s1")
-        assert os.path.getsize(p) == size_before, "fused 重启保留文件不删"
+        assert os.path.getsize(p) >= size_before, "fused 重启保留文件不删"
 
     def test_session_end_flushes_model_store(self, tmp_path):
         e = _mkengine(tmp_path / "endflush")
@@ -702,3 +715,54 @@ class TestEngineMarkerSurface:
             e._model_ingest_hook([_assistant_msg("short no marker text")])
         assert not [r for r in caplog.records if "model-store: ingested" in r.getMessage()], \
             "N=0 不打 ingest marker（避免噪声）"
+
+
+# ═══════════════════════ ts=0 补齐回归（fix-2：ingest_assistant + supersede 盖 ts）═══════════════════════
+
+
+class TestTsRegression:
+    """fix-2（ts=0 补齐）回归：两处构造面 ingest_assistant / supersede 均显式 ts=time.time()。
+
+    红绿契约（阈值 0，非 5%）：新建 model 段 ts=0 计数必须 = 0——
+    - ingest_assistant 入库后 live_segments() 取段断言 seg.ts > 0（行面 to_dict 落 ts）；
+    - supersede 新段同断言（T3 存量清洗路径同修）；
+    - **零数据迁移**：存量 ts=0 段（pre-deploy 行 / store.append 默认面）绝不回填——
+      supersede 后原段内存 ts 保持 0.0 原样（fix 只影响新建段；回滚 = revert 行级）。
+    """
+
+    def _legacy_segment(self, ms: "sc_model_store.ModelStore") -> Segment:
+        """模拟存量 ts=0 段（pre-deploy 原文入库行）：store.append 走 schema 默认 ts=0.0。"""
+        return ms.store.append(Segment(tier="P0", provenance="model",
+                                       original_text="legacy ts0 row " + "l" * 300,
+                                       structural_p0=False))
+
+    def test_ingest_assistant_new_segment_ts_nonzero(self, tmp_path):
+        ms = sc_model_store.ModelStore(_model_path(tmp_path), sync=True)
+        text = "ts probe model output " + "t" * 200
+        ok, gate = ms.ingest_assistant(text, min_chars=MIN, model_version="m1", main_by_hash={})
+        assert ok and gate == "chars"
+        seg = ms.live_segments()[0]
+        assert seg.ts > 0.0, "ingest_assistant 新建段 ts 非零（阈值 0）"
+        # 行面：ts 经 to_dict 落入盘字节（冷重放读回同值）
+        import json as _json
+        with open(_model_path(tmp_path), encoding="utf-8") as f:
+            row = _json.loads([ln for ln in f.read().splitlines() if ln.strip()][0])
+        assert row["ts"] > 0.0, "行级 ts 落盘（展示面/审计完整性）"
+
+    def test_supersede_new_segment_ts_nonzero_and_legacy_untouched(self, tmp_path):
+        p = _model_path(tmp_path)
+        ms = sc_model_store.ModelStore(p, sync=True)
+        legacy = self._legacy_segment(ms)
+        assert legacy.ts == 0.0  # 存量段 = schema 默认 ts=0（pre-fix 形态 fixture）
+        norm = "ts probe cleaned " + "c" * 200
+        new_seg = ms.supersede(legacy.segment_id, norm, model_version="m1")
+        assert new_seg is not None
+        assert new_seg.ts > 0.0, "supersede 新建段 ts 非零（阈值 0）"
+        # 零数据迁移：原段内存对象 ts 原样保留 0.0（append-only，绝不回填）
+        legacy_again = ms.get(legacy.segment_id)
+        assert legacy_again is not None and legacy_again.ts == 0.0, "存量 ts=0 段保留不回写"
+        with open(p, encoding="utf-8") as f:
+            rows = [ln for ln in f.read().splitlines() if ln.strip()]
+        assert len(rows) == 2
+        assert json.loads(rows[0])["ts"] == 0.0, "原段行字节不变（ts=0 历史保留）"
+        assert json.loads(rows[1])["ts"] > 0.0, "新段行级 ts 落盘"
