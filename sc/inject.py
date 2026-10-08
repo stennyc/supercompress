@@ -41,13 +41,17 @@ def _l0_ptr(ws) -> str:
 
 
 def _rank_key(ws, query_terms: set[str]) -> tuple:
-    """相关性排序键（确定性）：相关度 desc → tier（P0 先）→ 新近 desc（seq 大 = 新）。"""
+    """相关性排序键（确定性）：相关度 desc → tier（P0 先）→ 新近 desc（seq 大 = 新）
+    → 同号 tiebreak（union 窗口 main+model 双 seq 空间撞车，recon-A H1）：
+    seq 仍主键，content_hash[:16] 只在 seq 相等时定全序（同号必不同 hash →
+    序唯一 + 跨 replay 稳定 + 前缀缓存顺带稳；零 mutation：不动 seq/segment_id，
+    仅排序键扩展第四位，fix-1 t_ad82f732 / gate t_2d213ce9 裁定表 #1）。"""
     hits = 0
     if query_terms:
         low = ws.excerpt().lower()
         hits = sum(1 for t in query_terms if t in low)
     tier_order = {"P0": 0, "P1": 1, "P2": 2}.get(ws.segment.tier, 3)
-    return (-hits, tier_order, -ws.segment.seq)
+    return (-hits, tier_order, -ws.segment.seq, ws.segment.content_hash[:16])
 
 
 # 档位默认池（固定，无 pull 耦合——决定 B 核心，见模块 docstring；与模型窗口解耦）。
@@ -122,7 +126,11 @@ def choose_forms(
             form_of[sid] = ("L0", _l0_ptr(ws))
 
     out = []
-    for ws in sorted(segs, key=lambda w: w.segment.seq):  # 输出 = seq 稳定序（缓存友好）
+    # 展示序 = (seq, content_hash[:16]) 升序（fix-1 t_ad82f732 / gate t_2d213ce9 裁定表 #1：
+    # union 窗口 main+model 双 seq 空间撞车（recon-A H1）→ 同号段按 hash 前缀 tiebreak
+    # 定全序，渲染字节跨 replay / 跨输入序稳定（前缀缓存友好）；零 mutation：seq/segment_id
+    # 值不变，仅排序键扩展）
+    for ws in sorted(segs, key=lambda w: (w.segment.seq, w.segment.content_hash[:16])):
         form, text = form_of[ws.segment.segment_id]
         out.append((ws, form, text))
     return out
