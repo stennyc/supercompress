@@ -15,9 +15,11 @@ Locked design points (design-review final):
 """
 import hashlib
 import json
+import os
+import time
 import unicodedata
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional
 
 
 def sha256_nfc(text: str) -> str:
@@ -143,3 +145,185 @@ def digest_regen_key(seg: dict, model_version: str, session_topic: str) -> tuple
     """Two-level idempotent key, level 2: digest is a pure function of this triple.
     Same triple -> no recompute; model_version bump = intentional regeneration."""
     return (seg["content_hash"], model_version, session_topic)
+
+
+# ── settled P0 原文沉盘（owner 裁定：settled 折出存根 + 旧 P0 落盘可复活可审计）────
+# 不变量：文件名 <seq>.p0 与 compact-ledger 存根 #seq 一一对应（重开按 seq 捞原文）。
+# sink = 原文写盘（幂等覆盖，字节稳定）；restore = 按 seq 读回（缺失 → None，fail-open）。
+# 零 .db、零宿主面：只写 supercompress 侧车同目录的 <seq>.p0 文件（GC 联动同前缀删）。
+
+def p0_sink_path(base_dir: str, seq: int, sid: str = "") -> str:
+    """settled P0 原文落盘点 = <base_dir>/<sid>.p0.<seq>（P5 跨 session 隔离）。
+
+    sid = session 前缀（如 `20261013_092849_4af071`），使不同 session 的沉盘文件
+    同名 seq 不冲突——共享 store_dir 下多个 session 各自 seq 从 0 起，无 sid 前缀
+    会跨 session 同名覆盖（restore 捞回别的 session 的内容 = 数据损坏）。sid 空
+    （旧调用面/测试无 sid）→ 退化为 <seq>.p0（兼容既有文件，fail-open）。"""
+    if sid:
+        return os.path.join(base_dir, f"{sid}.p0.{seq}")
+    return os.path.join(base_dir, f"{seq}.p0")
+
+
+def sink_p0(base_dir: str, seq: int, text: str, kind: str = "adhoc",
+            sid: str = "") -> bool:
+    """把 settled P0 块原文沉盘（<sid>.p0.<seq>，P5 跨 session 隔离）。幂等：
+    同 sid+seq 重复写覆盖（字节稳定）。目录缺失 / 写失败 → 只告警不炸宿主
+    （fail-open，与账本侧车同口径）；返回是否落盘成功。"""
+    target = p0_sink_path(base_dir, seq, sid)
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write(str(kind) + "\n")          # 首行 = kind（审计面：kanban 半 / adhoc 纯）
+            f.write(str(text or ""))
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError:
+        return False
+
+
+def restore_p0(base_dir: str, seq: int, sid: str = "") -> Optional[tuple]:
+    """按 sid+seq 捞回 settled P0 原文（复活面）。返回 (kind, text)；缺失 → None
+    （fail-open）。sid 空 → 兼容旧 <seq>.p0 文件。"""
+    target = p0_sink_path(base_dir, seq, sid)
+    try:
+        with open(target, "r", encoding="utf-8", newline="") as f:
+            body = f.read()
+    except (FileNotFoundError, OSError):
+        return None
+    lines = body.split("\n", 1)
+    kind = lines[0] if lines and lines[0] else "adhoc"
+    text = lines[1] if len(lines) > 1 else ""
+    return (kind, text)
+
+
+# ── R5（owner 批次 A #2）：trimmed P1 块原文沉盘 / 复活（与 P0 面同形对称）──
+def p1_trim_path(base_dir: str, seq: int, sid: str = "") -> str:
+    """trimmed P1 块原文落盘点 = <base_dir>/<sid>.p1.<seq>（P5 跨 session 隔离，
+    与 <sid>.p0.<seq> 同前缀对称不撞名）。sid 空 → 兼容旧 <seq>.p1。"""
+    if sid:
+        return os.path.join(base_dir, f"{sid}.p1.{seq}")
+    return os.path.join(base_dir, f"{seq}.p1")
+
+
+def sink_p1(base_dir: str, seq: int, text: str, sid: str = "") -> bool:
+    """把 trimmed P1 块原文沉盘（<sid>.p1.<seq>，P5 跨 session 隔离）。幂等：
+    同 sid+seq 重复写覆盖（字节稳定）。目录缺失 / 写失败 → fail-open
+    （调用方只告警不炸宿主）；返回是否落盘成功。P1 块无 kind 审计行（可裁层
+    非定案，首行直接原文）——与 sink_p0 的 kind 首行面不同，restore_p1 相应
+    只返回 text。"""
+    target = p1_trim_path(base_dir, seq, sid)
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+        with open(target, "w", encoding="utf-8", newline="\n") as f:
+            f.write(str(text or ""))
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError:
+        return False
+
+
+def restore_p1(base_dir: str, seq: int, sid: str = "") -> Optional[str]:
+    """按 sid+seq 捞回 trimmed P1 原文（复活面）。返回 text；缺失 → None
+    （fail-open）。sid 空 → 兼容旧 <seq>.p1 文件。"""
+    target = p1_trim_path(base_dir, seq, sid)
+    try:
+        with open(target, "r", encoding="utf-8", newline="") as f:
+            return f.read()
+    except (FileNotFoundError, OSError):
+        return None
+
+
+# ── P5 GC 面（owner 既裁定"保留 30 天"）：过期 session 侧车族清扫 ──────────────
+# 宿主不替 supercompress 删侧车（宿主 gateway 自己的 90 天 retention 只管宿主数据），
+# 且红线"不改宿主" → 30 天 retention 落在插件侧：宿主 on_session_start 每开 session
+# 顺手扫一次 >30 天旧 session，纯 stdlib、零宿主改动、天然分散（每 session 开清一次，
+# 不集中爆扫）。与 gc_orphan_pools（带外删除/归档语义，删"源 jsonl 已不在的孤儿池"）
+# 是两个独立维度：本面按源 jsonl mtime 判 30 天 TTL，不清带外删的孤儿（那归 gc_orphan_pools）。
+RETENTION_DAYS = 30
+
+# 一个 session 的完整侧车族后缀（同住 store_dir、同 sid 前缀，删一个 sid 全族）。
+# .audit / .flock 是 ledger 锁 + 审计侧车；.p0.<sid>.<seq> / .p1.<sid>.<seq> 是 P5 隔离沉盘。
+_SIDECAR_SUFFIXES: tuple = (
+    ".jsonl",                    # 源 store（mtime 判定基准）
+    ".compact.json",             # compact-ledger 账本
+    ".model.jsonl",             # B 卡 model 旁路
+    ".digests.json",            # digest 池
+    ".recall_cache.json",       # recall 缓存
+    ".flock",                   # ledger flock 锁
+    ".audit",                   # 审计侧车
+)
+
+
+def gc_stale_sidecars_in_dir(store_dir: str, now: Optional[float] = None,
+                             retention_days: int = RETENTION_DAYS) -> List[str]:
+    """P5 GC 面核心算法（直接吃已解析的 store_dir 路径）。
+
+    `gc_stale_sidecars`（宿主接线面）薄壳到这里；engine 按自己已解析的 store_dir
+    （hermes_home > legacy 同一变量）调本面，不重新从 hermes_home 派生——legacy
+    独立测试路径下 store_dir = _legacy_store_dir，与 GC 面必须同住同目录才不误删。
+    判据：源 jsonl `<sid>.jsonl` mtime 超 retention_days → 删该 sid 全侧车族。
+    返回实际删除的文件路径列表（空 = 无过期 / 目录不存在）。fail-open 零崩。
+    """
+    if now is None:
+        now = time.time()
+    root = store_dir
+    if not os.path.isdir(root):
+        return []
+    cutoff = now - retention_days * 86400.0
+    removed: List[str] = []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    for name in names:
+        # 只以源 jsonl `<sid>.jsonl` 为判定基准（mtime 锚点）——排除派生面：
+        # `.model.jsonl`（B 卡旁路，sid 名含 '.' 前缀）/ `.compact.json` / `.digests.json`
+        # 都是派生侧车，跟源 sid 走，不独立判 TTL。纯源 jsonl 的文件名形 = `<sid>.jsonl`
+        # （sid 本体不含 '.'，见 _safe_session_name），故判据：ends .jsonl 且 stem 无 '.'。
+        if not name.endswith(".jsonl"):
+            continue
+        sid = name[:-len(".jsonl")]
+        if "." in sid:          # 派生面（<sid>.model.jsonl 的 stem='<sid>.model' 含 '.'）→ 跳过
+            continue
+        jsonl_path = os.path.join(root, name)
+        try:
+            mtime = os.path.getmtime(jsonl_path)
+        except OSError:
+            continue                      # stat 失败（并发删/权限）→ 跳过，下轮再试
+        if mtime > cutoff:
+            continue                      # 30 天内新鲜 → 绝不碰
+        # 过期 → 删该 sid 全族（源 jsonl + 所有同 sid 前缀侧车，F1 例外）
+        for candidate in [name] + [n for n in names
+                                    if n.startswith(sid + ".") and n != name]:
+            # F1：排除 ops 审计文件（<sid>.jsonl.bak_* / <sid>.jsonl_cleaned_* 等）——
+            # 它们是人工 ops 产出的审计留痕，非 session 侧车，30 天 TTL 不该连带删。
+            # 判据：候选 = 源 jsonl（name 本身）放行；侧车候选若含 ".jsonl.bak" 或
+            # ".jsonl_cleaned"（即派生自源 jsonl 的 ops 备份命名）→ 跳过。
+            if candidate != name and (".jsonl.bak" in candidate or ".jsonl_cleaned" in candidate):
+                continue
+            target = os.path.join(root, candidate)
+            try:
+                os.unlink(target)
+                removed.append(target)
+            except OSError:
+                pass                     # 零崩：删不掉的留下轮（fail-open）
+    return removed
+
+
+def gc_stale_sidecars(hermes_home: Optional[str] = None, now: Optional[float] = None,
+                      retention_days: int = RETENTION_DAYS) -> List[str]:
+    """P5 GC 面宿主接线面（薄壳）：解析 store_dir 后委托 `gc_stale_sidecars_in_dir`。
+
+    hermes_home 给定 → `<hermes_home>/supercompress_store`；缺省 → `_bootstrap.store_dir()`
+    （HERMES_HOME env 优先，per-profile 隔离；独立测试回退 legacy）。engine 通常直接调
+    `gc_stale_sidecars_in_dir`（喂它已解析的同一 store_dir 变量），本面供宿主/ops 按
+    hermes_home 直接触发的接线点保留。
+    """
+    if hermes_home:
+        root = os.path.join(hermes_home, "supercompress_store")
+    else:
+        from sc._bootstrap import store_dir
+        root = store_dir()
+    return gc_stale_sidecars_in_dir(root, now=now, retention_days=retention_days)

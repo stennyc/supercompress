@@ -1021,7 +1021,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
             e = lg.settle(seq, kind=kind)
             if e is not None:
                 _sink_dir = os.path.dirname(os.path.abspath(lg.path))
-                if not scdata.sink_p0(_sink_dir, seq, e["text"], kind=kind):
+                _sid = os.path.splitext(os.path.basename(lg.path))[0].replace(".compact", "")
+                if not scdata.sink_p0(_sink_dir, seq, e["text"], kind=kind, sid=_sid):
                     logger.warning("supercompress: settle_p0 c#%d flipped but p0 sink "
                                    "failed (in-memory only)", seq)
                 logger.info("supercompress: compact-ledger c#%d settled (kind=%s)", seq, kind)
@@ -1045,7 +1046,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 return True
             # 条目已不在内存账本（seal 清过）→ 尝试沉盘捞回（fail-open）
             _sink_dir = os.path.dirname(os.path.abspath(lg.path))
-            got = scdata.restore_p0(_sink_dir, seq)
+            _sid = os.path.splitext(os.path.basename(lg.path))[0].replace(".compact", "")
+            got = scdata.restore_p0(_sink_dir, seq, sid=_sid)
             logger.info("supercompress: unsettle_p0 c#%d not in live ledger; "
                         "disk restore=%s (entry already sealed; nothing to revive in-memory)",
                         seq, "ok" if got else "miss")
@@ -1075,7 +1077,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 return True
             # 条目已不在活账本（seal 清过）→ 尝试 <seq>.p1 沉盘件捞回（fail-open 缺失 → miss）
             _sink_dir = os.path.dirname(os.path.abspath(lg.path))
-            got = scdata.restore_p1(_sink_dir, seq)
+            _sid = os.path.splitext(os.path.basename(lg.path))[0].replace(".compact", "")
+            got = scdata.restore_p1(_sink_dir, seq, sid=_sid)
             logger.info("supercompress: untrim_p1 c#%d not in live ledger; "
                         "disk restore=%s (entry already sealed; nothing to revive in-memory)",
                         seq, "ok" if got else "miss")
@@ -2143,7 +2146,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     if _settled_now and _entry is not None:
                         # 纯自动 settled → 原文同事务沉盘（幂等覆盖；写失败 fail-open 只告警）
                         _sink_dir = os.path.dirname(os.path.abspath(ledger.path))
-                        if not scdata.sink_p0(_sink_dir, _entry["seq"], _entry["text"], kind=_kind):
+                        _sid = os.path.splitext(os.path.basename(ledger.path))[0].replace(".compact", "")
+                        if not scdata.sink_p0(_sink_dir, _entry["seq"], _entry["text"], kind=_kind, sid=_sid):
                             logger.warning("supercompress: compact-ledger c#%d settled but "
                                            "p0 sink failed (in-memory only)", _entry["seq"])
                     if _decision == "kanban" and _entry is not None:
@@ -2211,6 +2215,20 @@ class SupercompressContextEngine(sc_context_engine_base()):
         store_dir = (os.path.join(os.path.expanduser(home), STORE_SUBDIR)
                      if home else self._legacy_store_dir)
         target = os.path.join(store_dir, f"{_safe_session_name(session_id)}.jsonl")
+        # P5 GC 面（owner 既裁定"保留 30 天"）：宿主 on_session_start 每开 session 顺手扫
+        # 一次 >30 天旧 session 的侧车族全删（scdata.gc_stale_sidecars 纯算法面，插件内
+        # stdlib，零宿主改动；天然分散——每 session 开清一次不集中爆扫）。30 天内新鲜
+        # session 绝不碰；fail-open（目录缺失/单文件删失败 → 静默跳过，不炸宿主启动面）。
+        # 扫 store_dir（与上面同一变量）而非 hermes_home 派生——legacy 独立测试路径下
+        # store_dir = _legacy_store_dir，与 GC 面必须同住同目录才不误删别的 profile。
+        try:
+            _removed = scdata.gc_stale_sidecars_in_dir(store_dir)
+            if _removed:
+                logger.info("supercompress: gc_stale_sidecars removed %d file(s) "
+                            "(>30d retention sweep)", len(_removed))
+        except Exception as _e:
+            logger.warning("supercompress: gc_stale_sidecars failed open (retention "
+                           "sweep skipped, host startup unaffected): %s", _e)
         if self._bound_session == session_id and self.store.path == target:
             return  # 幂等重入：同实例同 session 已绑定。
             # 注：早退**不**重置 last_prompt_tokens / _force_evict_mode —— 它们是「本进程当前

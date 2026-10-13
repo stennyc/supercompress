@@ -40,11 +40,18 @@ def _l1_line(ws, rel: int = 1) -> str:
 
     R4（2026-10-13 · owner 病灶 c ts 不刷新）：段 ts 为 0/缺（回放段未刷新
     的不可信值，`_ts_zero_ratio` 观测面同口径）→ 省略 ts 段——不新造时间戳
-    （造了就是假数据）；正常 ts>0 的行字节逐字不变（前缀缓存契约零扰动）。
+    （造了就是假数据）。
     R5（owner 批次 A #3/#5）：行首 `#<rel>` = 块内相对号（render_block 逐段
     计数传入，账本面 c#N 块号之下不再出现段级全局号 = 双层编号去混淆）；
     `prov=<user|model>` 消 user/model 同号视觉重复（#3）；`seq=<全局seq>`
-    保留可点查定位（recall O(1) 面不变）。"""
+    保留可点查定位（recall O(1) 面不变）。
+
+    诚实边界（reviewer P6）：R4 原 commit 措辞"正常 ts>0 的行字节逐字不变
+    （前缀缓存契约零扰动）"失实——R5 #3/#5 把 L1 行形整体重构（加 prov=、
+    #seq→#rel 相对号、+seq= 位），**ts>0 的行字节也随 R5 批次变了**；前缀缓存
+    契约在 R5 批次被整体重构打破是 owner 已知事实（账本消息恒在缝位、字节单调
+    稳定靠 text() 整段渲染保证，不靠单 L1 行逐字不变）。ts=0 省略 ts 段是 R4 的
+    增量，叠加在 R5 新行形之上。"""
     seg = ws.segment
     fact = getattr(seg, "key_fact", "") or seg.original_text[:20]
     ts = getattr(seg, "ts", 0) or 0

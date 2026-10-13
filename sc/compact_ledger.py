@@ -44,23 +44,31 @@ _FORMAT_VERSION = 1
 _SETTLED_STUB_HASH_LEN = 16
 
 
-def _settled_stub_line(seq: int, text: str, kind: str) -> str:
-    """settled P0 块在活渲染面里的单行存根（固定短字节，不随原文长度变）。"""
+def _settled_stub_line(seq: int, text: str, kind: str, sid: str = "") -> str:
+    """settled P0 块在活渲染面里的单行存根（固定短字节，不随原文长度变）。
+
+    P5 跨 session 隔离：盘形 `<sid>.p0.<seq>`（sid 空退化为旧形 `<seq>.p0`），存根
+    定位提示同步渲染真实盘形——restore 按提示找文件不 miss。"""
     import hashlib
     h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:_SETTLED_STUB_HASH_LEN]
-    return f"#seq={seq} P0 settled sha256={h} kind={kind} (full text on disk: <seq>.p0)"
+    disk = f"{sid}.p0.{seq}" if sid else f"{seq}.p0"
+    return f"#seq={seq} P0 settled sha256={h} kind={kind} (full text on disk: {disk})"
 
 
-def _trimmed_stub_line(seq: int, text: str, tier: str = "P1") -> str:
+def _trimmed_stub_line(seq: int, text: str, kind: str = "P1") -> str:
     """R5（owner 批次 A #2 编号空洞）：trimmable P1 块封顶被裁时折的单行存根。
 
     与 settled 存根同形（sha256 可审计 + 定位提示），但定位面不同：P1 可裁块
     原文**在 recall 层（segment_id 点查 / 主 store 行）**，不在 <seq>.p0 沉盘面
     （那是 settled P0 专属）。折存根而非硬删 = 账本行不产生编号空洞（seq 连续），
-    被裁块仍经存根行可被人工定位原文（hash 与 store 行逐字可核）。"""
+    被裁块仍经存根行可被人工定位原文（hash 与 store 行逐字可核）。
+
+    参数名 `kind`（第三轮 owner 修正）：调用面传 `e.get("kind", "P1")`（'adhoc' /
+    'kanban'，P1 块的 kind 审计值），存根渲染成 `#seq=N <kind> trimmed...`。
+    原形参名 `tier` 与实传值（kind）错位，本轮对齐。"""
     import hashlib
     h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:_SETTLED_STUB_HASH_LEN]
-    return f"#seq={seq} {tier} trimmed sha256={h} (full text in recall/store)"
+    return f"#seq={seq} {kind} trimmed sha256={h} (full text in recall/store)"
 
 
 def compact_ledger_path_for_jsonl(jsonl_path: str) -> str:
@@ -86,6 +94,11 @@ class CompactLedger:
                  max_entries: int = 8,
                  logger: Any = None) -> None:
         self.path = path
+        # P5+F4：sid = 盘形前缀（self.path 基名去 .compact.json），存根定位提示 +
+        # token 预检按真实 sid 形（<sid>.p0.<seq>）口径，与 text() 渲染面对齐——
+        # 预检用 sid="" 旧形（<seq>.p0）会让 _token_sum 比实际渲染面每块低 ~9 token
+        # （F4），封帽账实二次错位；统一缓存一次，避免每块重算 basename。
+        self._sid = os.path.splitext(os.path.basename(path))[0].replace(".compact", "")
         self.max_tokens = max_tokens
         self.max_entries = max_entries
         self._log = logger
@@ -359,7 +372,7 @@ class CompactLedger:
         # （settled 块封帽过计，seal 比该来得早）。
         next_seq = self.seq + 1
         if settled:
-            tokens = est_tokens(_settled_stub_line(next_seq, t, str(kind)))
+            tokens = est_tokens(_settled_stub_line(next_seq, t, str(kind), self._sid))
         else:
             tokens = est_tokens(t)
         cumulative = self._token_sum() + tokens
@@ -401,7 +414,7 @@ class CompactLedger:
         # 3-A 账实一致：直接 append(settled=True) 的块按存根实渲染权重记账（活渲染面
         # 折存根），与 settle() 翻转后的 tokens 口径对称；未 settled 块按原文全权重。
         if entry["settled"]:
-            entry["tokens"] = est_tokens(_settled_stub_line(self.seq, t, entry["kind"]))
+            entry["tokens"] = est_tokens(_settled_stub_line(self.seq, t, entry["kind"], self._sid))
         # C.1a：forms 非空才写入（安全：空/None 不占 ledger 体积）；存为排序后的
         # (form,count) 列表（JSON 可序列化；dict 键序不稳定，排序保证读面确定性）
         if forms:
@@ -446,9 +459,10 @@ class CompactLedger:
             try:
                 import scdata
                 _sink_dir = os.path.dirname(os.path.abspath(self.path))
+                _sid = os.path.splitext(os.path.basename(self.path))[0].replace(".compact", "")
                 for _e in self.entries:
                     if _e.get("trimmed"):
-                        if not scdata.sink_p1(_sink_dir, _e["seq"], _e["text"]):
+                        if not scdata.sink_p1(_sink_dir, _e["seq"], _e["text"], sid=_sid):
                             if self._log is not None:
                                 self._log.warning(
                                     "compact-ledger: c#%d p1 sink failed "
@@ -493,6 +507,8 @@ class CompactLedger:
                                           "tokens": est_tokens(new_text)}]
         if not all_entries:
             return ""
+        # P5：存根定位提示渲染真实盘形 <sid>.p0.<seq>（sid 从 self.path 基名取）
+        _sid = os.path.splitext(os.path.basename(self.path))[0].replace(".compact", "")
         lines = [f"{MARK} generation={self.generation} seals={self.seals}"]
         for e in all_entries:
             if e.get("trimmed"):
@@ -500,8 +516,8 @@ class CompactLedger:
                 # 原文 recall/store 可定位，sha256 可核）
                 lines.append(f"c#{e['seq']}: " + _trimmed_stub_line(e["seq"], e["text"], e.get("kind", "P1")))
             elif e.get("settled"):
-                # settled P0 块 → 单行存根（原文沉盘，重开按 seq 捞回，见 sink/restore）
-                lines.append(f"c#{e['seq']}: " + _settled_stub_line(e["seq"], e["text"], e.get("kind", "adhoc")))
+                # settled P0 块 → 单行存根（原文沉盘 <sid>.p0.<seq>，重开按 seq 捞回，见 sink/restore）
+                lines.append(f"c#{e['seq']}: " + _settled_stub_line(e["seq"], e["text"], e.get("kind", "adhoc"), _sid))
             else:
                 lines.append(f"c#{e['seq']}: {e['text']}")
         return "\n---\n".join(lines)
@@ -525,7 +541,7 @@ class CompactLedger:
                 e["settled"] = True
                 e["kind"] = str(kind)
                 # 3-A：tokens 改计存根实渲染权重（活渲染面字节收缩，封帽用实值）
-                e["tokens"] = est_tokens(_settled_stub_line(e["seq"], e["text"], e["kind"]))
+                e["tokens"] = est_tokens(_settled_stub_line(e["seq"], e["text"], e["kind"], self._sid))
                 self._persist()
                 return e
         return None

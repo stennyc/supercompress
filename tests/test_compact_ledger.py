@@ -382,7 +382,10 @@ def test_settled_block_folds_to_stub_in_text(tmp_path):
     e = lg.append("#1 P0 [L3]\n网关限流阈值定案五百请求", settled=True, kind="adhoc")
     assert e is not None and e["settled"] is True
     out = lg.text()
-    stub = _settled_stub_line(1, "#1 P0 [L3]\n网关限流阈值定案五百请求", "adhoc")
+    # P5：text() 渲染存根带 sid 前缀（self.path 基名 a → a.p0.1）；对比基线同传 sid
+    import os
+    _sid = os.path.splitext(os.path.basename(str(tmp_path / "a.compact.json")))[0].replace(".compact", "")
+    stub = _settled_stub_line(1, "#1 P0 [L3]\n网关限流阈值定案五百请求", "adhoc", _sid)
     assert "c#1: " + stub in out
     # 原文全文不在存根渲染里（只存根行在场）
     assert "网关限流阈值定案五百请求" not in out
@@ -408,7 +411,10 @@ def test_settle_unsettle_toggle_is_idempotent(tmp_path):
 
 def test_sink_restore_p0_roundtrip(tmp_path):
     """sink_p0/restore_p0 落盘捞回：sink 写 <seq>.p0（首行 kind + 原文），
-    restore 按 seq 读回 (kind, text)；缺失 → None（fail-open）；幂等覆盖。"""
+    restore 按 seq 读回 (kind, text)；缺失 → None（fail-open）；幂等覆盖。
+
+    旧形（sid 空）兼容面：<seq>.p0。P5 跨 session 隔离面（sid 非空）走
+    <sid>.p0.<seq>，见 test_p5_cross_session_sink_isolation。"""
     import scdata
     base = str(tmp_path)
     ok = scdata.sink_p0(base, 42, "#1 P0 [L3]\n定案原文", kind="kanban")
@@ -423,6 +429,43 @@ def test_sink_restore_p0_roundtrip(tmp_path):
     assert scdata.restore_p0(base, 42) == ("kanban", "#1 P0 [L3]\n定案原文")
     # 缺失 seq → None（fail-open）
     assert scdata.restore_p0(str(tmp_path / "no_dir"), 7) is None
+
+
+def test_p5_cross_session_sink_isolation(tmp_path):
+    """P5（第三轮 reviewer major 翻案）：跨 session 沉盘文件命名隔离。
+
+    共享 store_dir 下多个 session 各自 seq 从 0 起，无 sid 前缀时 <seq>.p0 同名
+    跨 session 覆盖 = 数据损坏（restore 捞回别的 session 内容）。P5 修复：sink/restore
+    加 sid 参数，<sid>.p0.<seq> 同前缀隔离——两个 session 写同 seq 不撞名，restore
+    各自按 sid 捞回本 session 内容。
+
+    断言面：
+    1. 两个 sid（sid_a / sid_b）各写 seq=1 → 两个独立文件 <sid_a>.p0.1 / <sid_b>.p0.1
+       不覆盖，restore 各得各的内容。
+    2. sid 空（旧形）写 seq=1 → <1>.p0，与 sid 形不撞。
+    3. p1 面同隔离：<sid>.p1.<seq>。"""
+    import scdata, os
+    base = str(tmp_path)
+    # 两 session 各写 seq=1（同 seq 不同 sid）
+    assert scdata.sink_p0(base, 1, "session A 的定案", kind="adhoc", sid="sid_a") is True
+    assert scdata.sink_p0(base, 1, "session B 的定案", kind="kanban", sid="sid_b") is True
+    # 两文件独立存在（不覆盖）
+    assert os.path.exists(os.path.join(base, "sid_a.p0.1"))
+    assert os.path.exists(os.path.join(base, "sid_b.p0.1"))
+    # restore 各得各的内容（跨 session 不串号）
+    got_a = scdata.restore_p0(base, 1, sid="sid_a")
+    got_b = scdata.restore_p0(base, 1, sid="sid_b")
+    assert got_a is not None and got_a[1] == "session A 的定案" and got_a[0] == "adhoc"
+    assert got_b is not None and got_b[1] == "session B 的定案" and got_b[0] == "kanban"
+    # 旧形（sid 空）写 seq=1 → <1>.p0，与 sid 形不撞
+    assert scdata.sink_p0(base, 1, "legacy 形", kind="adhoc") is True
+    assert os.path.exists(os.path.join(base, "1.p0"))
+    assert scdata.restore_p0(base, 1) is not None and scdata.restore_p0(base, 1)[1] == "legacy 形"
+    # p1 面同隔离
+    assert scdata.sink_p1(base, 1, "A 的 P1 原文", sid="sid_a") is True
+    assert scdata.sink_p1(base, 1, "B 的 P1 原文", sid="sid_b") is True
+    assert scdata.restore_p1(base, 1, sid="sid_a") == "A 的 P1 原文"
+    assert scdata.restore_p1(base, 1, sid="sid_b") == "B 的 P1 原文"
 
 
 def test_auto_settled_on_completion_signal(tmp_path):
@@ -441,11 +484,12 @@ def test_auto_settled_on_completion_signal(tmp_path):
     assert e1["settled"] is True, \
         f"staged 块命中完成信号（已完成）+L3 面 → 自动 settled，实得 {e1}"
     assert e1["kind"] == "adhoc", "纯自动面 kind=adhoc（非 kanban 半自动）"
-    # 原文同事务沉盘（restore_p0 按 seq 捞回）
+    # 原文同事务沉盘（restore_p0 按 sid+seq 捞回，P5 跨 session 隔离 <sid>.p0.<seq>）
     import scdata, os
     _dir = os.path.dirname(os.path.abspath(e._ledger.path))
-    got = scdata.restore_p0(_dir, e1["seq"])
-    assert got is not None, "settled 块原文须沉盘 <sid>.p0（restore_p0 可捞回）"
+    _sid = os.path.splitext(os.path.basename(e._ledger.path))[0].replace(".compact", "")
+    got = scdata.restore_p0(_dir, e1["seq"], sid=_sid)
+    assert got is not None, "settled 块原文须沉盘 <sid>.p0.<seq>（restore_p0 可捞回）"
     assert got[0] == "adhoc" and got[1] == e1["text"]
 
 
@@ -505,11 +549,12 @@ def test_kanban_candidate_nomination_and_judge_loop(tmp_path):
     assert ok is True, "LLM 裁判 + clarify 确认 → settle_p0 折出成功"
     assert e._ledger.entries[0]["settled"] is True
     assert e._ledger.entries[0]["kind"] == "kanban"
-    # 折出后：原文沉盘（kind=kanban，审计面）
+    # 折出后：原文沉盘（kind=kanban，审计面，P5 跨 session 隔离 <sid>.p0.<seq>）
     _dir = os.path.dirname(os.path.abspath(e._ledger.path))
-    got = scdata.restore_p0(_dir, e1["seq"])
+    _sid = os.path.splitext(os.path.basename(e._ledger.path))[0].replace(".compact", "")
+    got = scdata.restore_p0(_dir, e1["seq"], sid=_sid)
     assert got is not None and got[0] == "kanban" and got[1] == e1["text"], \
-        "settled 原文沉盘 <sid>.p0（restore_p0 可捞回，kind=kanban）"
+        "settled 原文沉盘 <sid>.p0.<seq>（restore_p0 可捞回，kind=kanban）"
     # candidate 清单清空（已折出，不再待拍）
     assert e.kanban_candidates() == [], "折出后 candidate 清单应清空"
     # 活渲染面：折出后变存根（sha256= 在场，原文不吐）
@@ -572,10 +617,11 @@ def test_settle_p0_public_api_and_unsettle_revive(tmp_path):
     assert ok is True, "settle_p0 翻转成功"
     assert e._ledger.entries[0]["settled"] is True
     assert e._ledger.entries[0]["kind"] == "kanban"
-    # 沉盘件在场（可审计可复活）
+    # 沉盘件在场（可审计可复活，P5 跨 session 隔离 <sid>.p0.<seq>）
     import scdata, os
     _dir = os.path.dirname(os.path.abspath(e._ledger.path))
-    got = scdata.restore_p0(_dir, seq)
+    _sid = os.path.splitext(os.path.basename(e._ledger.path))[0].replace(".compact", "")
+    got = scdata.restore_p0(_dir, seq, sid=_sid)
     assert got is not None and got[0] == "kanban"
     # 看板 task 重新活跃 → unsettle_p0 复活
     ok2 = e.unsettle_p0(seq)
@@ -621,9 +667,10 @@ def test_p1_trimmable_trimmed_before_p0_at_cap(tmp_path):
     P1 可裁层（trimmable=True）在封顶时折 trimmed 存根（不硬删 = entry 常驻、编号零空洞）；
     P0 块（trimmable=False）永不被 P1 层误伤。
 
-    结构性事实（owner docstring 修正）：P0 块恒先于同代 P1 块 append，front-only
-    裁层扫最旧端遇 P0（非可裁）即停 → 混合 P0+P1 账本 P1 层几乎 no-op，P1 真正被
-    清靠 ③ seal 保底；**P1 可裁层只在 P1-only 账本（无 P0 在前端）真生效**。
+    结构性事实（owner 第三轮 P7 修正）：P1 可裁层**全量折所有 trimmable 块（无位置
+    门槛，不扫最旧端、遇 P0 不即停）**——混合 P0+P1 账本里 P1 层照样全折 P1，
+    P0 挡前端只意味着 P0 自身永不被折（trimmable=False）；P1 真正被全清靠 ③ seal
+    保底（P0 同清）。**只有 P1-only 账本（无 P0）P1 层全量折才真腾帽位**；
     本测试走 CompactLedger 单元面（P1-only 账本，不经 engine e2e 的 store 累积）：
     4 块 P1（各 ~5 token）+ 条数帽驱动（max_entries=2，token 帽放大到不触发）→
     P1 层折存根裁 3 块（4 → 1 全文块 + 3 trimmed 存根，seals=0 证 P1 层裁非 seal）。
@@ -656,15 +703,15 @@ def test_p0_candidate_survives_p1_cap_trim(tmp_path):
     """混合 P0+P1 账本封顶（reviewer 签认补强）：P0 candidate（trimmable=False，
     未定案全文回喂）永不被 P1 可裁层**选择性**误伤。
 
-    可观测不变量（seal 是保底，P1 层只裁 trimmable=True；P0 在最旧端挡 front-only
-    层 → 混合账本 P1 层 no-op，P0 消失只可能来自 seal 全清）：P0 块与 P1 块同进退——
-    要么 P0/P1 全保留（未超帽，P1 层无可裁面），要么 P0/P1 全清（seal 保底，P1 层
-    绝不"裁 P1 留 P0"或"裁 P0 留 P1"）。**绝不出现** P1 在场而 P0 被单独裁掉。
+    可观测不变量（owner 第三轮 P7 修正）：P1 可裁层**全量折所有 trimmable 块（无位置
+    门槛）**——混合账本里 P1 层照样全折 P1，P0 自身因 trimmable=False 永不被折；seal
+    是保底兜底（全清 P0+P1）。P0 块与 P1 块同进退——要么全保留（未超帽，P1 层无可裁
+    面），要么 P0/P1 全清（seal 保底）。**绝不出现** P1 在场而 P0 被单独裁掉。
 
     CompactLedger 单元面双场景对比（不经 engine e2e 的 store 累积，P1 块不跨轮增长）：
     P0（~5 token）+ 4 块 P1（各 ~5 token）= 25 token 总量。
-    cap=30 未超 → 全保留（P0/P1 同在，P1 层无可裁面）；cap=12 真超 + front 不可裁
-    → P1 层/sealed 层均 no-op（P0 在最旧端挡 front）→ seal 保底全清（P0/P1 同清）。"""
+    cap=30 未超 → 全保留（P0/P1 同在，P1 层无可裁面）；cap=12 真超 → P1 层全量折
+    P1（P0 不受影响），若折后仍超（P0 挡住 + 总量仍超）→ seal 保底全清（P0/P1 同清）。"""
     import tempfile as _tf
     from sc.compact_ledger import CompactLedger
     _base = _tf.mkdtemp()
@@ -681,8 +728,9 @@ def test_p0_candidate_survives_p1_cap_trim(tmp_path):
     assert len(p0_a) == 1 and len(p1_a) == 4, \
         "场景 A：P0 candidate + 4 P1 全保留（未超帽，P1 层无可裁面）"
     assert _p0_block in p0_a[0]["text"], "场景 A：P0 candidate text 保持原文（未被 P1 层改）"
-    # 场景 B：cap=12 真超（总量 25 > 12）+ P0 在最旧端挡 front-only P1 层 →
-    # P1 层 no-op → seal 保底全清（P0 同清）→ 新 P1 块重入账本。核心不变量：
+    # 场景 B：cap=12 真超（总量 25 > 12）→ P1 层全量折 P1（无位置门槛，P0 不受影响）
+    # → 折存根后 token 仍超（P0 挡住 + 总量仍超）→ seal 保底全清（P0 同清）→
+    # 新 P1 块重入账本。核心不变量：
     # **P0 永不被 P1 层单独保留/单独裁掉**（P0 消失只可能来自 seal 全清，
     # 绝不"P1 层裁 P0 留 P1"或"P1 层裁 P1 留 P0"）。
     lg_b = CompactLedger(_base + "/b.json", max_tokens=12, max_entries=6)
@@ -696,14 +744,14 @@ def test_p0_candidate_survives_p1_cap_trim(tmp_path):
         assert _p0_block in p0_b[0]["text"], "场景 B：P0 candidate text 保持原文"
         assert all(not x.get("trimmable") for x in p0_b), \
             "场景 B：P0 块全非可裁（P1 可裁层永不误伤 P0）"
-    assert lg_b.seals >= 1, "场景 B（P0 挡 front-only P1 层）seal 保底触发（P0/P1 同清）"
+    assert lg_b.seals >= 1, "场景 B（P1 层全量折 P1 后 token 仍超，P0 挡住）seal 保底全清（P0/P1 同清）"
 
 
 def test_p1_only_ledger_cap_trims_p1_not_p0(tmp_path):
     """纯 P1 账本封顶 + P1 层折存根裁的实压断言（R5 语义 X：折存根不硬删，真治编号空洞；
     既有"裁后条目数减少"断言同步更新为"trimmed 存根在场 + entry 常驻"）：
-    P1-only 账本（全 trimmable=True）条数帽超限时 P1 层折 trimmed 存根（front-only，
-    最旧端连折），P0（若在场 trimmable=False）永不被 P1 层误伤。
+    P1-only 账本（全 trimmable=True）条数帽超限时 P1 层**全量折所有 P1 块存根（无位置
+    门槛，非 front-only）**，P0（若在场 trimmable=False）永不被 P1 层误伤。
 
     语义 X 关键不变量（owner 裁定）：被裁 P1 块 entry 常驻 `entries`（trimmed=True，
     编号零空洞），封帽改数全文块数（`_full_block_count`）→ 折存根真腾帽位、seal 不
@@ -739,8 +787,9 @@ def test_p1_only_ledger_cap_trims_p1_not_p0(tmp_path):
 
 def test_p1_trim_layer_real_pressure_seal_fallback(tmp_path):
     """engine e2e 实压面（与 test_p1_only_ledger_cap_trims_p1_not_p0 的单元面对偶）：
-    P1 段跨轮累积在 store → P1 块 token 单调增长 → 超帽时 P1 层/front-only 可裁前缀
-    可能 no-op（最旧端被 P0 挡或 P1 块自身超 cap），seal 保底兜底。断言可观测面：
+    P1 段跨轮累积在 store → P1 块 token 单调增长 → 超帽时 P1 层**全量折所有 trimmable
+    块（无位置门槛）**——若折存根后总量仍超（P0 挡住或 P1 块自身超 cap）→ seal 保底兜底。
+    断言可观测面：
     封顶后 P1 块数净减（P1 内容被清，机制=P1 层或 seal 均可），且 P0 块（若有）
     不被 P1 层选择性误伤（seal 全清或 P0 同在，绝不"P1 在 P0 单独被裁"）。"""
     e = _mk(tmp_path, compact_ledger_max_tokens=25, compact_ledger_max_entries=6)
