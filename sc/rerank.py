@@ -40,7 +40,19 @@ K_RERANK = 3
 CANDIDATE_CHARS = 512
 
 # gate② 显式搜索关键词（query 小写后子串匹配；CJK 关键词不受 lower 影响）
-EXPLICIT_SEARCH_KEYWORDS = ("搜一下", "搜下", "search")
+# R2-v2（2026-10-10 · 语言无关化）：搜索意图词多语化（中/英/日/韩/德/西/法/俄），
+# 词表小且可追加——避免单语言（原仅"搜一下/搜下/search"）下其他语言的显式搜索
+# 意图漏触发 gate② → LLM 重排面不补 → 弱相关面漏兜。子串匹配对 CJK 无大小写问题。
+EXPLICIT_SEARCH_KEYWORDS = (
+    "搜一下", "搜下", "搜索",                       # 中
+    "search", "look up", "lookup",                  # 英
+    "検索", "検索して",                             # 日
+    "검색", "찾아",                                 # 韩
+    "suche", "durchsuche", "durchsuchen",          # 德
+    "buscar", "búsqueda",                            # 西
+    "recherche",                                    # 法
+    "поиск", "поиски",                              # 俄
+)
 
 
 def _query_digest(query: str) -> str:
@@ -100,10 +112,57 @@ def _rerank_prompt(query: str, hits: list) -> str:
     return "\n".join(lines)
 
 
+def _balanced_json_candidates(t: str) -> list:
+    """括号平衡法：从 t 里依次提取所有「首个 { 起、配平 } 结束」的候选片段。
+
+    正确处理字符串内的 { } 和转义引号，避免贪婪正则 \\{.*\\} 误抓散文里自带的
+    片段。提取失败/截断（配不平）返回空 list —— 调用方 json.loads 自然走 fail-safe。
+    """
+    out = []
+    i = 0
+    n = len(t)
+    while i < n:
+        if t[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escaped = False
+        j = i
+        while j < n:
+            ch = t[j]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        out.append(t[i:j + 1])
+                        i = j + 1
+                        break
+            j += 1
+        else:
+            break  # 配不平（截断）：剩余部分不作为候选
+    return out
+
+
 def parse_rerank_response(text: str, valid_ids: list) -> "list[str] | None":
     """LLM 响应 → 重排 id 列表（top-k 的**严格全排列**）；失败 → None（fail-safe）。
 
     容忍裸 JSON 对象 {"order": […]} / 裸数组 / code fence 包裹；
+    思考模型（reasoning 模型）实证失败面（2026-10-10 devops 日志 sc.rerank not parseable）：
+    content 前缀带 \\n\\n + fence + 索引数字（"0","1","2"）代替完整 segment_id——
+    提取层额外塞「整数索引面」：order 元素若是 0..k-1 的无重复整数/整数字符串，
+    按 prompt 里候选的顺序映射回 valid_ids（与全排列校验同强度：不重不缺不多）。
     多对象 / 纯文本 / 缺 id / 重复 id / 多 id / 空响应 → None（调用方原样返回入参 hits）。
     """
     if not text or not str(text).strip():
@@ -116,6 +175,10 @@ def parse_rerank_response(text: str, valid_ids: list) -> "list[str] | None":
     m = re.search(r"\{.*\}", t, re.DOTALL)
     if m:
         candidates.insert(1, m.group(0))
+    # thinking/散文前缀混入（reasoning 被并进 message.content，可能自带 { } 和 " 字符串），
+    # 贪婪正则 \{.*\} 会误抓散文里第一个 { 起的片段 → 额外用括号平衡法从首个 { 提取
+    # 第一个「平衡」JSON 对象，作为独立候选（json.loads 失败则走原 fail-safe，语义不变）
+    candidates.extend(_balanced_json_candidates(t))
     for c in candidates:
         try:
             d = json.loads(c)
@@ -128,11 +191,26 @@ def parse_rerank_response(text: str, valid_ids: list) -> "list[str] | None":
         if isinstance(d, list) and all(isinstance(x, str) for x in d):
             if sorted(d) == sorted(valid_ids):   # 严格全排列：不缺、不重、不多
                 return d
+        # 索引面：思考模型（实证 9/10 翻车）回 ["0","2","1"] 或 [2,0,1]（候选序号）
+        if isinstance(d, list) and 0 < len(d) == len(valid_ids):
+            idx = []
+            ok = True
+            for x in d:
+                if isinstance(x, int) and not isinstance(x, bool):
+                    idx.append(x)
+                elif isinstance(x, str) and x.isdigit():
+                    idx.append(int(x))
+                else:
+                    ok = False
+                    break
+            if ok and sorted(idx) == list(range(len(valid_ids))):
+                return [valid_ids[i] for i in idx]
     return None
 
 
 def rerank_hits(hits, query, llm_endpoint, *, cache, window_version,
-                gate: "RerankGate | None" = None) -> list:
+                gate: "RerankGate | None" = None,
+                drop_model_on_gate: bool = True) -> list:
     """P3 两步 rerank（gate 三选一 + 缓存键 + fail-safe；P1 打分核零动）。
 
     1. gate（纯函数）：不触发 → 原样返回（零 LLM 调用）；
@@ -141,6 +219,12 @@ def rerank_hits(hits, query, llm_endpoint, *, cache, window_version,
        生产 = 宿主主模型端点 aux 路由模式，测试 = FakeEndpoint）；
        LLM 不可用 / 超时 / 解析失败 → step2 **原样返回入参 hits（不降级不炸）**，留痕 log。
 
+    R4（2026-10-10 · 缺口 B）：gate 触发时（弱相关/空召回/显式搜索，= 不确定性高面）
+    对 `provenance=="model"` 的 hit 段默认 drop（不进 top-k 候选、不写缓存、不进返回集），
+    而非 keep-all——agent 自述段（P0 model）在不确定召回面里不该冒充用户级 P0 被 LLM
+    重新排序保留。`drop_model_on_gate=False` 回滚为原 keep-all 现状（零变化 fail-safe）。
+    确定性：drop 判定纯函数（只读 hit.seg.provenance 字段，零 LLM / 零 wall-clock）。
+
     确定性：gate 判定纯函数；缓存键纯函数；LLM 重排只在 gate 触发 + 缓存 miss 时发生。
     """
     gate = gate if gate is not None else RerankGate()
@@ -148,6 +232,17 @@ def rerank_hits(hits, query, llm_endpoint, *, cache, window_version,
         return hits
     if not hits:                                  # 召回空且无候选可排：无事可做（不发起 LLM）
         return hits
+    # R4：gate 触发（不确定性高面）→ 默认 drop model-provenance 段（agent 自述，非用户拍板）。
+    # user-provenance 段（真用户 P0/P1）全保留。drop_model_on_gate=False → 不 drop（原 keep-all）。
+    if drop_model_on_gate:
+        _dropped = [h for h in hits if getattr(h.seg, "provenance", "") == "model"]
+        if _dropped:
+            logger.info("supercompress: rerank gate fired → drop %d model-provenance "
+                        "hit(s) (R4: agent self-report segments not kept on uncertain recall)",
+                        len(_dropped))
+        hits = [h for h in hits if getattr(h.seg, "provenance", "") != "model"]
+        if not hits:                              # 全 drop 后空召回 → 无事可做（不发起 LLM）
+            return hits
 
     key = rerank_cache_key(query, window_version)
     cached = cache.get(key) if cache is not None else None

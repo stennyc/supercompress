@@ -13,7 +13,10 @@ class TestBlock4_Aux:
     def test_tagging_scoring_uses_configured_main_endpoint(self, aux):
         ep = aux.main_endpoint
         tagger = Tagger(aux, TOPIC)
-        tier, structural, regime, reason = tagger.classify("the module depends on A and B", "model")
+        # 4a 数字代号：classify 返回值长度可变（user/fail-safe 面 4 元组，LLM 成功面 5 元组）
+        # ——下标读前 4，与生产消费方（_make_segment/_model_tier_one）同口径，消拆包地雷
+        _res = tagger.classify("the module depends on A and B", "model")
+        tier, structural, regime, reason = _res[:4]
         assert any(c[0] == "tagging" for c in ep.calls), "直调用户已配主模型端点（零新 provider）"
         assert tier in ("P0", "P1", "P2")
         assert aux.fallback_endpoint is ep, "(A) 失败域与主模型同源，无第二 provider"
@@ -176,11 +179,20 @@ class TestBlock4_Aux:
         text = "plain statement about module X"
         ep = aux.main_endpoint
         ep.responses["tagging"] = json.dumps({"tier": "P2", "score": 3})
-        tier, _, _, _ = tagger.classify(text, "model")
+        _res = tagger.classify(text, "model")
+        tier = _res[0]
         assert tier == "P2"
         ep.responses["tagging"] = json.dumps({"tier": "P2", "score": 6})
-        tier, _, _, _ = tagger.classify("another plain statement Y", "model")
+        _res = tagger.classify("another plain statement Y", "model")
+        tier = _res[0]
         assert tier == "P1", "边界 ±1（6–8）→ P1 保守"
+        # 4a 数字代号：LLM tagging 面可顺带打定案信号码（settled_signal 0/1/2）
+        ep.responses["tagging"] = json.dumps({"tier": "P0", "score": 5, "settled_signal": 2})
+        _res = tagger.classify("定案收尾叙述", "model")
+        assert _res[0] == "P0" and _res[4] == 2, "LLM 打 settled_signal=2 → 第 5 位返回码"
         ep.responses["tagging"] = "I think this is P2 with score 3"  # 自然语言 → 不可机器解析
+        # fail-safe 面（non-JSON → transient_fail 保守 P0）恒 4 元组（tagger.py:87 无第 5 位）：
+        # 整解包 = 4 元组长度钉（若误吐 5 位即 ValueError 崩掉 = 契约违例检测）；与 L18-19
+        # 的下标读不对称但语义可辩护（此处专钉 fail-safe 面 4 元组契约，非 4a 打码面）。
         tier, structural, regime, reason = tagger.classify("one more statement Z", "model")
         assert tier == "P0" and structural, "不可解析 → 保守 P0，永不当 P2 丢"

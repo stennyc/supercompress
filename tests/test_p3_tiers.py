@@ -99,9 +99,10 @@ class TestFillPrune_EngineGate:
         for i in range(4):
             mkseg(e.store, f"p1 filler {i} MARKFILL{i} " + "x" * 4000, "P1")
         e.store.flush()   # P1 pending → durable，才进 _window_fresh 回放窗口（否则空块=假绿）
-        block = "\n".join(m["content"] for m in
-                          e.compress([{"role": "user", "content": "继续"}])
-                          if m["role"] == "system")
+        # S1 尾投递面（Plan C Phase 1）：staged 块并入末条 user 消息（不再独立 role=system）
+        out = e.compress([{"role": "user", "content": "继续"}])
+        block = "\n".join(str(m.get("content", "")) for m in out
+                          if "[supercompress] staged" in str(m.get("content", "")))
         assert "staged P0/P1 segments" in block, "前置：P1 真在注入池（非空块）"
         assert "MARKFILL" in block, "撤档：高压不再剪 P1（30% 档已撤，全文保留）"
 

@@ -15,12 +15,14 @@
 - semantic 边界宿主 LLM 语义扩展（drift 边界一次 LLM：扩词+精排+锚点，per-epoch 缓存+冷却回退）← P4
 """
 
+from .compact_ledger import CompactLedger, compact_ledger_path_for_jsonl
 from .schema import Segment, nfc_hash, est_tokens
 from .store import JsonlStore, StoreError
 from .budgets import usable_tokens, pull_budget, push_cap
 from .aux_provider import AuxProvider, marker_enabled
 from .distill import Window, WindowSeg, Distiller, DistillResult, Anchor
 from .inject import choose_forms, render_block, block_tokens
+from .inject import DEFAULT_L3_MAX_TOKENS, DEFAULT_DETAIL_BUDGET, DEFAULT_INDEX_BUDGET
 from .drift import DriftTracker
 from .rerank import RerankGate, rerank_hits, rerank_cache_key, parse_rerank_response, RERANK_TASK
 from .semantic import BoundaryExpander, BoundaryResult, parse_boundary_response, BOUNDARY_TASK
@@ -28,11 +30,14 @@ from .live_endpoint import LiveEndpoint, resolve_live_endpoint
 
 __all__ = [
     "Segment", "nfc_hash", "est_tokens",
+    "CompactLedger", "compact_ledger_path_for_jsonl",
     "JsonlStore", "StoreError",
     "usable_tokens", "pull_budget", "push_cap",
     "AuxProvider", "marker_enabled",
     "Window", "WindowSeg", "Distiller", "DistillResult", "Anchor",
     "choose_forms", "render_block", "block_tokens",
+    # fix-3 t_5bcb33f2：config 注入面（宿主 config 经此参面覆盖 cap/detail_budget，禁裸读 env）
+    "DEFAULT_L3_MAX_TOKENS", "DEFAULT_DETAIL_BUDGET", "DEFAULT_INDEX_BUDGET",
     "DriftTracker",
     "RerankGate", "rerank_hits", "rerank_cache_key", "parse_rerank_response", "RERANK_TASK",
     "BoundaryExpander", "BoundaryResult", "parse_boundary_response", "BOUNDARY_TASK",

@@ -21,8 +21,12 @@ from sc.rerank import (
 from fakes import FakeEndpoint
 
 
-def _mkseg(text, tier="P1", seq=0):
-    return Segment(tier=tier, provenance="model", original_text=text, seq=seq, ts=0.0)
+def _mkseg(text, tier="P1", seq=0, prov="user"):
+    # R3/R4 配套（2026-10-10）：默认 provenance 由 "model" 改 "user"——rerank/重排机制
+    # 单测测的是 LLM 重排+缓存+fail-safe（对 user 真拍板段），不应被 R4 gate-drop-model
+    # 行为短路（那会让这些机制测试恒返回空、失去覆盖）。R4 的 model-drop 行为由
+    # TestRerankDropModelOnGate 专属类钉死（prov 显式 "model"）。prov 参数保留（可测 model 面）。
+    return Segment(tier=tier, provenance=prov, original_text=text, seq=seq, ts=0.0)
 
 
 def _hits(scores, n=3):
@@ -185,6 +189,69 @@ class TestRerankJsonParse:
             "```json\n" + json.dumps({"order": ids}) + "\n```", ids)
         assert out == ids
 
+    def test_thinking_prose_prefix_rescued(self):
+        """reasoning/thinking 散文前缀夹带 JSON（reasoning 内容被并进 message.content）
+        → 括号平衡法提取首个完整 JSON 对象，仍能解析出正确 order（此前为 None）。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        json_part = json.dumps({"order": ids})
+        # 散文前缀里带自己的 " 和 { }，考验括号平衡法是否正确跳过字符串内的花括号
+        prose = ('Let me think carefully. The user asks about {"note": "x}y"}, '
+                 'so I reason through it step by step before answering:')
+        out = parse_rerank_response(prose + " " + json_part, ids)
+        assert out == ids
+
+    def test_thinking_prose_prefix_no_truncation_still_rejects_bad_json(self):
+        """散文前缀 + 合法 JSON 但缺 id（校验语义不变）→ 仍 None。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        bad = json.dumps({"order": ids[:2]})   # 缺 1 个 id
+        out = parse_rerank_response("Some prose first. " + bad, ids)
+        assert out is None
+
+    # ── 思考模型（reasoning 模型）实证失败面（2026-10-10 devops 日志 sc.rerank not parseable）──
+    def test_index_order_str_accepted_maps_to_ids(self):
+        """思考模型 9/10 翻车模式：候选序号 ["0","2","1"]（字符串数字）代替完整 id →
+        按 prompt 候选顺序映射回 ids（与全排列校验同强度）。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        out = parse_rerank_response('\n\n{"order": ["0", "2", "1"]}', ids)
+        assert out == [ids[0], ids[2], ids[1]]
+
+    def test_index_order_ints_accepted(self):
+        """整数形式 [2, 0, 1] 同映射（LLM 偶尔吐 int 不吐字符串）。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        out = parse_rerank_response('```json\n{"order": [2, 0, 1]}\n```', ids)
+        assert out == [ids[2], ids[0], ids[1]]
+
+    def test_index_order_out_of_range_rejected(self):
+        """索引越界（"3" ∉ 0..k-1）→ 非 0..k-1 全排列 → 仍 None（校验不放宽）。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        assert parse_rerank_response(json.dumps({"order": ["0", "1", "3"]}), ids) is None
+
+    def test_index_order_duplicate_rejected(self):
+        """索引重复（"0","0","2"）→ 非 0..k-1 全排列 → 仍 None。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        assert parse_rerank_response(json.dumps({"order": ["0", "0", "2"]}), ids) is None
+
+    def test_index_order_wrong_length_rejected(self):
+        """索引个数 ≠ 候选数（2 个索引对 3 候选）→ 仍 None。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        assert parse_rerank_response(json.dumps({"order": ["0", "1"]}), ids) is None
+
+    def test_id_full_permutation_wins_over_index_face(self):
+        """同一响应里若已有严格全排列（真 id），先命中 id 面——索引面不抢道。"""
+        a, b, c = _hits([0.1, 0.2, 0.3])
+        ids = [h.seg.segment_id for h in (a, b, c)]
+        out = parse_rerank_response(
+            "First I list indices [0, 2, 1], then the real answer: "
+            + json.dumps({"order": [ids[1], ids[0], ids[2]]}), ids)
+        assert out == [ids[1], ids[0], ids[2]], "id 全排列优先于索引面"
+
 
 # ───────────────────────── 确定性 ─────────────────────────
 
@@ -220,7 +287,7 @@ class TestSelectContextRerankWiring:
     @pytest.fixture()
     def engine(self, tmp_path):
         from engine import SupercompressContextEngine
-        e = SupercompressContextEngine(external_store_path=str(tmp_path))
+        e = SupercompressContextEngine(external_store_path=str(tmp_path), auto_recall=True)
         e._aux.main_endpoint = FakeEndpoint()
         return e
 
@@ -235,12 +302,12 @@ class TestSelectContextRerankWiring:
         return segs
 
     def _recalled_texts(self, out):
-        """召回块 body（去 [supercompress recall] 标记行）→ recalled 段序。
+        """召回块 body（去 [supercompress recall] 标记）→ recalled 段序。
 
-        engine 构造 = "[supercompress recall]\\n" + "\\n\\n".join(recalled)，故去掉标记后
-        剩 "\\n<seg0>\\n\\n<seg1>…"，strip 后按 \\n\\n 切即得段序。"""
-        block = [m for m in out if m.get("content", "").startswith("[supercompress recall]")][0]
-        body = block["content"].split("[supercompress recall]", 1)[1]
+        S1 尾投递面（Plan C Phase 1）：召回块并入末条 user 消息（不再独立 role=system），
+        取含标记的消息，去标记后按 \\n\\n 切即得段序。段序含 P0 垫底（P0 段被 P1 背景让位到块尾）。"""
+        block = [m for m in out if "[supercompress recall]" in str(m.get("content", ""))][0]
+        body = str(block["content"]).split("[supercompress recall]", 1)[1]
         return [t for t in body.strip().split("\n\n") if t]
 
     def test_explicit_search_triggers_llm_rerank_and_cache(self, engine):
@@ -255,8 +322,10 @@ class TestSelectContextRerankWiring:
             [{"role": "user", "content": "x"}], incoming_message=q)
         assert out is not None, "召回非空应产出替换请求"
         texts = self._recalled_texts(out)
-        assert texts and texts[0].startswith("网关限流阈值调至"), \
-            "LLM 重排可见：P0 段被提到召回块首位（P1 段让位 = P1 管线原序被打破）"
+        assert texts and texts[-1].startswith("网关限流阈值调至"), \
+            "P0 垫底（Plan C Phase 1）：被召回 P0 段被 P1 背景让位到块尾（全请求最后字节=recency 最强位）"
+        assert texts[0].startswith("部署发布版本"), \
+            "P1 背景段在 P0 之前（块内排序 背景 P1/P2/Pn → P0 垫底）"
         assert engine._rerank_cache, "LLM 成功重排后缓存非空"
         assert len(engine._aux.main_endpoint.calls) == 1, "gate 触发 + 缓存 miss → LLM 恰 1 次"
         assert len(engine._rerank_cache) == 1
@@ -332,3 +401,112 @@ class TestRerankGate3Point0Default:
         gate = RerankGate(low_score_threshold=3.0)
         assert gate.should_fire(_hits([3.0, 2.5, 1.0]), "边界") is False, \
             "top1=3.0 不 < 3.0 → gate① 不触发（等号归 ≥ 面）"
+
+
+class TestCallLlmEndpointThinkingModel:
+    """思考模型（enable_thinking 未关 / aux 通道未继承 custom_providers.extra_body）
+    响应面：思维链走 message.reasoning_content，正文在 content。
+    宿主 aux 端点（_CallLlmEndpoint）只取 content：
+    - content 非空 → 正常返回（思维链留在 reasoning_content，下游 parse 不受影响）；
+    - content 空 + reasoning 非空 → 返回 content（空串，下游 parse fail-safe 原样返回），
+      并打 WARNING 诊断日志（2026-10-10 devops 日志 sc.rerank not parseable 的根因面）；
+    绝不把 reasoning_content 并进 content（思考内容不是答案，不能冒充正文）。
+    """
+
+    def _endpoint(self, call_llm):
+        from engine import _CallLlmEndpoint
+        return _CallLlmEndpoint(call_llm, {"model": "m", "provider": "custom",
+                                           "base_url": "", "api_key": "", "api_mode": ""})
+
+    def test_namespace_response_uses_content_ignores_reasoning(self):
+        class _Msg:
+            content = '{"order": ["a", "b"]}'
+            reasoning_content = "thinking..."
+        class _Ch:
+            message = _Msg()
+        class _Resp:
+            choices = [_Ch()]
+        ep = self._endpoint(lambda **kw: _Resp())
+        out = ep.call("auxiliary.supercompress_rerank", "prompt")
+        assert out == '{"order": ["a", "b"]}', "namespace 面只取 content（reasoning 不并入）"
+
+    def test_dict_response_empty_content_nonempty_reasoning_returns_empty(self):
+        """思考模型 content 空 / reasoning 非空 → 返回空串（下游 fail-safe），不抛、不合并。"""
+        resp = {"choices": [{"message": {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I think the order is seg_a, seg_b, seg_c...",
+        }}]}
+        ep = self._endpoint(lambda **kw: resp)
+        out = ep.call("auxiliary.supercompress_rerank", "prompt")
+        assert out == "", "content 空 → 返回空串（rerank 解析层 fail-safe 原样返回入参 hits）"
+
+    def test_dict_response_content_present_returns_content(self):
+        resp = {"choices": [{"message": {
+            "role": "assistant",
+            "content": '{"order": ["seg_a", "seg_b"]}',
+            "reasoning_content": "thinking...",
+        }}]}
+        ep = self._endpoint(lambda **kw: resp)
+        out = ep.call("auxiliary.supercompress_rerank", "prompt")
+        assert out == '{"order": ["seg_a", "seg_b"]}'
+
+
+# ─────────────────── R4（2026-10-10）：gate 触发时默认 drop model-provenance 段 ─────────────────
+class TestRerankDropModelOnGate:
+    """R4：rerank gate 触发（弱/空/显式搜索 = 不确定性高面）时，provenance="model" 的
+    hit 段默认 drop（不进 top-k / 不写缓存 / 不进返回集）——agent 自述段不该在不确定
+    召回面冒充用户级 P0 被 LLM 重排保留。user-provenance 段全保留。
+    drop_model_on_gate=False → 回滚原 keep-all 现状。"""
+
+    def test_gate_fired_drops_model_keeps_user(self):
+        """gate 触发（显式搜索词）+ 混合 provenance → model 段被 drop、user 段保留。"""
+        from sc.recall import Hit, Segment
+        m1 = Hit(Segment(tier="P0", provenance="model", original_text="agent self report",
+                         seq=0, ts=0.0), 5.0)
+        u1 = Hit(Segment(tier="P0", provenance="user", original_text="user directive",
+                         seq=1, ts=0.0), 4.0)
+        ep = FakeEndpoint()
+        out = rerank_hits([m1, u1], "搜一下 部署", ep, cache={}, window_version=1)
+        assert [h.seg.segment_id for h in out] == [u1.seg.segment_id], \
+            "gate 触发后 model 段 drop、user 段保留（只剩 user P0）"
+
+    def test_gate_fired_all_model_returns_empty(self):
+        """gate 触发 + 全 model 段 → 全 drop 后空召回（不发起 LLM、不炸）。"""
+        from sc.recall import Hit, Segment
+        hits = [Hit(Segment(tier="P1", provenance="model", original_text=f"agent {i}",
+                            seq=i, ts=0.0), float(i + 1)) for i in range(3)]
+        ep = FakeEndpoint()
+        out = rerank_hits(hits, "搜一下", ep, cache={}, window_version=1)
+        assert out == [], "全 model 段 gate 触发 → 全 drop → 空返回"
+        assert len(ep.calls) == 0, "全 drop 后空召回 → 不发起 LLM 调用"
+
+    def test_gate_not_fired_no_drop(self):
+        """gate 不触发（非搜索词 + 高分）→ 不 drop（原样返回，R4 只在 gate 面生效）。"""
+        from sc.recall import Hit, Segment
+        m1 = Hit(Segment(tier="P1", provenance="model", original_text="agent x",
+                         seq=0, ts=0.0), 9.0)
+        m2 = Hit(Segment(tier="P1", provenance="model", original_text="agent y",
+                         seq=1, ts=0.0), 8.0)
+        ep = FakeEndpoint()
+        # 非搜索词 + top1=9.0 ≥ 默认阈值 → gate 不触发 → 不 drop、零 LLM
+        out = rerank_hits([m1, m2], "网关 限流 阈值", ep, cache={}, window_version=1)
+        assert [h.seg.segment_id for h in out] == [h.seg.segment_id for h in [m1, m2]], \
+            "gate 不触发 → R4 不生效（原样保留 model 段）"
+        assert len(ep.calls) == 0
+
+    def test_rollback_flag_restores_keep_all(self):
+        """drop_model_on_gate=False → 回滚原 keep-all 现状（model 段不 drop）。"""
+        from sc.recall import Hit, Segment
+        m1 = Hit(Segment(tier="P0", provenance="model", original_text="agent self report",
+                         seq=0, ts=0.0), 5.0)
+        u1 = Hit(Segment(tier="P0", provenance="user", original_text="user directive",
+                         seq=1, ts=0.0), 4.0)
+        ep = FakeEndpoint()
+        ep.responses[RERANK_TASK] = json.dumps(
+            {"order": [u1.seg.segment_id, m1.seg.segment_id]})
+        out = rerank_hits([m1, u1], "搜一下 部署", ep, cache={}, window_version=1,
+                          drop_model_on_gate=False)
+        assert {h.seg.segment_id for h in out} == \
+               {m1.seg.segment_id, u1.seg.segment_id}, \
+            "drop_model_on_gate=False → model 段保留（keep-all 现状）"

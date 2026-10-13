@@ -108,6 +108,29 @@ class TestUnion_SeqTiebreak_DisplayOrder:
         # seq 值零 mutation：同号段仍在渲染面（tiebreak 定序，非去重）
         assert sorted(ws.segment.seq for ws, _, _ in r1) == [3, 3]
 
+    def test_no_seq_mutation(self):
+        """零 mutation 验收（fix-1 红线 · 渲染选择面）：choose_forms 选档/渲染
+        全链路不改数据面——同 seq 段（main+model 各 seq=3，不同 hash 前缀）
+        渲染后 seq 值原样（双 3 全在渲染面，非去重/非重编号）、
+        段身份（segment_id = content_hash[:16]-seq，schema.py:80 同形）
+        逐段不变（渲染出的段 = 输入段，seq/segment_id/content_hash 原样）。"""
+        m3a = _seg("我认为有可能是 cli 属于 one-shot 方式", "P0", 3, "user", "5a2162eb3968e83a")
+        m3b = _seg("层 1 已经查清楚了。层 2 查询里", "P0", 3, "model", "851d05ca5d1b630e")
+        w1 = _union_window([m3a], [m3b])
+        r1 = choose_forms(list(w1.segs), w1)
+        # seq 多集原样：两个 seq=3 段都在渲染面（零重编号、零去重）
+        assert sorted(ws.segment.seq for ws, _, _ in r1) == [3, 3]
+        # 逐段身份不变：渲染出的段 = 输入段（seq/segment_id/content_hash 原样）
+        out_ids = {ws.segment.segment_id for ws, _, _ in r1}
+        assert out_ids == {m3a.segment_id, m3b.segment_id}, \
+            f"渲染段身份漂移（段被改/增/减）：{out_ids}"
+        for ws, _, _ in r1:
+            for src in (m3a, m3b):
+                if ws.segment.segment_id == src.segment_id:
+                    assert ws.segment.seq == 3, "渲染面 seq 被改动（零 mutation 破坏）"
+                    assert ws.segment.content_hash == src.content_hash, \
+                        "渲染面 content_hash 被改动（零 mutation 破坏）"
+
     def test_display_order_full_total_order_stable(self):
         """GREEN 全序断言（修复前必红）：跨 5 段混合（2 组同 seq 对 + 1 唯一
         seq）→ 展示序 = (seq, content_hash[:16]) 升序逐位钉死（合法全序，同
@@ -160,6 +183,35 @@ class TestUnion_SeqTiebreak_RankKey:
 
 
 class TestUnion_SeqTiebreak_ReplayStable:
+    def test_no_seq_mutation(self):
+        """零 mutation 验收（fix-1 红线，同 union 场景）：tiebreak 是纯排序键扩展，
+        全链路不改数据面——replay 前后 seq 值原样（多集保留，非重编号/非去重）、
+        seq↔segment_id↔content_hash 映射逐段不变（段身份 content_hash[:16]-seq，
+        schema.py:80 同形）、_next_seq 按 store.py:200 语义重算 max+1（非本 fix 改动面）。
+        双 0-based 计数器 union 形态（各 2 段，seq 0/1 全撞），零活体 store 触碰。"""
+        d1, d2 = tempfile.mkdtemp(), tempfile.mkdtemp()
+        main_a = "网关限流阈值调至每秒五百请求并配置告警"
+        main_b = "部署发布版本四十二到生产环境保留回滚入口"
+        model_a = "层 1 已经查清楚了 层 2 查询叙述面"
+        model_b = "aux degraded 单事件自愈观测"
+        s_main = _mk_store(d1, [(0, "P0", "user", main_a), (0, "P1", "user", main_b)])
+        s_model = _mk_store(d2, [(0, "P0", "model", model_a), (0, "P1", "model", model_b)])
+        # replay 前后多集 + 逐段身份不变（replay 不重编号）
+        for s in (s_main, s_model):
+            disk_seqs = sorted(seg.seq for seg in s.by_hash.values())
+            replayed = s.replay()
+            assert sorted(seg.seq for seg in replayed) == disk_seqs, "replay 重编号（零 mutation 破坏）"
+            ids_by_hash = {seg.content_hash: (seg.seq, seg.segment_id) for seg in s.by_hash.values()}
+            for seg in replayed:
+                assert (seg.seq, seg.segment_id) == ids_by_hash[seg.content_hash], \
+                    "replay 改了段身份映射（seq/segment_id/content_hash 任一漂移）"
+        # _next_seq = max+1 重算（store.py:200 语义，非本 fix 改动面）
+        assert s_main._next_seq == 1 and s_model._next_seq == 1
+        # union 渲染面：seq 多集原样（双 store 各 seq=0 段全在渲染面，非去重）
+        w = _union_window(s_main.replay(), s_model.replay())
+        r = choose_forms(list(w.segs), w)
+        assert sorted(ws.segment.seq for ws, _, _ in r) == [0, 0, 0, 0]
+
     def test_two_replay_passes_deterministic(self):
         """GREEN 跨 replay 稳定性 + RED 触发面（recon 双 0-based 计数器形态）：
         两个独立 JsonlStore（主 + model 旁路）各 2 段（seq 0/1 双空间全撞，

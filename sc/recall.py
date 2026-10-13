@@ -109,7 +109,14 @@ class Recaller:
     # P1 定稿参数（plan P1.2）：BM25 k1/b + 相关性增强因子。
     BM25_K1 = 1.2
     BM25_B = 0.75
-    P0_BOOST = 1.5          # 同相关度 P0 优先（保 test_bm25_top3_p0_boost）
+    P0_BOOST = 1.5          # user P0 同相关度优先（保 test_bm25_top3_p0_boost）
+    # R3（2026-10-10 · 缺口 D）：P0 boost 按 provenance 分叉——
+    # user P0（用户拍板/指令）= P0_BOOST=1.5（不变）；
+    # model P0（agent 自述，provenance="model"）= MODEL_P0_BOOST=1.0（不享用户级加权，
+    # 压到"用户 P0 之下、普通 P1 之上"中间带：真有用的 agent 实证段强相关仍可召，
+    # 但不再拿 1.5 加权冒充用户拍板）。分叉轴 = 谁说的（user vs model），零模型名依赖
+    # （supercompress 早自适应任意 model，此处只按 provenance 段来源分叉，不碰 model_version）。
+    MODEL_P0_BOOST = 1.0
     STALE_DECAY = 0.5      # stale P1 召回降权（保 test_stale_p1_downweighted）
     # extended-BM25 精度基座（P1 三招，纯字面系数、确定性）：
     EXACT_MATCH_BOOST = 2.0   # 招①：标识符型 term（路径/点分标识符）命中 → 该 term 贡献 ×2
@@ -226,7 +233,15 @@ class Recaller:
                     f = pt[t]
                     base += em * idf_path(t) * (f * (k1 + 1)) / (f + k1 * norm)
             if seg.tier == "P0":
-                base *= self.P0_BOOST
+                # R3（2026-10-10 · 缺口 D）：P0 boost 按 provenance 分叉——
+                # user P0（用户拍板/指令）= P0_BOOST=1.5（不变，保 test_bm25_top3_p0_boost）；
+                # model P0（agent 自述，provenance="model"）= MODEL_P0_BOOST=1.0（不享用户级
+                # 加权，避免 agent 自述段拿 1.5 冒充拍板排序到用户 P0 之上）。分叉轴 = 谁说的，
+                # 零模型名依赖（supercompress 自适应任意 model，此处只读段 provenance 字段）。
+                if getattr(seg, "provenance", "") == "model":
+                    base *= self.MODEL_P0_BOOST
+                else:
+                    base *= self.P0_BOOST
             if getattr(seg, "stale", False):
                 base *= self.STALE_DECAY
             if decay_lambda > 0.0 and n > 0:
@@ -234,7 +249,14 @@ class Recaller:
                 # max(0.0,…) 钉在 0，永不产生负乘子把无关段重排到零分段之下。
                 base *= max(0.0, 1.0 - decay_lambda * (float(n) - 1.0 - float(seg.seq)))
             scored.append((-base, tidx[seg.tier], seg.seq, seg))
-        scored.sort()                                      # 相关度 desc → 层级（P0 先）→ seq 稳定序
+        # 排序 key 法（P0 surgical）：显式 scalar key 让三要素（-base, tier, seq）全 tie 时
+        # 按第 4 位 segment_id（content_hash[:16]+seq，跨 store 唯一行级 id）定全序，杜绝
+        # 裸 Segment 比较。普通 @dataclass 无 order=True → '<' 不支 → 原裸 sort() 在 tie 面
+        # 抛 TypeError → engine.py:1163-1164 select_context fail-open 返回 None（22.5h+
+        # 慢性 no-op 根因；union-window 下主 store + model 旁路 seq 各自计数可碰撞同 seq）。
+        # key 第 1-3 位与原 4-tuple 前 3 位逐一相同 → top-k 相对次序零变化；仅把裸 Segment
+        # 比较换成合法全序（不碰 Segment 类定义 / P1 BM25 打分子 / _s1_tail_deliver 路径）。
+        scored.sort(key=lambda t: (t[0], t[1], t[2], t[3].segment_id))
 
         # ── 预算下权（top-k 成员按相关性定；P1 降权按时序累计，与相关性排序解耦）──
         # 旧平直 scorer 下 P1 累计恰好落在相关性序（同分→seq），BM25 换层后近同文 P1 产生

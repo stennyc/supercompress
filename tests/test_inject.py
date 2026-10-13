@@ -192,7 +192,14 @@ class TestChooseForms_Budget:
         assert block, "非空段集合 → 非空注入块"
         assert "##" not in block and "---" in block, "分隔符 = ---（段间）"
         for ws, ff, t in rendered:
-            assert f"#{ws.segment.seq}" in block, "每段以 #seq 前缀可索引"
+            # R5 批次 A #3/#5：行首 `#<rel>` = 块内相对号（1 起），全局 seq 保留在
+            # `seq=<全局seq>` 段（L1）/ `#<seq> ... [L3]`（L3 原文渲染面）——
+            # 断言可点查定位的 `seq=<全局seq>`（L1）或原文行首（L3），非相对号。
+            if ff == "L1":
+                assert f"seq={ws.segment.seq}" in block, "L1 行保留全局 seq（recall O(1) 点查面）"
+            else:
+                assert f"#{ws.segment.seq}" in block or f"seq={ws.segment.seq}" in block, \
+                    "L3/L2 行保留全局 seq（原文渲染面）"
 
 
 # ───────────────────────── engine 层接线验证 ─────────────────────────
@@ -231,16 +238,30 @@ class TestEngineCompress_StagedInjection:
         skel = mkseg(e.store, '[Group chat: "ops"] ' + "room skeleton " * 50, "P0",
                       structural=True)
         big_p1 = mkseg(e.store, "big dump " + "x" * 4000, "P1")
-        # 宿主消息面：protect_first_n=3 + [system block] + protect_last_n=6
+        # 宿主消息面：protect_first_n=3 + protect_last_n=6；S1 尾投递面（Plan C Phase 1）
+        # staged 块不再独立 role=system，而是并入末条 user 消息 content（不再是位置 2 system）
         msgs = [{"role": "user", "content": f"m{i}"} for i in range(12)]
         out = e.compress(msgs, current_tokens=200000, force=True)
-        sys_msgs = [m for m in out if m.get("role") == "system"]
-        assert len(sys_msgs) == 1, "恰一条 system 阶梯注入块"
-        content = sys_msgs[0]["content"]
-        # ① header f-string 三要素（engine.py:529-533）
-        assert "staged P0/P1 segments" in content, "header 文案"
-        assert " segs, " in content and " tok" in content, "segs 计数 + block_tokens"
-        assert "forms: {" in content, "forms 档位统计（sorted dict）"
+        assert not [m for m in out if m.get("role") == "system"], \
+            "S1：compress 不再发任何 in-list system（staged 块改投 user 面）"
+        staged = [m for m in out if "[supercompress] staged" in str(m.get("content", ""))]
+        assert len(staged) == 1, "恰一条 user 消息携带 staged 阶梯注入块（S1 尾投递并入末条）"
+        content = str(staged[0]["content"])
+        # ① header：长会话（_has_middle=True）走 compact-ledger 累计段路径（header =
+        #    "staged compact-ledger" + c#N 块），短会话走 S1 尾投递（header =
+        #    "staged P0/P1 segments" + forms 统计）。两条路都要有 staged 注入块在场。
+        #    （owner 裁定 tier 分层后：P0 定案块 + P1 可裁层，账本路径按 c#N 渲染）
+        has_s1_header = ("staged P0/P1 segments" in content)
+        has_ledger_header = ("staged compact-ledger" in content)
+        assert has_s1_header or has_ledger_header, \
+            f"staged 注入块 header 须在场（S1 或 compact-ledger），实得: {content[:120]!r}"
+        if has_s1_header:
+            # S1 尾投递面：header f-string 三要素（segs 计数 + block_tokens + forms 统计）
+            assert " segs, " in content and " tok" in content, "segs 计数 + block_tokens"
+            assert "forms: {" in content, "forms 档位统计（sorted dict）"
+        else:
+            # compact-ledger 面：c#N 累计块 + generation/seals 前缀（append-only 单调）
+            assert "c#" in content, "compact-ledger c#N 累计块在场"
         # ② structural P0 全文必在（L3 豁免细节池）
         assert "goal: ship v1" in content, "structural P0 全文在块"
         # ③ egress：room-skeleton P0 被 _skel 过滤逐出（不进块）

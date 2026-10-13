@@ -83,6 +83,29 @@ def model_marker_hit(text: str) -> bool:
 _NORM_LINE_CAP = 200         # 归一单行上限（verdict 行 ≤200 字符，截断加 ...）
 _NORM_JSON_PREFIX = "[model-json]"
 _NORM_CODE_PREFIX = "[code"
+# R5（owner 批次 A #6 · 记账面阈值）：staged 块进账本前的占位符展开阈值。
+# T1 折叠契约（_fold_code_fences）不变——任何围栏都折单行引用（治脏水、封 token）；
+# 阈值只作用在**记账面**（engine.compress 的 staged 块生成处）：块内某段是
+# [code: ×N lines] 占位符且 N < 阈值 → 该段展开原文进账本（小代码块全文比
+# 残句占位符信息量大，残句混入账本 = 诊断账本 #6 根因）；N ≥ 阈值维持
+# 占位符（大代码块全文太贵，残句够索引用）。0 = 关阈值（全占位符，旧行为）。
+MODEL_LEDGER_FENCE_EXPAND_LINES = 20
+
+
+def _is_small_code_placeholder(text: str, min_lines: int = MODEL_LEDGER_FENCE_EXPAND_LINES) -> bool:
+    """R5 #6：text 是 [code: ×N lines] 占位符且 N < min_lines → True（小占位符，
+    记账面应展开原文）。非占位符 / 大占位符（N≥阈值）/ min_lines=0 → False。
+    确定性纯 stdlib，同 T1 前缀形态识别（_NORM_CODE_PREFIX）。"""
+    t = str(text or "")
+    if not t.startswith(_NORM_CODE_PREFIX):
+        return False
+    if min_lines <= 0:
+        return False
+    import re
+    m = re.search(r"×(\d+) lines", t)
+    if not m:
+        return False
+    return int(m.group(1)) < min_lines
 
 
 def _json_scalar(v) -> str | None:
@@ -157,7 +180,12 @@ def _normalize_json_reply(text: str) -> str | None:
 
 def _fold_code_fences(text: str) -> str | None:
     """(b) ``` 围栏折叠为单行引用（保留语言标注 + 行数 + 首行截断引用），围栏内容不全文入库。
-    无围栏 / 围栏不配对（奇数个 ``` marker）→ None（fail-open 原文）。"""
+    无围栏 / 围栏不配对（奇数个 ``` marker）→ None（fail-open 原文）。
+
+    R5 修订（owner 批次 A #6 · 零回归裁定）：**T1 折叠契约不变**——任何配对的
+    ``` 围栏（1 行起）都折单行引用，既有 7 条 normalize 测试锁死的「小围栏也折」
+    语义原样保留。小 N 占位符混入账本的治理改在**记账面**（CompactLedger 渲染
+    层对 [code: ×N lines] 占位符的记账/展示），不动本函数行为。"""
     lines = (text or "").splitlines()
     markers = [i for i, ln in enumerate(lines) if ln.lstrip().startswith("```")]
     if not markers:

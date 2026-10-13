@@ -299,7 +299,8 @@ def test_anchor_evidence_audit_face():
 def _mkengine(tmp_path: Path) -> SupercompressContextEngine:
     """独立隔离 engine（external_store_path → tmp_path；不碰全局 active.jsonl）。"""
     return SupercompressContextEngine(context_length=256000,
-                                      external_store_path=str(tmp_path))
+                                      external_store_path=str(tmp_path),
+                                      auto_recall=True)
 
 
 def test_engine_on_turn_complete_tags_user_epoch(tmp_path):
@@ -333,12 +334,14 @@ def test_engine_select_context_soft_downweights_old_epoch(tmp_path):
     out = e.select_context([{"role": "user", "content": q}],
                            conversation_messages=[{"role": "user", "content": q}])
     assert out is not None, "当前 epoch P1 应被召回注入"
-    block = "\n".join(m["content"] for m in out if m["role"] == "system")
-    assert "NEW_EPOCH 当前 任务" in block, "当前 epoch P1 应被召回注入"
+    block = "\n".join(str(m.get("content", "")) for m in out
+                      if "[supercompress recall]" in str(m.get("content", "")))
+    assert "NEW_EPOCH 当前 任务" in block, "当前 epoch P1 应被召回注入（S1 尾投递并入 user）"
     # 确定性：同一 select_context 两次 → 注入块全等（Recaller.search 每次返回 fresh Hit）
     out2 = e.select_context([{"role": "user", "content": q}],
                             conversation_messages=[{"role": "user", "content": q}])
-    assert "\n".join(m["content"] for m in out2 if m["role"] == "system") == block
+    assert ("\n".join(str(m.get("content", "")) for m in out2
+             if "[supercompress recall]" in str(m.get("content", ""))) == block)
 
 
 def test_engine_compress_hard_evicts_old_epoch(tmp_path):
@@ -356,7 +359,10 @@ def test_engine_compress_hard_evicts_old_epoch(tmp_path):
     e.store.append(new_p1)
     e.store.flush()                                     # P1 → durable（进 _window_fresh）
     out = e.compress([{"role": "user", "content": "继续 当前 任务 部署"}])
-    block = "\n".join(m["content"] for m in out if m["role"] == "system")
+    # S1 尾投递面（Plan C Phase 1）：staged 块不再独立 role=system，并入末条 user 消息
+    block = "\n".join(str(m.get("content", "")) for m in out
+                      if "[supercompress] staged" in str(m.get("content", "")))
+    assert block, "前置：staged 块非空（S1 尾投递并入 user，非 system）"
     # 旧 epoch P1 全文被 hard 逐出窗口（无 digest → 不渲染 FULLTEXT_MARKER_OLD）
     assert "FULLTEXT_MARKER_OLD" not in block, "旧 epoch P1 全文应被 hard 逐出（不在窗口）"
     # 当前 epoch P1 全文保留
@@ -439,7 +445,9 @@ def test_engine_compress_never_hard_evicts_empty_epoch_segments(tmp_path):
     e.store.append(cur_p1)
     e.store.flush()
     out = e.compress([{"role": "user", "content": "继续 当前 任务"}])
-    block = "\n".join(m["content"] for m in out if m["role"] == "system")
+    # S1 尾投递面（Plan C Phase 1）：staged 块并入末条 user 消息（非独立 system）
+    block = "\n".join(str(m.get("content", "")) for m in out
+                      if "[supercompress] staged" in str(m.get("content", "")))
     assert "FULLTEXT_LEGACY" in block, "空 epoch（legacy）P1 全文必须保留（不被 drift 误伤）"
     assert "FULLTEXT_OLD" not in block, "真旧 epoch（整数 0 ≠ 当前 1）P1 全文应被 hard 逐出"
     assert "FULLTEXT_CUR" in block, "当前 epoch P1 全文必须保留"

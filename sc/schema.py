@@ -32,8 +32,9 @@ def est_tokens(text: str) -> int:
 
 # 行内已知字段（from_dict 过滤：scdata 权威行可能带额外键，未知键静默丢弃）
 _KNOWN = ("tier", "provenance", "original_text", "seq", "kind", "ts", "session_topic",
-          "digest_ref", "model_version", "structural_p0", "reopened_from", "stale",
-          "goal", "phase_id", "state", "decisions", "open_tasks", "guardrail")
+          "digest_ref", "model_version", "structural_p0", "settled_signal",
+          "reopened_from", "stale", "goal", "phase_id", "state", "decisions",
+          "open_tasks", "guardrail")
 
 
 @dataclass
@@ -53,6 +54,9 @@ class Segment:
     digest_ref: str = "pending"     # "pending" | "ready:<refid>" | "none"
     model_version: str = ""
     structural_p0: bool = False     # 命中确定性结构地板（user msg / TODO 标记 / 决策词 / 唯一错误）
+    # 定案信号码（4a 数字代号，LLM 蒸馏面顺手打码，账本写侧纯读码不扫词，多语言干净）：
+    #   2 = 强完成（adhoc 直接折存根）  1 = 弱候选（kanban 提名，等裁判 + clarify）  0 = 无（全文回喂）
+    settled_signal: int = 0
     reopened_from: str | None = None  # 跨期重开物化来源（归档 id）；None = 原 session
     stale: bool = False             # 隔期重开的 P1 中间推理：降召回优先级，行动前 verify
     digest_text: str = ""           # 运行期：digest 生成后的摘要文本（不落盘，三元组可再生）
@@ -93,7 +97,8 @@ class Segment:
             "original_text": self.original_text, "seq": self.seq, "kind": self.kind,
             "ts": self.ts, "session_topic": self.session_topic,
             "digest_ref": self.digest_ref, "model_version": self.model_version,
-            "structural_p0": self.structural_p0, "reopened_from": self.reopened_from,
+            "structural_p0": self.structural_p0, "settled_signal": self.settled_signal,
+            "reopened_from": self.reopened_from,
             "stale": self.stale, "goal": self.goal, "phase_id": self.phase_id,
             "state": self.state, "decisions": self.decisions,
             "open_tasks": self.open_tasks, "guardrail": self.guardrail,

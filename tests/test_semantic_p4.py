@@ -335,7 +335,7 @@ class _BoundaryCannedEndpoint:
 @pytest.fixture()
 def p4_engine(tmp_path):
     from engine import SupercompressContextEngine
-    e = SupercompressContextEngine(external_store_path=str(tmp_path))
+    e = SupercompressContextEngine(external_store_path=str(tmp_path), auto_recall=True)
     e._aux.main_endpoint = _BoundaryCannedEndpoint([])
     return e
 
@@ -355,8 +355,10 @@ def _drift_to_boundary(e, ep_expanded=None):
 
 
 def _recalled_texts(out):
-    block = [m for m in out if m.get("content", "").startswith("[supercompress recall]")][0]
-    body = block["content"].split("[supercompress recall]", 1)[1]
+    """S1 尾投递面（Plan C Phase 1）：召回块不再独立 role=system，而是并入末条 user 消息。
+    取含 [supercompress recall] 标记的消息（末条 user），去标记后按 \\n\\n 切段序。"""
+    block = [m for m in out if "[supercompress recall]" in str(m.get("content", ""))][0]
+    body = str(block["content"]).split("[supercompress recall]", 1)[1]
     return [t for t in body.strip().split("\n\n") if t]
 
 
@@ -474,7 +476,7 @@ class TestEngineBoundaryFallback:
         """boundary_fail_cooldown=0 → 阶梯全 0 → 冷却窗恒关（fail-safe 单事件语义，不锁死重试）。"""
         from engine import SupercompressContextEngine
         e = SupercompressContextEngine(external_store_path=p4_engine.store_path,
-                                       boundary_fail_cooldown=0.0)
+                                       boundary_fail_cooldown=0.0, auto_recall=True)
         ep = _BoundaryCannedEndpoint(["hpa"])
         ep.fail = True
         e._aux.main_endpoint = ep
@@ -527,7 +529,7 @@ class TestEngineG4Determinism:
     def test_no_endpoint_failsafe_no_crash(self, p4_engine, tmp_path):
         """_NoEndpoint（宿主未注入 call_llm）→ 边界 LLM 全 fail-safe：turn 不炸、纯 BM25 回退。"""
         from engine import SupercompressContextEngine
-        e = SupercompressContextEngine(external_store_path=str(tmp_path))
+        e = SupercompressContextEngine(external_store_path=str(tmp_path), auto_recall=True)
         # 默认 _NoEndpoint：任何 LLM task → RuntimeError → P4 degraded 回退（壳 fail-open）
         _drift_to_boundary(e)
         assert e._drift.current_epoch == 1, "drift 正常触发（P4 面异常不影响 P2 判定）"
