@@ -21,7 +21,13 @@
 """
 from __future__ import annotations
 
+import logging
+import time
+
 from .schema import est_tokens
+from . import audit
+
+_obs_logger = logging.getLogger(__name__)
 
 
 def _l3_text(ws) -> str:
@@ -29,11 +35,22 @@ def _l3_text(ws) -> str:
     return ws.excerpt()
 
 
-def _l1_line(ws) -> str:
-    """L1 索引行（~20-40t）：seq + tier + 时间戳 + key_fact（无则 head20）。"""
+def _l1_line(ws, rel: int = 1) -> str:
+    """L1 索引行（~20-40t）：块内相对号 + tier + prov + 全局 seq + 时间戳 + key_fact（无则 head20）。
+
+    R4（2026-10-13 · owner 病灶 c ts 不刷新）：段 ts 为 0/缺（回放段未刷新
+    的不可信值，`_ts_zero_ratio` 观测面同口径）→ 省略 ts 段——不新造时间戳
+    （造了就是假数据）；正常 ts>0 的行字节逐字不变（前缀缓存契约零扰动）。
+    R5（owner 批次 A #3/#5）：行首 `#<rel>` = 块内相对号（render_block 逐段
+    计数传入，账本面 c#N 块号之下不再出现段级全局号 = 双层编号去混淆）；
+    `prov=<user|model>` 消 user/model 同号视觉重复（#3）；`seq=<全局seq>`
+    保留可点查定位（recall O(1) 面不变）。"""
     seg = ws.segment
     fact = getattr(seg, "key_fact", "") or seg.original_text[:20]
-    return f"#{seg.seq} {seg.tier} ts={seg.ts:.0f} · {fact}"
+    ts = getattr(seg, "ts", 0) or 0
+    ts_part = f" ts={ts:.0f}" if ts > 0 else ""
+    prov = getattr(seg, "provenance", "") or "?"
+    return (f"#{rel} {seg.tier} prov={prov} seq={seg.seq}{ts_part} · {fact}")
 
 
 def _l0_ptr(ws) -> str:
@@ -59,6 +76,13 @@ def _rank_key(ws, query_terms: set[str]) -> tuple:
 DEFAULT_INDEX_BUDGET = 2048
 DEFAULT_DETAIL_BUDGET = 4096
 
+# L3 单段 cap（fix-3 t_5bcb33f2 · P2 预算竞争根治）：单段 L3 全文装细节池的 token 上限。
+# 根因（验收报告 L3 裁定行）：choose_forms 无单段 cap + P0 distill 豁免 + 42 段 L3 抢 4K 池
+# → 单段可独吞细节池。cap = 保守 800 tok（保证单段最多占细节池 4K 的 ~1/5）。
+# fail-safe：choose_forms(l3_max_tokens=None) → 800（卡内锁 800 起步，pytest 全绿后可微调）。
+# 注入面 = sc/__init__.py 重导出；宿主 config 经参面覆盖，禁裸读 env（reviewer 裁定同源）。
+DEFAULT_L3_MAX_TOKENS = 800
+
 # P3 30% 零成本剔除档已于 2026-10-04 撤销（用户拍板 B）：活体 P1=0 → fill_share 恒 0.0，
 # 该档永远 no-op。choose_forms 不再接受 fill_prune——P1/P2 回到常规选档（L3/L2/L1/L0 按预算/
 # 高信号排），不再被强制锁 L0。telemetry 观测面（filler_form_share / gate_re_add_30pct）保留作审计。
@@ -70,6 +94,7 @@ def choose_forms(
     query: str = "",
     index_budget: int | None = None,
     detail_budget: int | None = None,
+    l3_max_tokens: int | None = None,
 ) -> list[tuple]:
     """预算驱动选档（核心，确定性）→ [(ws, form, text), ...]，输出 = seq 稳定序。
 
@@ -81,10 +106,16 @@ def choose_forms(
     逐段选「装得下的最高档」，超池逐档降级，绝不超预算。细节不丢：L0 指针带 segment_id，
     原文 O(1) 点查可回（recall.get）。
 
+    L3 单段 cap（fix-3）：非 structural 段单段 L3 全文 ≤ l3_max_tokens（None → 800 保守默认）；
+    超 cap 段整段不再装细节池 → 降 L2（有 digest）/ L1/L0 指针（无 digest 兜底）。
+    structural P0 豁免 cap（活账本永不裁，push cap 语义一致）。
+
     确定性不变（同 segs/window/query → 同输出）。
     """
     ib = DEFAULT_INDEX_BUDGET if index_budget is None else max(0, int(index_budget))
     db = DEFAULT_DETAIL_BUDGET if detail_budget is None else max(0, int(detail_budget))
+    # L3 单段 cap（fix-3）：None → 800 保守默认；宿主 config 经参面覆盖，禁裸读 env。
+    cap = DEFAULT_L3_MAX_TOKENS if l3_max_tokens is None else max(0, int(l3_max_tokens))
     high_pressure = getattr(window, "used_tokens", 0) > getattr(window, "capacity_tokens", 0)
     detail_pool = 0 if high_pressure else db
 
@@ -113,7 +144,8 @@ def choose_forms(
             form_of[sid] = ("L3", _l3_text(ws))
             continue
         c = costs[sid]
-        if c["l3"] <= detail_pool:
+        # L3 单段 cap（fix-3）：超 cap 段整段不再装细节池 → 落 L2（有 digest）/ L1/L0 指针（无 digest 兜底）
+        if c["l3"] <= detail_pool and c["l3"] <= cap:
             form_of[sid] = ("L3", _l3_text(ws))
             detail_pool -= c["l3"]
         elif c["digest"] and c["l2"] is not None and index_used + c["l2"] <= ib:
@@ -137,16 +169,111 @@ def choose_forms(
 
 
 def render_block(rendered: list[tuple]) -> str:
-    """选档结果 → 注入块文本（system 消息内容）。壳只调本函数，不持算法体。"""
+    """选档结果 → 注入块文本（system 消息内容）。壳只调本函数，不持算法体。
+
+    R5（owner 批次 A #3/#5）：行首 `#<rel>` = 本块内相对号（逐段 1..N 计数，
+    与账本面 c#N 块号不再混淆）；L3/L2 全文行加 `prov=<user|model>` 消同号
+    视觉重复；L1 行在 render_block 内经 `_l1_line(ws, rel)` 重算（choose_forms
+    产出的 L1 text 仅供 token 预算估算，渲染面才定相对号/全局 seq 位）；段级
+    全局 seq 移入 `seq=` 位（recall 点查面不变），零 LLM、零持久态。"""
     lines = []
+    rel = 0
     for ws, form, text in rendered:
+        rel += 1
+        prov = getattr(ws.segment, "provenance", "") or "?"
         if form in ("L3", "L2"):
-            lines.append(f"#{ws.segment.seq} {ws.segment.tier} [{form}]\n{text}")
+            lines.append(f"#{rel} {ws.segment.tier} prov={prov} seq={ws.segment.seq} [{form}]\n{text}")
+        elif form == "L1":
+            lines.append(_l1_line(ws, rel))
         else:
-            lines.append(text)
+            lines.append(text)        # L0 指针行（_l0_ptr 原样，高压兜底最小面）
     return "\n---\n".join(lines)
 
 
 def block_tokens(rendered: list[tuple]) -> int:
     """注入块总 token（验证/DoD 断言用：≤ 细节池 4K + 索引池 2K = 总帽 6K，固定池无 pull 耦合）。"""
     return sum(est_tokens(t) for _, _, t in rendered)
+
+
+# ── gate §3 可观测面（t_62c8ad6f · 纯 read-only 观测，零数据变更，消费既有机制）────
+# 红线：不迁移历史 ts=0 段、不新写 torn-detection（消费 scdata.replay 既有 idx.dropped，
+# reason 分布 json_parse_fail / content_hash_mismatch / dup_skip_idempotent 已在盘）；
+# 纯 INFO 不告警——ts 阈值裁定面是 fix-2 修复卡，本观测行只报事实。
+# fix-5 t_d888d710 在此上加 audit 悬挂侧（<sid>.audit.jsonl O_APPEND+0600，fail-soft 零 raise）。
+
+
+def _dropped_reasons(idx) -> dict:
+    """消费既有 ReplayIndex.dropped（(line_no, reason) 清单）→ reason 分布 dict（按 reason 计数）。
+
+    零 mutation：只读迭代，不改动 idx.dropped / idx.by_hash。"""
+    reasons: dict[str, int] = {}
+    for _, reason in idx.dropped:
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return reasons
+
+
+def _ts_zero_ratio(segs) -> float:
+    """消费既有 Segment.ts（窗口 ts=0 段数 / 总段数）→ 占比 float。零 mutation。
+
+    只读 getattr(seg, "ts")，零重算/零迁移；空窗口 → 0.0（无定义，caller 自行判空 no-op）。"""
+    if not segs:
+        return 0.0
+    n_zero = sum(1 for s in segs if (getattr(s, "ts", 0) or 0) == 0)
+    return n_zero / len(segs)
+
+
+def observe_replay_drops(idx) -> None:
+    """消费既有 ReplayIndex.dropped（scdata.py 单一实现产出的 torn 行清单），打一行 INFO。
+
+    只读 idx.dropped（(line_no, reason) 元组，replay 权威数据面既有产物），
+    零新增语义/完整性校验、零写路径触碰。零 dropped → 一行 N=0 INFO（观测面恒定可 grep）。
+    """
+    reasons = _dropped_reasons(idx)
+    _obs_logger.info(
+        "supercompress: replay dropped %d line(s) reason=%s", len(idx.dropped), reasons)
+
+
+def observe_ts_zero_ratio(segs) -> None:
+    """观测行：当前窗口 ts==0 段占比 count/len，纯 INFO 不告警。
+
+    窗口 = 传入的 replay 段列表（engine._window_fresh 磁盘重放产物）；
+    空窗口 no-op（无定义）。只读 Segment.ts，零 mutation / 零迁移 / 零重算。
+    """
+    if not segs:
+        return
+    n_zero = sum(1 for s in segs if (getattr(s, "ts", 0) or 0) == 0)
+    _obs_logger.info(
+        "supercompress: ts_zero_ratio=%.4f (n=%d/%d, observation-only, no alerting)",
+        n_zero / len(segs), n_zero, len(segs))
+
+
+def observe_replay_window(idx, segs, sid: str, jsonl_path: str) -> dict:
+    """fix-5 双路径观测面统一入口（INFO + audit 悬挂），纯消费既有数据，零 mutation。
+
+    一条 replay/注入事件观测一次 →
+      ① INFO 侧：打 dropped（reason 分布）+ ts_zero_ratio 两行（见上面两函数，可 grep）；
+      ② audit 悬挂侧：往 `<sid>.audit.jsonl`（audit.audit_path_for_jsonl(jsonl_path)）
+         O_APPEND 单行 append 一条 record `{ts, sid, dropped, ts_zero_ratio}`
+         （audit.write_audit_record：0600 + flush，写 OSError → WARNING fail-soft 零 raise，
+         同 compact_ledger._persist 失败契约）。
+
+    `dropped` = reason 分布 dict（消费既有 idx.dropped）；`ts_zero_ratio` = 窗口 ts=0 占比
+    （消费既有 Segment.ts）；`ts` = time.time()（观测事件时间，非段 ts）。
+    返回本事件 record dict（含 audit 落盘结果 bool `audit_written`）；即便 audit 写失败
+    也照常打 INFO + 返回 record（fail-soft，主流程零感知）。零 store/log/.db 写、
+    零 by_hash/ts/seq/content_hash 变更。
+    """
+    # ① INFO 侧（恒定可 grep，不依赖 audit 写成败）
+    observe_replay_drops(idx)
+    observe_ts_zero_ratio(segs)
+    # ② 算观测 record（纯消费）
+    record = {
+        "ts": time.time(),
+        "sid": sid,
+        "dropped": _dropped_reasons(idx),
+        "ts_zero_ratio": _ts_zero_ratio(segs),
+    }
+    # ③ audit 悬挂侧（O_APPEND 单行 + 0600 + flush；fail-soft 零 raise）
+    record["audit_written"] = audit.write_audit_record(
+        audit.audit_path_for_jsonl(jsonl_path), record, log=_obs_logger)
+    return record
