@@ -62,22 +62,36 @@ def tagger(aux):
 class TestMonologueCuesTable:
     def test_covers_zh_and_en_openers(self):
         joined = " ".join(REASONING_MONOLOGUE_CUES)
-        # 中：开首独白惯用形（账本实证词面）
-        for cue in ("让我", "我需要", "现在我", "我先", "查清楚", "让我核实"):
+        # 中：开首独白惯用形（账本实证词面，F4 后 14 条）
+        for cue in ("让我", "我需要", "现在我", "我先", "我打算", "准备先", "让我核实"):
             assert cue in joined, f"{cue} 缺"
+        # F4：宽词「查清楚」「查一下」已删（裸形 = 结论段开首，入表即误杀）——
+        # 反向断言其不在表（宁漏勿错红线落地）
+        for gone in ("查清楚", "查一下"):
+            assert gone not in joined, f"{gone} 不应在表（F4 宽词红线）"
         # 英：开首独白惯用形（小写词表）
         joined_low = joined.lower()
-        for cue in ("let me", "i need to", "now i need", "i found", "i need to check"):
+        for cue in ("let me", "i need to", "now i need", "i will", "i'll check",
+                    "now i", "first i", "i need to check"):
             assert cue in joined_low, f"{cue} 缺"
+        # F4：「i found」「i discovered」已删（"I found that X" 是结论段开首，非独白）
+        for gone in ("i found", "i discovered"):
+            assert gone not in joined_low, f"{gone} 不应在表（F4 宽词红线）"
 
     def test_no_broad_words(self):
         # 宽词不入表（owner 红线：宁漏勿错，宽词误杀面）：单独"发现"
         # /"结果"/"完成"无开首限定不入表——词表只收"我 + 让/需/先/查 + 动作"
-        # 开首独白结构。
+        # 开首独白结构。F4 补强：查清楚/查一下/i found/i discovered 同属
+        # 结论词（"I found that X" / "查清楚 X 的根因" 是结论开首，非独白带前缀），
+        # 一并断言其缺席。
         joined = " ".join(REASONING_MONOLOGUE_CUES).lower()
         assert "发现" not in joined
         assert "结果" not in joined
         assert "完成" not in joined
+        assert "查清楚" not in joined
+        assert "查一下" not in joined
+        assert "i found" not in joined
+        assert "i discovered" not in joined
 
 
 class TestIsReasoningMonologue:
@@ -86,18 +100,26 @@ class TestIsReasoningMonologue:
             "让我先核实宿主到底提供了哪些 turn-boundary face，再判断。",
             "我需要找出当时 emo 的源文件是否真的被读取过。",
             "我先测试一下当前状态。",
-            "查清楚了，结论是：footer 该推的地方确实推了。",
         ):
             assert is_reasoning_monologue(text) is True, text
+
+    def test_zh_conclusion_not_flagged(self):
+        # F4：「查清楚了，结论是…」是**结论段开首**（查清某事 = 结论词，非独白带
+        # 前缀），删「查清楚」cue 后不再命中 = 正确（误杀结论段才是真丢失）
+        assert is_reasoning_monologue("查清楚了，结论是：footer 该推的地方确实推了。") is False
 
     def test_en_openers(self):
         for text in (
             "I need to check which tool actually read the emo files.",
             "Let me verify the order and run the suite.",
-            "I found the root cause — detect_root returns /root…",
             "Now I need to confirm the final details and then TDD it.",
         ):
             assert is_reasoning_monologue(text) is True, text
+
+    def test_en_conclusion_not_flagged(self):
+        # F4：「I found the root cause — …」是**结论段开首**（"I found that X"
+        # 发现某事 = 结论词，非独白带前缀），删「i found」cue 后不再命中 = 正确
+        assert is_reasoning_monologue("I found the root cause — detect_root returns /root…") is False
 
     def test_non_monologue_not_flagged(self):
         for text in (

@@ -208,3 +208,59 @@ class TestNearDupSkip:
         led.append(head + " v1", settled=True)
         e = led.append(head + " v2")
         assert e is not None, "settled 块已折存根，去重不对比它（v2 照入账）"
+
+
+# ───────────────────────── (f1) 跨进程 flock 写路径（owner 既定决议 #4）─────────────────────────
+class TestLedgerFlock:
+    """F1（reviewer 实测 + owner 决议 #4）：`_persist` 的 read-RMW-write（tmp+os.replace）
+    在专属 flock（`<dir>/.ledger.flock`）临界区内，跨进程并发 append 串行化；
+    锁面 fail-open（锁文件 open/flock 失败 → 退化裸 RMW，不炸宿主）。"""
+
+    def test_persist_creates_dedicated_flock_file(self, tmp_path):
+        import sc.compact_ledger as cl
+        led_path = str(tmp_path / "s1.compact.json")
+        led = cl.CompactLedger(led_path, max_tokens=99999, max_entries=8)
+        led.append("块A 网关限流阈值调至五百请求并配置告警")
+        lock_path = tmp_path / ".ledger.flock"
+        assert lock_path.exists(), \
+            "F1：_persist 须创建专属 flock 文件 <dir>/.ledger.flock（不进账本 JSON）"
+
+    def test_append_serialized_across_instances(self, tmp_path):
+        """同进程内两个独立实例（模拟双 provider 并发）交替 append：
+        flock 互斥 + 共享 load() 语义下 seq 单调、entries 无丢、无 seal 抢跑。"""
+        import sc.compact_ledger as cl
+        led_path = str(tmp_path / "s2.compact.json")
+        a = cl.CompactLedger(led_path, max_tokens=99999, max_entries=64)
+        b = cl.CompactLedger(led_path, max_tokens=99999, max_entries=64)  # 共享同盘
+        # 交替 append（每步 re-load 对方盘状态，模拟宿主 compress 各进程视角）
+        for i in range(4):
+            a.append(f"块{i:02d} 部署网关限流版本{i}保留回滚入口")
+            b.load()   # 同步 a 的写
+            b.append(f"块b{i:02d} 回滚开关位置网关配置第三节")
+            a.load()
+        # seq 单调（a/b 共享 seq 面，后 load 者续号）：entries 全在、无洞
+        a.load()
+        seqs = [e["seq"] for e in a.entries]
+        assert seqs == sorted(seqs), f"seq 须单调（无回退空洞）：{seqs}"
+        assert len(a.entries) == 8, f"双实例 4×2=8 块全在（flock 串行化无丢块）：{len(a.entries)}"
+        assert a.seals == 0, "无封帽（token/条数帽 99999/64 远未超）seal 不抢跑"
+
+    def test_fail_open_when_lock_unavailable(self, tmp_path, monkeypatch):
+        """锁文件 open 失败 → fail-open 退化裸 RMW（零行为回归，不炸宿主）。"""
+        import sc.compact_ledger as cl
+        led_path = str(tmp_path / "s3.compact.json")
+        led = cl.CompactLedger(led_path, max_tokens=99999, max_entries=8)
+        # 让 _flock_ledger 的 open 抛 OSError（模拟只读目录/权限拒绝）
+        import builtins
+        real_open = builtins.open
+        def _denied(path, *a, **kw):
+            if ".ledger.flock" in str(path):
+                raise PermissionError("simulated: lock file open denied")
+            return real_open(path, *a, **kw)
+        monkeypatch.setattr(builtins, "open", _denied)
+        try:
+            led.append("块X fail-open 写路径照跑（锁不可用不炸）")
+        finally:
+            monkeypatch.undo()
+        assert led.entries and led.entries[-1]["text"].startswith("块X"), \
+            "F1 fail-open：锁不可用退化裸 RMW，append 仍落（零宿主回归）"

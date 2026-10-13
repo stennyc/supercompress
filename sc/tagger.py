@@ -36,12 +36,19 @@ _P1_MARKERS = ("<compaction-summary>",)
 # 误删面只剩开首 60 字符词面命中这一个入口（纯字面、零 LLM、确定性，
 # 同 is_agent_self_report R2-v2 模式；user 段免疫由 classify 调用面保证）。
 REASONING_MONOLOGUE_CUES = (
-    # 中：开首独白惯用形（账本实证词面：「让我…」「我需要…」「我先…」「查清楚…」）
+    # 中：开首独白惯用形（账本实证词面：「让我…」「我需要…」「我先…」「我打算…」）
+    # F4（owner 红线「不收宽词」）：删「查清楚」「查一下」——裸「查清楚 X 根因」直接开首
+    # = 任务结论段开首（非独白带前缀），入表即误杀结论段；带前缀形「让我查清楚」由
+    # 「让我」cue 覆盖，不单独收裸形。宁漏勿错（漏 = 独白照 P0/P1 入库零风险，
+    # 误杀 = 结论段误降 P2 不进注入面 = 真丢失）。
     "让我", "我需要", "现在我", "我先", "我打算", "准备先",
-    "查清楚", "查一下", "让我核实",
+    "让我核实",
     # 英：开首独白惯用形（lowercase table；判定时两侧小写）
+    # F4：删「i found」「i discovered」——「I found that X」/「I discovered X」是**结论
+    # 段开首**（发现/查清某事），非开首独白惯用形；「i'll check」「let me check」才是
+    # 独白带前缀。同中文红线，结论词不收（误杀结论段 = 真丢失）。
     "let me", "i need to", "now i need", "i will", "i'll check",
-    "i found", "i discovered", "now i", "first i", "i need to check",
+    "now i", "first i", "i need to check",
 )
 _MONOLOGUE_WINDOW = 60     # 开首判定窗口（strip 后前 N 字符内命中才算开首独白）
 

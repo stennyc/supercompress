@@ -153,11 +153,73 @@ class CompactLedger:
                            "(generation=%d seals=%d seq=%d)",
                            reason, self.generation, self.seals, self.seq)
 
-    # ───────────── 写路径（原子：tmp + os.replace；幂等零写快退）─────────────
+    # ───────────── 写路径（原子：tmp + os.replace；幂等零写快退；F1 跨进程 flock）────
+    def _flock_ledger(self, target_dir: str):
+        """F1（owner 既定决议 #4）：跨进程共享同一 <sid>.compact.json 时（双宿主 / 双
+        provider 并发 compress），裸 tmp+os.replace 的 read-RMW-write 会让后写者
+        覆盖先写者（seq 回退、新块丢失）——本仓零 flock（reviewer F1 实测：grep
+        'flock' 零命中），多进程并发 = 数据丢失。
+
+        修法（owner 裁定）：给 ledger 一个**专属 flock 文件** `<target_dir>/.ledger.flock`
+        （不进账本 JSON、不随账本 GC），fcntl.flock(LOCK_EX) 阻塞拿锁、LOCK_UN
+        释放；**fail-open**——锁文件 open 失败 / flock 抛 OSError → 静默返回
+        _LockedNullContext（原 fail-soft 语义不破坏，宿主 worker 不被阻塞），
+        竞争退化为无锁 RMW（丢行风险 = 既有行为，零回归），绝不炸宿主。
+        threading.Lock（model_store 面）只管单进程内线程，跨进程面 = 本 flock。
+        与 scdata 沉盘面解耦（flock 只护账本 JSON 的 read-RMW-write 临界区，
+        <seq>.p0/.p1 沉盘走各自 O_APPEND，不在本锁面内）。
+        """
+        # 锁的 open/flock 失败 = fail-open 退化（null_cm 走裸 RMW，同 pre-F1）
+        import fcntl
+        import contextlib
+
+        @contextlib.contextmanager
+        def _null_cm():
+            yield
+
+        lock_path = os.path.join(target_dir, ".ledger.flock")
+        try:
+            _lf = open(lock_path, "a+")   # a+ 不截断、不创建内容竞争（flock 只看 inode）
+        except OSError:
+            if self._log is not None:
+                self._log.warning("compact-ledger: flock open failed -> no-lock RMW "
+                                  "(fail-open, same as pre-F1 behavior)")
+            return _null_cm
+        try:
+            fcntl.flock(_lf.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            try:
+                _lf.close()
+            except OSError:
+                pass
+            if self._log is not None:
+                self._log.warning("compact-ledger: flock LOCK_EX failed -> no-lock RMW "
+                                  "(fail-open)")
+            return _null_cm
+
+        @contextlib.contextmanager
+        def _locked_cm():
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(_lf.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    _lf.close()
+                except OSError:
+                    pass
+        return _locked_cm
+
     def _persist(self) -> None:
         data = {"version": _FORMAT_VERSION, "generation": self.generation,
                 "seals": self.seals, "seq": self.seq, "entries": self.entries}
         target_dir = os.path.dirname(os.path.abspath(self.path)) or "."
+        # F1：整个 read-RMW-write（tmp 写 + os.replace + 目录 fsync）在专属 flock
+        # 临界区内，跨进程并发 append 串行化（后写者等先写者释放）；fail-open
+        # 退化为既有裸 RMW（零行为回归，锁面只是竞争时加锁）。
+        _lock_cm = self._flock_ledger(target_dir)
         try:
             fd, tmp = tempfile.mkstemp(prefix=".compact-", suffix=".tmp", dir=target_dir)
         except OSError as e:
@@ -166,11 +228,17 @@ class CompactLedger:
                                   "in-memory only this round", e)
             return
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, self.path)
+            with _lock_cm():
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, self.path)
+                # 目录项 fsync（rename 持久化 best-effort，平台不支持/只读静默）
+                try:
+                    _fsync_dir(target_dir)
+                except Exception:
+                    pass
         except OSError as e:
             try:
                 os.unlink(tmp)
@@ -179,11 +247,6 @@ class CompactLedger:
             if self._log is not None:
                 self._log.warning("compact-ledger: persist failed (%s) -> "
                                   "in-memory only this round", e)
-        # 目录项 fsync（rename 持久化 best-effort，平台不支持/只读静默）
-        try:
-            _fsync_dir(target_dir)
-        except Exception:
-            pass
 
     # ───────────── append-only 核心 ─────────────
     def _token_sum(self) -> int:
@@ -208,18 +271,17 @@ class CompactLedger:
         - `max_entries` = 累计段最多同时保留 N 块；
         - `max_tokens` = 累计段 token 上限；
         - 超帽裁切顺序（最省活渲染面字节、前缀最稳）：
-            ① 裁账本内**首个 trimmable 块**（P1 推理段，原文 recall 可捞回，丢弃零数据
-               损失）——`_trim_trimmable_oldest` 实现为「扫账本找首个 trimmable 且未
-               settled 的块就裁掉」，每次 append 至多裁 1 块后重评估。**若最旧端是 P0
-               （非可裁），P1 层即 no-op**（P0 挡住可裁块，混合 P0+P1 账本 P1 层因此
-               几乎不生效，P1 真正被清靠 ③ seal 保底；P1-only 账本——无 P0 挡在账本内
-               ——P1 层才逐个真裁）；
-            ② 仍超 → 裁账本内**首个 settled 块**（P0 定案块，原文已沉盘 <sid>.p0，
-               可复活）——同理 front-only：最旧端是未 settled 块时本层 no-op；
+            ① 折账本内**全部 trimmable 块**（P1 推理段，原文 recall 可捞回，丢弃零数据
+               损失）——`_trim_trimmable_oldest` 实现为「扫账本内**所有** trimmable 且
+               未 settled/未 trimmed 的块逐一折 trimmed 存根」（全量折，无位置门槛），
+               **P0 块（trimmable=False）永不被 P1 层折**；P1-only 账本全部折存根，
+               混合 P0+P1 账本折掉所有 P1、P0 全文/存根照留（seal 不抢跑，编号连续）；
+            ② 仍超 → 裁量层第二面 `_trim_settled_oldest`（R5 #2 语义 X 下退化为 no-op
+               保底——settled 块已折单行存根、不硬删 = 不产生编号空洞，见该方法 doc）；
             ③ 还超 → 回退整段 seal（保底，清空账本，新块重入账）。
           未 trimmable 且未 settled 的 P0 定案块（含 kanban candidate）**永不被 ①② 裁**
           （只可能被 ③ seal 全清）——定案账本只剩 P0 存根 + 未定案 P0 全文，P1 推理
-          可裁层被优先清掉。
+          可裁层被优先全折。
         settled 块在 `text()` 里折成单行存根（`_settled_stub_line`），原文沉盘
         （engine 侧调 scdata.sink_p0）；trimmable 块 `text()` 照常渲染全文（P1 可裁层
         不折存根——还没定案，折了模型看不到推理过程），封顶时被优先裁掉。
