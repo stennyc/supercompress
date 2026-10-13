@@ -1057,9 +1057,16 @@ class SupercompressContextEngine(sc_context_engine_base()):
     def untrim_p1(self, seq: int) -> Optional[bool]:
         """R5（owner 批次 A #2）：复活被封顶折存根的 P1 可裁块 c#seq。
 
-        先试活账本 untrim（折存根块仍在账本 = 常态，零 IO）；账本无此 seq
-        （已 seal 清）→ 尝试 <seq>.p1 沉盘件捞回（同 restore_p0 复活面，
-        fail-open 缺失 → False 静默）。异常 fail-open 吞掉（宿主零炸）。"""
+        先试活账本 untrim（折存根块仍在账本 = 常态，零 IO，entries 里 trimmed=True
+        的块改回全权重回账本渲染面）；账本无此 seq（已 seal 清过 → entries=[] 全清）
+        → 尝试 <seq>.p1 沉盘件读回**原文做审计参照**（fail-open 缺失 → miss，只 log
+        不自动重插入账本——seal 是整段作废语义，复活要重新 accumulate，盘件供人工
+        审计 / 后续再累积参照，非自动 untrim）。异常 fail-open 吞掉（宿主零炸）。
+
+        诚实边界（reviewer P4）：docstring 旧措辞"捞回（同 restore_p0 复活面）"误导
+        为"自动复活"，实际 seal 后 restore_p1 只读盘 log 不重插入 entries——本处已
+        更正为"盘件供审计参照"。untrim_p1 返回值语义：True=活账本内 untrim 成功
+        （块重回渲染面）；False=条目已 seal 清（沉盘件仅供审计，未自动复活）。"""
         try:
             lg = self._compact_ledger()
             e = lg.untrim(seq)
@@ -2123,8 +2130,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 #     （candidate 提名，宿主 LLM 裁判 + clarify 确认后调 settle_p0 折出）；
                 #   - "none"   不定案：双信号都未命中 → settled=False + kind=adhoc
                 #     （未定案段照常全量回喂，治「重复问」只对真定案段生效）。
-                _p0_block, _p0_forms = _staged_by_tier(rendered, "P0")
-                _p1_block, _p1_forms = _staged_by_tier(rendered, "P1")
+                _p0_block, _p0_forms = _staged_by_tier(_expanded, "P0")
+                _p1_block, _p1_forms = _staged_by_tier(_expanded, "P1")
                 _entry = None
                 if _p0_block:
                     _decision = _staged_p0_decision(_p0_block, _p0_forms, rendered)

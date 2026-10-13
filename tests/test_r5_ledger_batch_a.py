@@ -97,7 +97,8 @@ class TestTrimLeavesStubs:
     def test_trimmable_trim_leaves_stub_line(self, tmp_path):
         # 封帽触发 ① 裁量层：max_entries=2，trimmable P1 块占位后再 append
         # → 条数帽超限（len(entries)=2 已达 max_entries）→ _trim_trimmable_oldest
-        # 把最旧 P1 折存根（front-only：最旧端是 trimmable P1）→ 编号无空洞、无 seal
+        # 把所有 P1 折存根（全量折，reviewer P7：无位置门槛，P0 挡前端不影响）
+        # → 编号无空洞、无 seal
         led = CompactLedger(str(tmp_path / "l.compact.json"),
                             max_tokens=999999, max_entries=2)
         led.append("P1推理块一" * 20, trimmable=True)   # c#1 P1 可裁
@@ -264,3 +265,111 @@ class TestLedgerFlock:
             monkeypatch.undo()
         assert led.entries and led.entries[-1]["text"].startswith("块X"), \
             "F1 fail-open：锁不可用退化裸 RMW，append 仍落（零宿主回归）"
+
+
+# ───────────────────────── (p1) 跨进程 load 竞态补全（reviewer 二次复盘 P1）─────────────────────────
+class TestLedgerLoadFlock:
+    """P1（reviewer 二次复盘 major）：第一轮 F1 只给 `_persist` 加了 flock，`load()`
+    读面零锁 → 双宿主冷重开 `load→内存 append→flock persist` 时后 load 者读到
+    stale 盘状态、append 到旧 seq 上、flock 写盘时覆盖先写者 = 丢块（reviewer P1
+    实测"磁盘只剩 B1、A1 丢失"）。P1 修法：`load()` 的读盘+解析同样进专属 flock
+    临界区（LOCK_EX 短临界区），读侧 stale read 面归零。
+
+    **合法部署形态 = 先后 compress（双宿主 / 双 provider 不**同时** compress 同一
+    session）**：flock 串行化"先后"的两个宿主，B 的 load 读到 A 写好的完整盘状态、
+    续 seq、不丢块。跨进程**真并发同时** compress 同一 session 是**非法部署形态**
+    （宿主契约：一个 session 一个 provider 在 compress，engine 会话面保证），不在
+    ledger 层为它做跨调用持锁——同 session 单 provider 由宿主层保证。"""
+
+    def test_sequential_two_processes_no_loss(self, tmp_path):
+        """先后（非同时）双宿主 compress 同一 session：B load 读到 A 写好的盘、
+        续 seq、8 块全在、无封帽抢跑。flock 护 load+persist 把"先后"竞态治住。"""
+        import subprocess, sys, os, textwrap
+        led_path = str(tmp_path / "conc.compact.json")
+        script = textwrap.dedent(f"""
+            import sys, os
+            sys.path.insert(0, {os.getcwd()!r})
+            from sc.compact_ledger import CompactLedger
+            l = CompactLedger({led_path!r}, max_tokens=999999, max_entries=64)
+            # 本宿主 load()（flock 护读面）读到既有盘状态 → 内存 append 4 块
+            # → flock persist（写面串行化）。返回写后 seq。
+            for i in range(4):
+                l.append(os.environ.get("PROCTAG", "?") + str(i))
+            print(l.seq, end="")
+        """)
+        # 先后（sequential）跑两宿主：A 完整跑完再跑 B（B load 读到 A 的 4 块）
+        seqs = []
+        for tag in ("A", "B"):
+            env = dict(os.environ, PROCTAG=tag)
+            pr = subprocess.Popen([sys.executable, "-c", script],
+                                  env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+            out, _ = pr.communicate(timeout=30)
+            assert pr.returncode == 0, f"{tag} 宿主 append 不崩"
+            seqs.append(int(out.strip()))
+        assert seqs == [4, 8], \
+            f"先后 compress：A 写后 seq=4、B load 读 A 续到 seq=8（flock 护 load 面）：{seqs}"
+        # 主进程 reload 盘上状态（flock 护读面）：8 块全在、seq 单调、无 seal
+        led = CompactLedger(led_path, max_tokens=999999, max_entries=64)
+        n_a = sum(1 for e in led.entries if e["text"].startswith("A"))
+        n_b = sum(1 for e in led.entries if e["text"].startswith("B"))
+        assert n_a == 4 and n_b == 4, \
+            f"先后双宿主 8 块全在（flock 护 load+persist，无丢块）：A={n_a} B={n_b}"
+        seqs2 = [e["seq"] for e in led.entries]
+        assert seqs2 == sorted(seqs2), f"seq 须单调无回退空洞：{seqs2}"
+        assert led.seals == 0, "条数帽 64 远未超，seal 不抢跑"
+
+    def test_concurrent_same_session_is_illegal_deployment(self, tmp_path):
+        """**文档面（非行为断言）**：跨进程**同时** compress 同一 session 是非法
+        部署形态（宿主契约：一个 session 单 provider compress，engine 会话面保证）。
+        本测试不构造并发（那需要 spawn 同时跑，非本面责任），只断言 load docstring
+        已明写该边界——防止后人误以为 ledger 的 flock 能护跨进程真并发。"""
+        import inspect
+        src_doc = inspect.getsource(CompactLedger.load)
+        assert ("非法" in src_doc or "单 provider" in src_doc
+                or "宿主层" in src_doc or "先后" in src_doc), \
+            "P1：load docstring 须明写 flock 护先后 compress、跨进程真并发由宿主层" \
+            "同 session 单 provider 保证（非 ledger 层责任）"
+
+
+# ───────────────────────── (p2) 长会话 ledger tier-split 用展开面（reviewer 二次复盘 P2）─────────────
+class TestLedgerLongSessionUsesExpanded:
+    """P2（reviewer 二次复盘 major）：R5 #6 占位符展开只接进短会话 S1 面（`_staged`
+    用 `_expanded`），长会话 ledger tier-split（`_staged_by_tier`）误传未展开的
+    `rendered` → 长会话账本 P1 块的小代码占位符 `[code: ×N lines]` 照样混入
+    （#6 在长会话面漏修）。修法：engine.compress() 长会话路径 tier-split 改传
+    `_expanded`（已构造，零新计算）。本测试锁 engine 侧：tier-split 入参是展开后
+    的 rendered（小占位符段 = original_text 全文，非占位符残句）。"""
+
+    def test_long_session_tier_split_uses_expanded_rendered(self):
+        """engine.compress() 长会话路径的 tier-split 必须喂 _expanded（展开面），
+        不能喂 rendered（未展开面）——源码面断言（锁定调用面，防回退）。"""
+        import re
+        src = open("engine.py", encoding="utf-8").read()
+        # 定位 _staged_by_tier 调用：两处（P0 + P1）都须传 _expanded
+        p0 = re.search(r"_staged_by_tier\(\s*(_\w+)\s*,\s*\"P0\"\s*\)", src)
+        p1 = re.search(r"_staged_by_tier\(\s*(_\w+)\s*,\s*\"P1\"\s*\)", src)
+        assert p0 and p1, "engine 须有 _staged_by_tier P0/P1 两处调用"
+        assert p0.group(1) == "_expanded", \
+            f"P2：P0 tier-split 须喂展开面 _expanded（实得 {p0.group(1)}，未展开 rendered = 占位符漏修）"
+        assert p1.group(1) == "_expanded", \
+            f"P2：P1 tier-split 须喂展开面 _expanded（实得 {p1.group(1)}，未展开 rendered = 占位符漏修）"
+
+    def test_small_placeholder_expands_for_ledger_not_residue(self):
+        """行为面：小代码占位符段（[code: ×N lines]，N < 阈值）经
+        _expand_small_code_placeholders 后 = original_text 全文（非残句占位符）。
+        ledger 长会话路径喂 _expanded → P1 块里小代码段是全文，诊断账本 #6 的
+        残句占位符不进账本。"""
+        from engine import _expand_small_code_placeholders
+        from sc.distill import WindowSeg
+        from sc.schema import Segment
+        import time
+        seg = Segment(session_topic="t", original_text="def f():\n    return 1\n\ndef g():\n    pass",
+                      tier="P1", provenance="model", seq=1, ts=time.time(),
+                      content_hash="x"*32, kind="adhoc")
+        # L3 渲染面给小代码占位符（模拟 T1 折叠产物：N=2 < 阈值 20）
+        placeholder = "[code:python ×2 lines] def f():"
+        rendered = [(WindowSeg(seg), "L3", placeholder)]
+        out = _expand_small_code_placeholders(rendered)
+        assert out[0][2].startswith("def f()"), \
+            "小代码占位符段须展开为 original_text 全文（非残句）：实得 %r" % out[0][2][:40]

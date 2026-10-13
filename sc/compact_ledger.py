@@ -98,49 +98,79 @@ class CompactLedger:
     # ───────────── 读路径（fail-open：缺失/损坏一律空账本 + generation 留痕）─────────────
     def load(self) -> None:
         """读侧车 → entries/generation/seals/seq。缺失（从未写过，合法态）→ 全 0 保持；
-        损坏 / 结构不符 → 整段作废（generation +1、seals +1、seq 单调 +1），fail-open。"""
+        损坏 / 结构不符 → 整段作废（generation +1、seals +1、seq 单调 +1），fail-open。
+
+        P1（reviewer 二次复盘 · 跨进程竞态补全）：读面**同样**进专属 flock 临界区
+        （`_flock_ledger` 的 LOCK_EX 短临界区：拿锁→读盘+解析→释锁），杜绝"双宿主
+        冷重开并发 load→内存 append→flock persist"里 load 读到 stale 盘状态、各自
+        append 到旧 seq 上、flock 写盘时互相覆盖丢块。flock 只护 `_persist` 写不护
+        `load` 读 = 读侧 stale read 面（第一轮 F1 修复不完整，reviewer P1 实测"磁盘
+        只剩 B1、A1 丢失"）。fail-open 不变：锁 open/flock 失败 → 退化裸读（pre-P1
+        行为，零宿主回归）；锁临界区内的 FileNotFoundError/损坏仍走既有 fail-open
+        语义（全 0 / _scrap），锁本身不改变读结果的错误处理。
+
+        实现：把"读盘+解析+entries 填充"整体包在 `_do_read()` 里，在 flock 临界区
+        （正常）或裸读兜底（锁面异常 fail-open）内执行——`raw` 与作用域自洽，锁面
+        异常不引入 NameError。
+
+        **合法部署形态边界（防误读）**：flock 治的是双宿主 / 双 provider **先后**
+        （非同时）compress 同一 session 的竞态——B 的 load 读到 A 写好的完整盘状态、
+        续 seq、不丢块。跨进程**真并发同时** compress 同一 session 是**非法部署
+        形态**（宿主契约：一个 session 单 provider 在 compress，engine 会话面保证），
+        不在 ledger 层为它做跨调用持锁——同 session 单 provider 由宿主层保证。"""
+        _lock_cm = self._flock_ledger(os.path.dirname(os.path.abspath(self.path)) or ".")
+
+        def _do_read():
+            try:
+                with open(self.path, "r", encoding="utf-8", newline="") as f:
+                    raw = f.read()
+            except FileNotFoundError:
+                return
+            except OSError as e:
+                if self._log is not None:
+                    self._log.warning("compact-ledger: read failed (%s) -> empty ledger", e)
+                self._scrap("io_error")
+                return
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                self._scrap("corrupt_json")
+                return
+            if not isinstance(data, dict):
+                self._scrap("bad_structure")
+                return
+            if data.get("version") not in (None, _FORMAT_VERSION):
+                self._scrap("version_mismatch")
+                return
+            self.generation = max(0, int(data.get("generation") or 0))
+            self.seals = max(0, int(data.get("seals") or 0))
+            self.seq = max(0, int(data.get("seq") or 0))
+            entries = data.get("entries")
+            self.entries = []
+            if isinstance(entries, list):
+                for e in entries:
+                    if (isinstance(e, dict) and isinstance(e.get("text"), str)
+                            and isinstance(e.get("seq"), int)):
+                        self.entries.append({
+                            "seq": e["seq"], "text": e["text"],
+                            "tokens": int(e.get("tokens") or est_tokens(e["text"])),
+                            # settled/kind 读面容忍旧条目无此键（→False/"adhoc"），
+                            # 零破坏既有 compact-ledger 消费面 + 零 mutation（只增字段）。
+                            # ⑤ 迁移缝：旧盘 settled 条目的 tokens 保留 3-A 前全文权重
+                            # （load() 原样读回，不回改历史字节）→ 升级当次封帽过计、
+                            # 一次 seal 自愈；保守方向（过计=seal 早到，绝不少计溢出），
+                            # 故不修逻辑只留痕。
+                            "settled": bool(e.get("settled", False)),
+                            "kind": str(e.get("kind", "adhoc")),
+                            "trimmable": bool(e.get("trimmable", False)),
+                        })
+
         try:
-            with open(self.path, "r", encoding="utf-8", newline="") as f:
-                raw = f.read()
-        except FileNotFoundError:
-            return
-        except OSError as e:
-            if self._log is not None:
-                self._log.warning("compact-ledger: read failed (%s) -> empty ledger", e)
-            self._scrap("io_error")
-            return
-        try:
-            data = json.loads(raw) if raw.strip() else {}
+            with _lock_cm():
+                _do_read()
         except Exception:
-            self._scrap("corrupt_json")
-            return
-        if not isinstance(data, dict):
-            self._scrap("bad_structure")
-            return
-        if data.get("version") not in (None, _FORMAT_VERSION):
-            self._scrap("version_mismatch")
-            return
-        self.generation = max(0, int(data.get("generation") or 0))
-        self.seals = max(0, int(data.get("seals") or 0))
-        self.seq = max(0, int(data.get("seq") or 0))
-        entries = data.get("entries")
-        self.entries = []
-        if isinstance(entries, list):
-            for e in entries:
-                if (isinstance(e, dict) and isinstance(e.get("text"), str)
-                        and isinstance(e.get("seq"), int)):
-                    self.entries.append({
-                        "seq": e["seq"], "text": e["text"],
-                        "tokens": int(e.get("tokens") or est_tokens(e["text"])),
-                        # settled/kind 读面容忍旧条目无此键（→False/"adhoc"），
-                        # 零破坏既有 compact-ledger 消费面 + 零 mutation（只增字段）。
-                        # ⑤ 迁移缝：旧盘 settled 条目的 tokens 保留 3-A 前全文权重（load()
-                        # 原样读回，不回改历史字节）→ 升级当次封帽过计、一次 seal 自愈；
-                        # 保守方向（过计=seal 早到，绝不少计溢出），故不修逻辑只留痕。
-                        "settled": bool(e.get("settled", False)),
-                        "kind": str(e.get("kind", "adhoc")),
-                        "trimmable": bool(e.get("trimmable", False)),
-                    })
+            # 锁面意外（_flock_ledger 返回的 cm 本身抛，理论上不抛）→ fail-open 裸读
+            _do_read()
 
     def _scrap(self, reason: str) -> None:
         """整段作废（不可信派生层语义）：entries 清空、generation/seals/seq 单调 +1。"""
@@ -393,8 +423,11 @@ class CompactLedger:
         `_full_block_count()`，见 append()），故折存根真能腾帽位、裁量层实压生效、
         seal 不抢跑；被裁块 entry 保留 → `len(entries)` 不下降（既有测试对"裁后条目数
         减少"的断言须随语义 X 更新为"trimmed 存根在场 + seals==0"）。
-        front-only 连裁：最旧端非可裁块（P0）时本层 no-op（P0 挡住可裁块的混合账本
-        P1 层近乎不生效，P1 真正被清靠 ③ seal 保底——P1-only 账本才逐个真折存根）。
+        全量折（reviewer P7 对齐实现）：本层折账本内**所有** trimmable 且未
+        settled/未 trimmed 的块（无位置门槛——P0 挡在最旧端不影响中间/后端的 P1
+        块被折；P1-only 账本全折，混合 P0+P1 账本折掉所有 P1、P0 照留）。
+        P0 块（trimmable=False）永不被本层折；P1 真正被清光靠 ③ seal 保底（全 P0
+        账本无 trimmable 块可折时本层 no-op → append() while 循环 return False 跳出）。
         """
         _trimmed_before = sum(1 for e in self.entries if e.get("trimmed"))
         for e in list(self.entries):
