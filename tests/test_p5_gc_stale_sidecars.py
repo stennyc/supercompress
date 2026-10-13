@@ -103,6 +103,34 @@ def test_retention_constant_is_30_days():
     assert scdata.RETENTION_DAYS == 30
 
 
+def test_gc_stale_p07_collision_sid_with_dot(tmp_path):
+    """P0.7 碰撞加固 sid（sid 本体含点号，如 my_app_sid.bd345c0436）的源 jsonl 须
+    正确识别为源判定基准并 GC 全族——第五轮 reviewer minor 实修：旧判据
+    `if "." in sid: continue` 会把含点号的 P0.7 源 jsonl 误当派生面跳过
+    = retention gap 无限增长。新判据按派生后缀白名单（.model.jsonl 等）排除，
+    P0.7 源 jsonl（ends .jsonl 且非 .model.jsonl）照样 GC。"""
+    root = str(tmp_path / "supercompress_store")
+    os.makedirs(root, exist_ok=True)
+    now = time.time()
+    old = now - 45 * 86400.0
+    # P0.7 形 sid（本体含点号）的源 jsonl + 侧车族
+    p07_sid = "my_app_sid.bd345c0436"
+    for fname in (f"{p07_sid}.jsonl", f"{p07_sid}.compact.json", f"{p07_sid}.p0.1",
+                  f"{p07_sid}.model.jsonl"):
+        p = os.path.join(root, fname)
+        with open(p, "w") as f:
+            f.write("x")
+        os.utime(p, (old, old))
+    removed = scdata.gc_stale_sidecars_in_dir(root, now=now)
+    removed_names = [os.path.basename(p) for p in removed]
+    # P0.7 源 jsonl（含点号 sid）必须被 GC（第五轮修复前会被误跳）
+    assert f"{p07_sid}.jsonl" in removed_names, "P0.7 含点号 sid 源 jsonl 须被 GC"
+    assert f"{p07_sid}.compact.json" in removed_names
+    assert f"{p07_sid}.p0.1" in removed_names
+    # 派生面 .model.jsonl 不独立判 TTL，但跟源 sid 走全族删（startswith 命中）
+    assert f"{p07_sid}.model.jsonl" in removed_names
+
+
 def test_gc_stale_excludes_ops_audit_bak_files(tmp_path):
     """F1（reviewer 第四轮 minor）：legacy active.jsonl 的 ops 审计文件
     （active.jsonl.bak_* / active.jsonl_cleaned_*）非 session 侧车，30 天 TTL

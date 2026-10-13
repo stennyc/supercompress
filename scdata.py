@@ -266,6 +266,14 @@ def gc_stale_sidecars_in_dir(store_dir: str, now: Optional[float] = None,
     判据：源 jsonl `<sid>.jsonl` mtime 超 retention_days → 删该 sid 全侧车族。
     返回实际删除的文件路径列表（空 = 无过期 / 目录不存在）。fail-open 零崩。
     """
+    # 派生面后缀白名单（非源 jsonl 的侧车文件，不参与 TTL 判定，跟源 sid 走全族删）。
+    # P0.7 碰撞加固 sid（`my_app_sid.bd345c0436.jsonl`，sid 本体含点）的源 jsonl 形仍
+    # 以 `.jsonl` 结尾且**不**以 `.model.jsonl` 结尾 → 正确识别为源（旧判据 `if "." in sid`
+    # 会把它当派生面误跳 = retention gap 无限增长，第五轮 reviewer minor 实修）。
+    _DERIVED_SUFFIXES: tuple = (
+        ".model.jsonl", ".compact.json", ".digests.json",
+        ".recall_cache.json", ".flock", ".audit",
+    )
     if now is None:
         now = time.time()
     root = store_dir
@@ -278,15 +286,14 @@ def gc_stale_sidecars_in_dir(store_dir: str, now: Optional[float] = None,
     except OSError:
         return []
     for name in names:
-        # 只以源 jsonl `<sid>.jsonl` 为判定基准（mtime 锚点）——排除派生面：
-        # `.model.jsonl`（B 卡旁路，sid 名含 '.' 前缀）/ `.compact.json` / `.digests.json`
-        # 都是派生侧车，跟源 sid 走，不独立判 TTL。纯源 jsonl 的文件名形 = `<sid>.jsonl`
-        # （sid 本体不含 '.'，见 _safe_session_name），故判据：ends .jsonl 且 stem 无 '.'。
+        # 只以源 jsonl `<sid>.jsonl` 为判定基准（mtime 锚点）。源 jsonl = ends .jsonl
+        # 且非派生面（`.model.jsonl` 等白名单后缀）。排除 `.p0.<sid>.<seq>`/`.p1.<sid>.<seq>`
+        # 沉盘（seq 在 sid 之后，非源判定基准，跟源 sid 走全族删）。
         if not name.endswith(".jsonl"):
             continue
-        sid = name[:-len(".jsonl")]
-        if "." in sid:          # 派生面（<sid>.model.jsonl 的 stem='<sid>.model' 含 '.'）→ 跳过
-            continue
+        if name.endswith(".model.jsonl"):
+            continue                      # B 卡旁路派生面，非源判定基准
+        sid = name[:-len(".jsonl")]      # P0.7 sid 含点号也照算（源 jsonl 形正确）
         jsonl_path = os.path.join(root, name)
         try:
             mtime = os.path.getmtime(jsonl_path)
