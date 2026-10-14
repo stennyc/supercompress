@@ -6,11 +6,16 @@ tail(protect_last_n=6) + staged 块（S1 尾投递到 tail 末条 user）。stag
 每次 compact 新替旧 → compact #2 重算块 → 位置 2/tail 字节全变 → provider 前缀缓存
 全量回落（根因矛盾，owner 指令"1 要"）。
 
-目标布局（owner 裁定）：
-    head(3) + [累计摘要账本 c#1, c#2, …（append-only，只增不回改旧块）] + 滚动 tail
-- 每次 compact 只 **append** 新块 c#N（N 跨压缩单调），已缓存旧块 c#1..c#N-1 字节
-  原样保留 → 前缀单调 → provider 前缀缓存跨 compact #1/#2/… 命中。
-- 唯一刷缓存位 = 滚动 tail（本就每 turn 变，便宜位）。
+目标布局（owner 裁定 · v6.1 页化 §2.4）：
+    head(3) + [页化账本 c#1..c#N（每页只装自己段新 entries + 页头 notes 区前页 settled
+    快照）] + 滚动 tail
+- 每次 compact 只 **append** 新页 c#N（N 跨压缩单调）；**旧页字节永不回改** →
+  无 settled 状态翻转时除最后一页外全部旧页字节不变 → provider 前缀缓存命中
+  除最后一页外的全部旧页（v6.1 新锚；旧「累计超集严格前缀」契约已随页化迁移，
+  见 tests/test_ledger_paging.py）。
+- 某页 later settle 只在它**之后**新页的 notes 区体现（快照冻结铁律 3），旧页字节冻结。
+- 唯一刷缓存位 = 滚动 tail（本就每 turn 变，便宜位）+ 状态翻转那次 compact 的
+  新页 notes 区（规则 4 一次性 flush）。
 - 封顶 / 轮转 = **整段清 + 重新积累**（seal：entries 清空、generation +1、seq 连续），
   不做 mid-block 回改（前缀已交付 provider 的旧字节永不被改写）。
 
@@ -65,10 +70,27 @@ def _trimmed_stub_line(seq: int, text: str, kind: str = "P1") -> str:
 
     参数名 `kind`（第三轮 owner 修正）：调用面传 `e.get("kind", "P1")`（'adhoc' /
     'kanban'，P1 块的 kind 审计值），存根渲染成 `#seq=N <kind> trimmed...`。
-    原形参名 `tier` 与实传值（kind）错位，本轮对齐。"""
+    原形参名 `tier` 与实传值（kind）错位，本轮对齐。
+    """
     import hashlib
     h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:_SETTLED_STUB_HASH_LEN]
     return f"#seq={seq} {kind} trimmed sha256={h} (full text in recall/store)"
+
+
+def evict_stub_line(seq: int, text: str, tier: str, anchor_ids: str) -> str:
+    """v6 §2.1（存根挂逐出事件）：80%/90% 逐出点（sc.distill 逐出翻 digest_only）
+    在 compact_ledger 活账本渲染面折的单行存根。
+
+    与 `_trimmed_stub_line` 同形（复用其 sha256 审计 + 定位提示渲染），但定位面
+    不同：被逐出段原文锚在 **durable 锚点**（store fsync+读回的 content_hash，
+    复用现有锚点发射机制，owner 选 a 零新增沉盘），`anchor_ids` = 该段 durable
+    锚点 segment_id 串（多个用 ", " 连接；无 durable 锚点的段不逐出存根——
+    锚点未发射 = 逐出未发生，见 sc.distill 逐出接线面）。
+    存根与 §2.4 页头 notes 区正交（T10）：本行写在逐出段自己那页的 entries 面，
+    不进 notes 区快照；召回段（§2.2 source=recall）恒不产生本行。"""
+    import hashlib
+    h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:_SETTLED_STUB_HASH_LEN]
+    return f"#seq={seq} {tier} evicted sha256={h} (durable anchors: {anchor_ids})"
 
 
 def compact_ledger_path_for_jsonl(jsonl_path: str) -> str:
@@ -102,7 +124,11 @@ class CompactLedger:
         self.max_tokens = max_tokens
         self.max_entries = max_entries
         self._log = logger
-        self.entries: List[Dict[str, Any]] = []   # [{"seq","text","tokens",,"settled","kind"}]
+        # v6.1 页化（§2.4）：每 entry = 一页 c#N。页面只装自己段的新 entries
+        # （`text` 全文恒在、不在 notes 区折存根）；`notes` = 该页写入那一刻
+        # 前 N-1 页各自 settled 状态的一行快照（list of (seq, settled_flag)），
+        # 写定后永不回改（快照冻结铁律 1-4，见 text() 渲染面）。
+        self.entries: List[Dict[str, Any]] = []   # [{"seq","text","tokens","notes","settled","kind","trimmable","evicted"}]
         self.generation: int = 0
         self.seals: int = 0
         self.seq: int = 0
@@ -164,6 +190,14 @@ class CompactLedger:
                 for e in entries:
                     if (isinstance(e, dict) and isinstance(e.get("text"), str)
                             and isinstance(e.get("seq"), int)):
+                        _notes_raw = e.get("notes")
+                        # v6.1 页化 notes 区读面：旧盘（无 notes 键）→ 空快照
+                        # （前 N-1 页状态未知，fail-open 不回填 = 不回改旧页字节，
+                        # 只对新写页生效——旧页 notes 缺失按其写入时快照缺失渲染）。
+                        _notes = []
+                        if isinstance(_notes_raw, list):
+                            _notes = [(int(_p[0]), bool(_p[1])) for _p in _notes_raw
+                                      if isinstance(_p, (list, tuple)) and len(_p) == 2]
                         self.entries.append({
                             "seq": e["seq"], "text": e["text"],
                             "tokens": int(e.get("tokens") or est_tokens(e["text"])),
@@ -176,6 +210,10 @@ class CompactLedger:
                             "settled": bool(e.get("settled", False)),
                             "kind": str(e.get("kind", "adhoc")),
                             "trimmable": bool(e.get("trimmable", False)),
+                            "notes": _notes,
+                            # v6 §2.1：旧盘无 evicted 键 → 空串（未逐出，渲染面
+                            # 走原文/trimmed/settled 既有分支，fail-open 零扰动）
+                            "evicted": str(e.get("evicted", "")),
                         })
 
         try:
@@ -303,7 +341,8 @@ class CompactLedger:
         折存根后 entry 仍在账本、len 不降 → 条数帽永远超限 → 裁量层形同
         虚设、总被 ③ seal 兜底（= 编号空洞原样保留的根因）。"""
         return sum(1 for e in self.entries
-                   if not e.get("settled") and not e.get("trimmed"))
+                   if not e.get("settled") and not e.get("trimmed")
+                   and not e.get("evicted"))
 
     def append(self, text: str, forms: Optional[Dict[str, int]] = None,
                settled: bool = False, kind: str = "adhoc",
@@ -411,6 +450,13 @@ class CompactLedger:
         entry = {"seq": self.seq, "text": t, "tokens": tokens,
                  "settled": bool(settled), "kind": str(kind),
                  "trimmable": bool(trimmable)}
+        # v6.1 页化（§2.4）：每页 notes 区 = 该页写入那一刻前 N-1 页各自
+        # settled 状态的逐页一行快照（冻结）——写入后永不回改（快照冻结铁律 2/3：
+        # 某页 later settle 只在它之后的新页 notes 区体现，绝不回头改旧页，否则
+        # 旧页字节变 → 前缀缓存断）。零新状态面：快照 = 当前 entries 既有各页实态
+        # 的投影，append-only，不回读不回写旧页。
+        entry["notes"] = [[e["seq"], bool(e.get("settled"))]
+                          for e in self.entries]
         # 3-A 账实一致：直接 append(settled=True) 的块按存根实渲染权重记账（活渲染面
         # 折存根），与 settle() 翻转后的 tokens 口径对称；未 settled 块按原文全权重。
         if entry["settled"]:
@@ -492,26 +538,61 @@ class CompactLedger:
 
     # ───────────── 渲染（engine 只调本函数，零算法体）─────────────
     def text(self, new_text: str = "") -> str:
-        """累计段完整渲染（前缀单调）：既有块 c#1.. + 新块 c#N 拼接。
+        """累计段完整渲染（v6.1 页化 + 页头 notes 区快照冻结，§2.4）：
 
+        布局 = MARK 行 + 逐页「── 页 c#N ──」段（段间 \\n---\\n 分隔，既有消费面
+        零扰动）：
+          页 c#N = 页头 notes 区（该页写入时前 N-1 页各自 settled 一行快照）
+                 + 本页 entries（自己段的新 message 全文，恒在、不在 notes 区折存根）
+        快照冻结铁律（T8/T9 锁死）：
+          - 每页 c#N 只装自己段的新 entries（规则 1）；
+          - 页头 notes 区 = 写入那一刻的前 N-1 页 settled 快照（规则 2），写定后永不回改；
+          - 某页 later settle 只在它之后的新页 notes 区体现（规则 3），旧页字节冻结；
+          - 无 settled 翻转时除最后一页（新页）外全部旧页字节不变（规则 4）→
+            provider 前缀缓存命中除最后一页外的全部旧页（v6.1 新锚；旧「累计超集
+            严格前缀」契约已随页化迁移，见 tests/test_ledger_paging.py）。
+        存根与 notes 区正交（T10）：被逐出段存根行（v6 §2.1 evict_stub_line）写在
+        逐出段自己那页的 entries 面；召回段（§2.2 source=recall）恒不进 notes 区。
         未传 new_text = 只渲染已 append 的既有条目（幂等读面，compress() 常见调用）；
         传入 new_text = 预览「若再 append 一块」的前缀形态（new_text 与末条相同 → 不重复追加）。
         settled 块折出：settled=True 的 P0 块渲染为**单行存根**（_settled_stub_line），
         原文不吐——模型只看到「#seq P0 settled <hash> <kind>」，不重读全文（治重复问）；
         trimmed 块（R5 #2 封顶折存根的 P1 可裁层）同折单行存根（_trimmed_stub_line，
-        原文 recall/store 可定位、sha256 可核）；未 settled 未 trimmed 块照常渲染全文。
+        原文 recall/store 可定位、sha256 可核）；evicted 块（v6 §2.1 逐出存根）按
+        `evicted` 存根字段渲染；未折出块照常渲染全文。
+        旧盘兼容（fail-open）：无 `notes` 键的旧页（旧格式账本 reload）notes 区渲染
+        为「notes: -」占位一行（快照缺失不回填 = 不回改旧页字节，§2.4 铁律 3 精神），
+        旧页正文渲染面逐字节不变。
         空账本 → ""（engine 零发行账本消息）。"""
         all_entries = self.entries
         if new_text and (not all_entries or all_entries[-1]["text"] != new_text):
-            all_entries = all_entries + [{"seq": self.seq + 1, "text": str(new_text),
-                                          "tokens": est_tokens(new_text)}]
+            _preview = self.entries + [{"seq": self.seq + 1, "text": str(new_text),
+                                       "tokens": est_tokens(new_text)}]
+            _preview[-1].setdefault("notes",
+                                    [[e["seq"], bool(e.get("settled"))]
+                                     for e in self.entries])
+            all_entries = _preview
         if not all_entries:
             return ""
         # P5：存根定位提示渲染真实盘形 <sid>.p0.<seq>（sid 从 self.path 基名取）
         _sid = os.path.splitext(os.path.basename(self.path))[0].replace(".compact", "")
         lines = [f"{MARK} generation={self.generation} seals={self.seals}"]
-        for e in all_entries:
-            if e.get("trimmed"):
+        for i, e in enumerate(all_entries):
+            # 页头 notes 区：本页写入时前 N-1 页的 settled 快照（冻结）。
+            # 旧盘（无 notes 键）→ 空快照 → "notes: -" 占位（不回填旧页）。
+            _notes = e.get("notes")
+            if _notes:
+                lines.append(f"── 页 c#{e['seq']} ──")
+                lines.append("notes " + " ".join(
+                    f"c#{_n}={ 'settled' if _s else 'open' }"
+                    for _n, _s in _notes))
+            else:
+                lines.append(f"── 页 c#{e['seq']} ──")
+                lines.append("notes: -")
+            if e.get("evicted"):
+                # v6 §2.1 逐出存根：原文退场（durable 锚点定位，evict_stub_line 渲染）
+                lines.append(e["evicted"])
+            elif e.get("trimmed"):
                 # R5 #2：trimmable P1 块被封顶裁 → 单行存根（不硬删 = 无编号空洞；
                 # 原文 recall/store 可定位，sha256 可核）
                 lines.append(f"c#{e['seq']}: " + _trimmed_stub_line(e["seq"], e["text"], e.get("kind", "P1")))
@@ -521,6 +602,61 @@ class CompactLedger:
             else:
                 lines.append(f"c#{e['seq']}: {e['text']}")
         return "\n---\n".join(lines)
+
+    # ───────────── v6 §2.1 存根挂逐出事件（engine 逐出点接线，§2.1 唯一新增环节）────
+    def evict_page(self, seq: int, tier: str, anchor_ids: str) -> Optional[Dict[str, Any]]:
+        """被逐出段（80%/90% 水线翻 digest_only）在自己那页折单行逐出存根。
+
+        复用 `_trimmed_stub_line` 渲染形态（sha256 可审计 + 定位提示），定位面 =
+        durable 锚点 segment_id 串（owner 选 a：复用现有 fsync+读回锚点，零新增沉盘）。
+        幂等：该页已折 evicted 存根 → None（零写盘）；找不到 seq → None（fail-open，
+        账本与窗口漂移时不炸宿主）。与 §2.4 notes 区正交（T10）：存根行写在本页
+        entries 面（`e["evicted"]`），不影响页头 notes 快照（notes 只记 settled）；
+        与 §2.2 召回段正交：source=recall 段恒不进账本（engine 结算点先清），
+        本方法只对真逐出段调用，恒不产生召回存根（T4 防递归）。
+
+        LOW-4 去重门控（owner 拍板）：同一 segment_id 已在活账本内折过 evicted 存根
+        （跨多次 compact 重 staged → 新账本页逐出 cb 折新页存根，sha256 相同）时，
+        本方法直接返回 None（幂等零写盘）——去重判据 = 扫描 `self.entries` 中
+        既有任何 `evicted` 字段是否已含 `(durable anchors: <anchor_ids>)` 子串，
+        纯内存读、零 LLM、零宿主、fail-open（扫描异常 → 继续走正常折存根面，
+        不炸宿主）。不同 segment_id 的存根不受影响（不误并）。"""
+        _anchor_key = f"(durable anchors: {str(anchor_ids)})"
+        for _e in self.entries:
+            if _e.get("evicted") and _anchor_key in _e["evicted"]:
+                if self._log is not None:
+                    self._log.info("compact-ledger: evict_page dedup skip "
+                                    "(anchor %s already stubbed in c#%s)", anchor_ids, _e["seq"])
+                return None
+        for e in self.entries:
+            if e["seq"] == seq:
+                if e.get("evicted"):
+                    return None                       # 幂等快退
+                e["evicted"] = evict_stub_line(seq, e["text"], str(tier), str(anchor_ids))
+                e["trimmed"] = True                   # 存根块不占条数帽位（同 trimmed 口径）
+                e["tokens"] = est_tokens(e["evicted"]) # 3-A 账实单口径：封帽用存根实权重
+                self._persist()
+                return e
+        return None
+
+    # ───────────── v6 §2.2 召回暂存先清（owner 选 i 直接丢，不进存根账）─────────────
+    def discard_entries(self, seqs) -> int:
+        """直接丢弃指定 seq 的账本页（owner 选 i：不留占位、不进存根账）。
+
+        召回暂存段（source=recall，compact 结算点先清）是临时捞回、用完即弃——
+        不进活会话 P0 存根账（防递归多存根，T4 关键：召回段恒不进存根账）。
+        durable 锚点仍在 store 可审计（丢弃 ≠ 删数据）。`seqs` = 被丢页 seq 集；
+        幂等（重复丢弃 = 只丢第一次找到的）；找不到任何 seq → 0（零写盘，fail-open）。
+        返回实丢页数（engine 观测面日志用）。丢弃后 seq 不回填——编号空洞只可能
+        出现在「账本活面」（丢弃面），封帽判定按剩余页实值计（`_full_block_count`
+        / `_token_sum` 天然只数现存 entries），seal 兜底语义零变化。"""
+        _seqs = set(seqs)
+        _before = len(self.entries)
+        self.entries = [e for e in self.entries if e["seq"] not in _seqs]
+        _n = _before - len(self.entries)
+        if _n:
+            self._persist()
+        return _n
 
     # ───────────── settled 状态翻转面（append-only：只置位/清位，不回改旧字节）─────────────
     def settle(self, seq: int, kind: str = "adhoc") -> Optional[Dict[str, Any]]:

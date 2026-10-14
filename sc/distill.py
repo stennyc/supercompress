@@ -89,13 +89,17 @@ class Distiller:
     """纯蒸馏器 + 锚点发射器：不持有状态、不取数、不直接写 jsonl（记忆层管存）。"""
 
     def __init__(self, window: Window, store, aux, inject_fault_after: str | None = None,
-                 force_evict: bool = False, force_ratio: float = 0.75) -> None:
+                 force_evict: bool = False, force_ratio: float = 0.75,
+                 ledger_evict_cb=None) -> None:
         self.window = window
         self.store = store
         self.aux = aux
         self.inject_fault_after = inject_fault_after
         self.force_evict = force_evict
         self.force_ratio = force_ratio    # R3 逃生门压力线（默认 0.75 = engine force_compact_ratio 同源）
+        # v6 §2.1：存根挂逐出事件闭包（engine 注入，形参 = 被逐出段 segment；
+        # 缺省 None = 原逐出语义零变化——既有 Distiller 调用面/测试面不受影响）
+        self.ledger_evict_cb = ledger_evict_cb
         self.push_cap_tokens = push_cap(window)   # Push cap 读共享分母（一处定义）
         self.events: list[str] = []
 
@@ -155,14 +159,16 @@ class Distiller:
 
         # 4. 80% 软水位：P2 → P1 逐出至水位（P3 梯级：90% 水线不逐 P0/AC——P0 只走
         #    ① push cap（P0 常驻集 ≤15%）② 100% force_evict 兜底 两出口；本档 P0 豁免）
-        self._evict_until(w, water, aux, result, tiers=("P2", "P1"))
+        #    v6 §2.1：存根挂逐出事件（engine 注入 cb 时，durable 被逐出段在活账本折存根）
+        self._evict_until(w, water, aux, result, tiers=("P2", "P1"),
+                          ledger_evict_cb=self.ledger_evict_cb)
 
         # 5. push cap：P0 常驻集 ≤ 15%（goal / structural P0 永不裁）
         while self._p0_resident_tokens(w) > self.push_cap_tokens:
             cand = self._next_candidate(w, aux, tiers=("P0",))
             if cand is None:
                 break
-            self._evict(cand, result)
+            self._evict(cand, result, self.ledger_evict_cb)
 
         # 6. gate⑤ 故障注入点（off-by-default：生产恒 inert；SC_INJECT_FAULT=1 → 真生效）
         if self.inject_fault_after and marker_enabled():
@@ -241,16 +247,32 @@ class Distiller:
         return None
 
     def _evict_until(self, w: Window, water: int, aux, result: DistillResult,
-                     tiers: tuple = ("P2", "P1", "P0")) -> None:
+                     tiers: tuple = ("P2", "P1", "P0"),
+                     ledger_evict_cb=None) -> None:
         while w.used_tokens > water:
             cand = self._next_candidate(w, aux, tiers=tiers)
             if cand is None:
                 break                               # 无段可逐（结构 P0 钉死 / P0 digest 未 ready）
-            self._evict(cand, result)
+            self._evict(cand, result, ledger_evict_cb)
 
-    def _evict(self, ws: WindowSeg, result: DistillResult) -> None:
+    def _evict(self, ws: WindowSeg, result: DistillResult,
+               ledger_evict_cb=None) -> None:
+        """逐出 + v6 §2.1 存根挂逐出事件（唯一新增环节）。
+
+        `ledger_evict_cb`（engine 注入的闭包，形参 = 被逐出段 segment）缺省
+        None = 原逐出语义零变化（既有 `self._evict(cand, result)` 调用面不受影响）。
+        逐出段原文已 durable（`store.durable` fsync+读回锚点，与 `_emit_anchors`
+        同源过滤，owner 选 a 零新增沉盘）→ 闭包在活账本对应页折单行存根
+        （`evict_page`，`evict_stub_line` 渲染，指向 durable 锚点 segment_id）；
+        非账本段 / 非 durable 段 = 逐出照旧、不折存根（T1/T2 存根面只覆盖已在
+        活账本里的被逐出段；召回段 source=recall 恒不进账本 → 恒不折存根，
+        T4 防递归）。`evict_page` 全 fail-open（找不到 seq / IO 失败 → 静默）。"""
         ws.form = "digest_only"
         result.dropped.append(ws.segment)
+        if ledger_evict_cb is None:
+            return
+        if ws.segment.content_hash in getattr(self.store, "durable", set()):
+            ledger_evict_cb(ws.segment)
 
     def _p0_pending_escape_allowed(self, w: Window) -> bool:
         """R3 逃生门谓词（pending 兜底）：端点持续劣化 + digest 全 pending + 窗口超压。

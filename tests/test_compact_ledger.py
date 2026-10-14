@@ -96,8 +96,12 @@ def test_ledger_path_single_source():
 
 # ─────────────────────────── GREEN 核心：append-only 前缀单调 ───────────────────────────
 def test_ledger_appends_across_compacts_and_prefix_stable(tmp_path):
-    """compact #1→#2 间，账本块 append-only 累计——c#1 字节原样保留（c#2 顶上追加）→
-    前缀单调 → provider 前缀缓存跨 compact 命中。现状（RED）：无账本块（_ledger_section=""）必失败。"""
+    """v6.1 页化契约（§2.4 迁移）：compact #1→#2 间账本**按页** append——
+    每页 c#N 只装自己段的新 entries + 页头 notes 区（前 N-1 页 settled 快照），
+    旧页字节冻结（无 settled 翻转时恒不变）→ provider 前缀缓存命中除最后一页
+    外的全部旧页（v6.1 新锚；旧「累计超集严格前缀」契约 c2.startswith(c1) 已随
+    页化迁移——页头 notes 区让新页不是旧页的严格字节前缀，改断言「旧页段原样
+    在 + 每页只装自己」）。"""
     e = _mk(tmp_path)
     e.on_session_start("s_ledger")
     _seed_user(e, "网关限流阈值调至每秒五百请求并配置告警通知")
@@ -107,19 +111,43 @@ def test_ledger_appends_across_compacts_and_prefix_stable(tmp_path):
     c1 = _ledger_section(out1)
     assert "c#1" in c1, "compact #1 账本块须含 c#1（RED 现状：无账本块）"
     assert e._ledger.entries and e._ledger.entries[0]["text"] in c1, "账本条 = staged 块原文"
-    assert _blocks(c1) == ["c#1"]
+    _page1 = _page_segment(c1, "c#1")
+    assert _page1, "页 c#1 页段在场"
+    assert "notes: -" in _page1, "页 c#1 notes 区 = 首页空快照（notes: - 占位）"
+    assert "c#2" not in _page1, "页 c#1 不含 c#2 正文（每页只装自己）"
 
-    # compact #2：窗口又长大（+新 user 段），账本追加 c#2 且 c#1 字节不动
+    # compact #2：窗口又长大（+新 user 段），账本追加页 c#2 且页 c#1 字节冻结
     _seed_user(e, "回滚开关位置在网关配置第三节保留现场")
     out2 = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
     c2 = _ledger_section(out2)
-    assert "c#2" in c2 and "c#1" in c2, "compact #2 账本块 = c#1 + c#2（累计非新替旧）"
-    assert c2.startswith(c1), "前缀单调：c#1.. 旧块字节原样是 c#2 的严格前缀（append-only）"
-    assert _blocks(c2) == ["c#1", "c#2"], _blocks(c2)
+    assert "c#2" in c2 and "c#1" in c2, "compact #2 账本块含 c#1 + c#2 两页"
+    _p1_in_c2 = _page_segment(c2, "c#1")
+    assert _p1_in_c2.rstrip("\n---") == _page1, \
+        "旧页字节冻结：页 c#1 段在 c#2 渲染中原样（无 settled 翻转；尾部页间分隔符除外）"
+    _p2 = _page_segment(c2, "c#2")
+    assert "c#2" in _p2, "页 c#2 页段在场"
+    assert "回滚开关位置在网关配置第三节保留现场" in _p2, "页 c#2 只装自己（本段新增 entries）"
+    assert "c#1=" in _p2, "页 c#2 notes 区带 c#1 settled 快照（跨页一行索引，不重吐 c#1 全文）"
+    assert "notes c#1=open" in _p2, "c#1 未定案 → notes 快照 open（settled 翻转前恒 open）"
+    # 页化渲染：c#1/c#2 标记总数 = 页头（2）+ notes 区（页 c#2 带 1 处 c#1）+ 正文行内（2）
+    # = c#1 共 3（页头 1 + notes 1 + 正文行内 1）、c#2 共 2（页头 1 + 正文行内 1）
+    assert _blocks(c2).count("c#1") == 3 and _blocks(c2).count("c#2") == 2, _blocks(c2)
     # 账本块落 head/tail 缝（middle 注入位）：非首、非尾（唯一刷缓存位 = 滚动 tail）
     idx_ledger = next(i for i, m in enumerate(out2) if MARK in str(m.get("content", "")))
     assert 0 < idx_ledger < len(out2) - 1, "账本块须在 head 与滚动 tail 之间（非头非尾）"
     assert all(MARK not in str(m.get("content", "")) for m in out2[:idx_ledger])
+
+
+def _page_segment(section: str, tag: str) -> str:
+    """取 section 里某页「── 页 c#N ──」整段（到下一个 ── 页 或 section 末）的字节，
+    尾部页间分隔符（\n---\n）裁掉（末尾页本就无分隔符；跨页比较时尾部差异归一）。"""
+    _re_tag = re.compile(r"── 页 c#\d+ ──")
+    _marks = list(_re_tag.finditer(section))
+    for _i, _m in enumerate(_marks):
+        if section[_m.start():_m.end()] == f"── 页 {tag} ──":
+            _end = _marks[_i + 1].start() if _i + 1 < len(_marks) else len(section)
+            return section[_m.start():_end].rstrip("\n---")
+    return ""
 
 
 # ─────────────────────────── 宿主 re-feed 去重（活体 compact #1→#2 面）───────────────────────────
@@ -190,11 +218,17 @@ def test_ledger_resets_on_session_reset(tmp_path):
     # 造第二块（积累 2 块）
     _seed_user(e, "第二块新段部署网关告警保留现场")
     out1b = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
-    assert len(_blocks(_ledger_section(out1b))) == 2, "reset 前累计 2 块"
+    _sec1b = _ledger_section(out1b)
+    assert _page_segment(_sec1b, "c#1") and _page_segment(_sec1b, "c#2"), \
+        "reset 前累计 2 块（页化：c#1 + c#2 两页）"
     e.on_session_reset()
     assert e._ledger.entries == [] and e._ledger.generation >= 1, "reset = 整段清"
     out2 = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
-    assert len(_blocks(_ledger_section(out2))) == 1, "reset 后只重新积累 1 块（旧 c#1/c#2 全清）"
+    _sec2 = _ledger_section(out2)
+    # reset 后 seq 号单调推进（c#3），旧 c#1/c#2 页头全清：只 1 页在场
+    assert len(_page_marks(_sec2)) == 1, "reset 后只重新积累 1 页（旧 c#1/c#2 页头全清）"
+    assert not _page_segment(_sec2, "c#1") and not _page_segment(_sec2, "c#2"), \
+        "旧页 c#1/c#2 不跨 reset 续写（seq 号单调推进到新页号）"
 
 
 # ─────────────────────────── 同 session 冷重开：账本字节不动（跨进程 append-only）───────────────────────────
@@ -235,18 +269,23 @@ def test_ledger_rebinds_on_carry_over_rotation(tmp_path):
     e.on_session_start("old_s")
     _seed_user(e, "网关限流阈值调至每秒五百请求并配置告警通知")
     out1 = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
-    assert len(_blocks(_ledger_section(out1))) == 1, "旧 session 首块 c#1"
+    _sec1 = _ledger_section(out1)
+    assert _page_segment(_sec1, "c#1"), "旧 session 首块 c#1"
     # 再喂一段 → 窗口变大 → 新 staged 块 → 追加 c#2（append-only 累计）
     _seed_user(e, "旧 session 第二段网关部署保留回滚入口工具输出")
     out1b = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
-    assert len(_blocks(_ledger_section(out1b))) == 2, "旧 session 累计 2 块（c#1 + c#2）"
+    _sec1b = _ledger_section(out1b)
+    assert _page_segment(_sec1b, "c#1") and _page_segment(_sec1b, "c#2"), \
+        "旧 session 累计 2 块（c#1 + c#2）"
     e.on_session_start("new_s", old_session_id="old_s", carry_over_context=True)
     lg = e._compact_ledger()
     assert lg.path == compact_ledger_path_for_jsonl(e.store.path), "账本随 store rebind 到新 session 侧车"
     assert lg.path.endswith("new_s.compact.json"), "新 session 侧车 = new_s（与旧 old_s 物理隔离）"
     assert lg.entries == [], "轮转 rebind 后新 session 账本从空起（旧 c#1/c#2 不跨 session 泄漏）"
     out2 = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
-    assert len(_blocks(_ledger_section(out2))) == 1, "新 session 只重新积累 1 块（c#1，非旧 2 块续写）"
+    _sec2 = _ledger_section(out2)
+    assert _page_segment(_sec2, "c#1") and not _page_segment(_sec2, "c#2"), \
+        "新 session 只重新积累 1 块（c#1，非旧 2 块续写）"
 
 
 def test_ledger_noop_when_no_middle_keeps_s1(tmp_path):
@@ -288,7 +327,15 @@ def test_ledger_fail_open_on_corrupt_sidecar(tmp_path):
     out = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)   # 不得抛
     assert _has_substr(MARK, out), "损坏侧车 fail-open：重置后正常积累"
     assert e._ledger.generation >= 1, "损坏侧车整段作废（generation 单调留痕）"
-    assert len(_blocks(_ledger_section(out))) == 1, "fail-open 后从空重新积累 1 块"
+    _sec = _ledger_section(out)
+    assert len([_m for _m in _page_marks(_sec)]) == 1, \
+        "fail-open 后从空重新积累 1 块（页化：恰 1 个 ── 页 c#N ── 页头）"
+    assert any("c#" in _m for _m in _page_marks(_sec)), "新页在场（seq 号随 scrap 单调推进）"
+
+
+def _page_marks(section: str) -> list:
+    """section 里所有「── 页 c#N ──」页头行（页化契约：页数 = 页头数）。"""
+    return [ln for ln in section.splitlines() if ln.startswith("── 页 c#")]
 
 
 # ─────────────────────────── 宿主 agent/ 零 diff 自检（红线条款）───────────────────────────

@@ -780,6 +780,16 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # = 8 次 compact 的分层块；P1 可裁层封顶优先裁，实际活跃块 = P0 定案数（≤8）。
         self.compact_ledger_max_entries: int = int(_get("compact_ledger_max_entries", 16))
         self._ledger: Optional[CompactLedger] = None
+        # v6 §2.1 存根挂逐出事件门控：账本侧车是否已 materialize（短会话/空 store
+        # 从不触碰账本 → 逐出存根 cb 无账本可写 → 禁用 cb，Distiller 零新写面）。
+        self._compact_ledger_enabled: bool = False
+        # 本轮召回段 segment_id 集（source=recall 轻标记，instance 态、不动 content
+        # 字节）——compact 结算点先扫上轮召回段集：这些段临时捞回用完即弃，
+        # 不参与存根折叠、直接丢弃（不进活账本 P0 存根账）→ 同信息「原始存根 +
+        # 召回再存根」N 次仍只 1 条存根（T4 防递归关键：召回段恒 source=recall、
+        # 恒不进存根账）。
+        self._last_recall_seg_ids: set = set()
+        self._last_recall_page_seqs: list = []
 
         # R1 版本戳（报告#1 #1）：构造期算一个稳定 build_id —— 一眼判断"本进程跑的
         # 到底是哪一代"：git checkout → 短 sha（working tree 有改动带 -dirty）；env 冻结
@@ -979,6 +989,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
             logger=logger,
         )
         self._ledger = lg
+        # v6 §2.1：账本 materialize → 启用逐出存根 cb 门控
+        self._compact_ledger_enabled = True
         return lg
 
     def _compact_ledger_reset(self) -> None:
@@ -992,6 +1004,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
             lg.reset()
             logger.info("supercompress: compact-ledger reset (session boundary) "
                         "generation=%d seals=%d path=%s", lg.generation, lg.seals, lg.path)
+        # 会话边界整段清 → 账本回到未 materialize 态（零新写面：短会话门控语义保持）
+        self._compact_ledger_enabled = False
 
     # ── settled P0 半自动翻转面（owner 裁定 B 路线：引擎侧闭环，看板 task 重新活跃 → unsettle 复活）──
     def kanban_candidates(self) -> List[Dict[str, Any]]:
@@ -1872,6 +1886,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
             _reused = self._recall_cache_try_reuse(query, p4_terms, p4_verdicts)
             if _reused is not None:
                 recalled = _reused
+                # v6 §2.2：cache-hit 复用面同样打 source=recall 轻标记（复用段 id 集
+                # 来自上轮 _recall_cache_store 写回的 seg_ids；召回段恒 source=recall）
+                self._last_recall_seg_ids = set(
+                    _s for _s in (self._recall_cache.get("seg_ids", []) if self._recall_cache else []))
                 out = _s1_tail_deliver(
                     request_messages, "[supercompress recall]\n" + "\n\n".join(recalled))
                 logger.info("supercompress: recall cache-hit (reused prev, K=%d)",
@@ -1953,10 +1971,74 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 [sid for (_x, sid) in _bg + _p0],
                 recalled,
                 len(recalled))
+            # v6 §2.2：召回段 source=recall 轻标记（instance 态记本轮召回段 id 集，
+            # 不动 content 字节）——compact 结算点据此先清上轮召回暂存段（直接丢，
+            # 不进存根账 → 防递归多存根）。
+            self._last_recall_seg_ids = set(sid for (_x, sid) in _bg + _p0)
             return out
         except Exception as e:
             logger.warning("supercompress: select_context no-op (recall degraded): %s", e)
             return None
+
+    def _evict_seq_index(self, lg) -> Dict[str, int]:
+        """v6 §2.1：活账本 staged 块行首段标记 `seq=<全局段序>` → 账本页 seq 索引（精确映射面）。
+
+        锚定面（MED-2）：只认 `_staged_by_tier`/`render_block` 行首段标记位整段行形
+        `#<rel> <tier> prov=… seq=<全局>`（tier ∈ P0/P1/P2，`\\w+` 单源容忍 form 字面
+        漂移），**绝不**吃 body 散落的字面 `seq=NNN`（代码片段 / 日志行 / 重渲染段首）
+        ——裸 `seq=(\\d+)` 误命中面 = 存根折错页 / 召回先清误丢非召回页（reviewer A）。
+        L0 高压行形 `#seq tier [segment_id] on-demand`（sc/inject._l0_ptr，缓存锚位）
+        行首无 `seq=` 位 → 恒不匹配：L0 段**不折存根**（MED-1 owner 裁定 (b)——高压
+        最小足迹兜底，存根意义小；数据零损失：原文 durable 锚点仍在 store 可审计，
+        `_make_evict_stub_cb` 映射 miss = fail-open 零数据损失既有口径）。
+        `_make_evict_stub_cb` 与 compress 结算点召回先清共用本单源正则，零双写。
+        纯读内存面，零持久态。"""
+        _idx: Dict[str, int] = {}
+        try:
+            _seq_re = re.compile(r"(?m)^#\d+ \w+ prov=\S+ seq=(\d+)")
+            for _e in lg.entries:
+                for _m in _seq_re.finditer(_e.get("text", "")):
+                    _idx[_m.group(1)] = _e["seq"]
+        except Exception:
+            _idx = {}
+        return _idx
+
+    def _recall_page_seqs(self, ledger, global_seqs) -> List[int]:
+        """§2.2 结算点召回先清映射面（MED-2 单源）：全局段 seq → 含该段的账本页 seq 集。
+
+        映射源 = `_evict_seq_index(ledger)`（行首段标记位锚定，同 §2.1 存根面）；
+        body 字面 `seq=NNN` 不再参与（误丢非召回页缺陷修复）；L0 行形（无 `seq=` 位）
+        恒不映射（L0 段逐出/召回均不折存根、不先清映射——fail-open 口径同源）。"""
+        _drop: List[int] = []
+        _want = set(int(_g) for _g in global_seqs)
+        for _g, _page_seq in self._evict_seq_index(ledger).items():
+            if int(_g) in _want:
+                _drop.append(_page_seq)
+        return _drop
+
+    def _make_evict_stub_cb(self):
+        """v6 §2.1 存根挂逐出事件 cb 工厂（壳内闭包，只调 sc 组件，无算法体）。
+
+        被逐出段（80%/90% 水线翻 digest_only，原文已 durable）→ 活账本对应 staged 块页
+        折单行存根（`evict_page`，`evict_stub_line` 渲染，指向 durable 锚点 segment_id）；
+        精确映射 = 块内 `seq=<全局段序>` 索引（`_evict_seq_index`），映射缺失（段不在
+        活账本里）→ 逐出照旧不折存根（零数据损失：durable 锚点仍可审计）。
+        全 fail-open（IO 失败只告警不炸宿主）；账本未 materialize（短会话/空 store）→
+        返回 None（Distiller 零新写面，T5 55% 分页面字节不变门控）。"""
+        if not self._compact_ledger_enabled:
+            return None
+
+        def _v6_evict_stub(_seg):
+            _lg = self._ledger
+            if _lg is None:
+                return
+            try:
+                _page_seq = self._evict_seq_index(_lg).get(str(_seg.seq))
+                if _page_seq is not None:
+                    _lg.evict_page(_page_seq, _seg.tier, _seg.segment_id)
+            except Exception as _e:
+                logger.warning("supercompress: evict-ledger-stub wiring degraded: %s", _e)
+        return _v6_evict_stub
 
     def compress(
         self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None,
@@ -1983,15 +2065,18 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     logger.warning("supercompress: overflow %d tokens > 50%% push_cap %d, "
                                    "enabling force_evict_mode", overflow, push_cap)
                     self._force_evict_mode = True
-            # 执行 distill（R3：force_ratio 接同源配置 force_compact_ratio）
+            # 执行 distill（R3：force_ratio 接同源配置 force_compact_ratio；
+            # v6 §2.1 存根挂逐出事件：cb 在 80%/90% 逐出点把 durable 被逐出段在活账本折存根）
             result = Distiller(window, self.store, self._aux, force_evict=self._force_evict_mode,
-                               force_ratio=self.force_compact_ratio).run()
+                               force_ratio=self.force_compact_ratio,
+                               ledger_evict_cb=self._make_evict_stub_cb()).run()
             # 如果 normal distill 失败（transient_skip）且未启用 force_evict，自动降级
             if result.status == "backpressure" and not self._force_evict_mode:
                 logger.warning("supercompress: distill backpressure, trying force_evict")
                 self._force_evict_mode = True
                 result = Distiller(window, self.store, self._aux, force_evict=True,
-                                   force_ratio=self.force_compact_ratio).run()
+                                   force_ratio=self.force_compact_ratio,
+                                   ledger_evict_cb=self._make_evict_stub_cb()).run()
                 logger.info("supercompress: force_evict result status=%s events=%s",
                             result.status, result.events)
             if result.status not in ("ok", "backpressure"):
@@ -2133,6 +2218,26 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 #     （candidate 提名，宿主 LLM 裁判 + clarify 确认后调 settle_p0 折出）；
                 #   - "none"   不定案：双信号都未命中 → settled=False + kind=adhoc
                 #     （未定案段照常全量回喂，治「重复问」只对真定案段生效）。
+                # v6 §2.2（§2.2 owner 选 i）：上轮召回段 id 集（source=recall，
+                # select_context 注入 head 时打的轻标记）在 staged 块计算前消费——
+                # 对应账本页直接丢弃（不进存根账、不留占位）→ 同信息「原始存根 +
+                # 召回来回 N 次」活账本只 1 条存根（T4 防递归）。丢弃 = entries 面
+                # 删除；durable 锚点仍在 store 可审计（丢弃 ≠ 删数据）。
+                if self._last_recall_seg_ids:
+                    _recall_seqs = {s.seq for s in self.store.replay()
+                                    if s.segment_id in self._last_recall_seg_ids}
+                    # MED-2 单源映射：行首段标记位锚定（_evict_seq_index），body 字面
+                    # seq=NNN 不再参与误丢面；L0 行形恒不映射（fail-open 同源）。
+                    _drop_page_seqs = self._recall_page_seqs(ledger, _recall_seqs)
+                    if _drop_page_seqs:
+                        ledger.discard_entries(_drop_page_seqs)
+                        self._last_recall_page_seqs = list(_drop_page_seqs)
+                        logger.info("supercompress: compact-ledger discarded %d "
+                                    "source=recall page(s) (recall staging cleared "
+                                    "before settle, anti-recursive stubs)",
+                                    len(_drop_page_seqs))
+                    else:
+                        self._last_recall_page_seqs = []
                 _p0_block, _p0_forms = _staged_by_tier(_expanded, "P0")
                 _p1_block, _p1_forms = _staged_by_tier(_expanded, "P1")
                 _entry = None

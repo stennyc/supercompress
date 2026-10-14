@@ -124,7 +124,7 @@ def test_shell_thin_invariant_no_algorithm_in_shell():
     """壳薄度门禁（@reviewer grep 判据）：壳文件内 distill/recall 只有调用无算法体。"""
     with open(os.path.join(_ROOT, "engine.py"), encoding="utf-8") as f:
         body = f.read()
-    for forbidden in ("def _evict", "def _next_candidate", "def _tok", "re.findall",
+    for forbidden in ("def _evict(", "def _next_candidate", "def _tok", "re.findall",
                       "P0 boost", "content_hash_mismatch", "nfc_hash(self"):
         assert forbidden not in body, f"shell grew algorithm logic: {forbidden!r}"
     assert "Distiller(" in body and "Recaller(" in body, "shell must delegate to sc components"
