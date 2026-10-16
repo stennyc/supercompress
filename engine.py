@@ -455,6 +455,98 @@ def _staged_p0_decision(staged_block: str, forms: Optional[Dict[str, int]],
     return "none"
 
 
+# P0-1（T4 防递归闭环）：被丢页 text 重扫行首 seq 标记位 → 段全局 seq 集
+# （行形与 _evict_seq_index MED-2 锚定面同源：`#<rel> <tier> prov=… seq=<全局>`；
+# 存根行形 `#seq=N <tier> evicted` 行首无段号 → 不匹配，零反向误剔面）。
+_LEAD_SEQ_RE = re.compile(r"(?m)^#\d+ \w+ prov=\S+ seq=(\d+)")
+
+
+def _staged_ledger_dedup(rendered: list, ledger, engine) -> list:
+    """staged 块进账本前的 dedup（2026-10-16 owner 裁定 · 治 byte-superset 残留 + 账本头自嵌漏网）：
+
+    窗口 kept P0/P1 段里，「全局 seq 已在活账本 _evict_seq_index 内」的段 → 剔
+    （前页 c#N 已记该段全文，新页只靠 notes 区记账，不重吐）；
+    段文本 = 账本块头 / S1 staged 头自嵌段（宿主 re-feed 账本消息被当 model 段入库的池染段）→ 剔。
+
+    P0-1（T4 防递归 · 过渡轮面，owner 裁定 i 纪律）：T3 结算点先清（discard 旧账本页）
+    **之后**的那一轮，登记面 _last_recall_page_seqs 仍在 + 引擎侧丢弃前快照
+    _last_discarded_page_texts 重扫被丢页行首 seq 标记位 → 该过渡轮 staged 块里
+    仍会被重抓进新页的被丢页段剔除（防「旧账本页不重进活账本」被绕，治
+    「原始存根 + 召回来回 N 次」活账本递归堆积的 staged 块重吐面）。
+    过渡轮只有 1 轮：登记面随下一轮 compact 结算被消费清掉（_last_recall_page_seqs=[]
+    + _last_discarded_page_texts={}）后不再生效——段若仍在 store 窗口 = store→窗口
+    →staged 正常流，合法重入账（§2.2 owner 选 i 单轮纪律，非永久封禁；永久封禁
+    会让 T4 在反复召回段上把账本打成 0 页——递归的是 evicted 存根行，由 evict stub
+    去重门控锁死，与 staged 块重吐面正交）。
+
+    保守面：seq 映射 miss（_evict_seq_index fail-open 空 dict）/ 账本未 materialize
+    （ledger=None）/ 被丢页快照缺失 → 全保留（零误剔）。纯读 + 列表过滤，
+    零 mutation、零 LLM。
+
+    reviewer 复盘锚定边界（2026-10-16 · 非缺陷，裁定已核）：
+    - #2 L1 行形（`#1 P0 prov=user seq=5 · …`，sc.inject._l1_line）带全局 seq 定位位，
+      **本应**命中 `_LEAD_SEQ_RE` 进 drop 集（被丢页里 L1 段一并剔除 = intended）；
+      L0 行形无 `seq=` 位恒不命中（MED-1 同源，test_l0_segment_no_evict_stub 锁死）。
+      存根行形 `#seq=N <tier> evicted` 行首无段号 → 不命中，零反向误剔面。
+    - #3 body 内嵌「staged 块形 lead line 且带他段全局 seq」的有界误剔面：被扫进
+      drop 集后下轮登记面清掉即合法重入账（§2.2 单轮纪律同方向自愈），
+      非新缺陷类，不专门堵。
+    """
+    if ledger is None:
+        return list(rendered or [])
+    try:
+        _known_seqs = set(int(_k) for _k in engine._evict_seq_index(ledger))
+    except Exception:
+        return list(rendered or [])   # fail-open：映射不可用 → 全保留（不误剔）
+    # P0-1 过渡面（discard 当轮）：读引擎侧丢弃前快照，重扫被丢页行首 seq 标记位。
+    # 快照仅在登记面在场（_last_recall_page_seqs ≠ []）的当轮有效；下一轮登记面
+    # 被结算消费清掉 → 快照随之失效（T3 纪律的正常流恢复）。
+    _drop_seqs: set = set()
+    for _page_seq in (getattr(engine, "_last_recall_page_seqs", None) or []):
+        try:
+            _snap = getattr(engine, "_last_discarded_page_texts", None) or {}
+            _body = _snap.get(int(_page_seq), "")
+            if _body:
+                _drop_seqs.update(int(_m.group(1)) for _m in _LEAD_SEQ_RE.finditer(_body))
+        except Exception:
+            continue
+    # P0-1（T4 防递归 · §2.2 owner 选 i 单轮纪律）：本轮 T3 结算点即将 discard 的页
+    # （_last_recall_seg_ids → _recall_page_seqs 映射，dedup 先于 discard 跑）→
+    # 被丢页段该轮从已知集里豁免 + 进 drop 集：discard 后该段失活 index 映射，
+    # 若不重入账则账本 0 页（T4 防递归在反复召回段上把账本打成空）；下一轮登记面
+    # 被结算消费清掉后失效（段若仍在窗口 = store→窗口→staged 正常流）。
+    _pre_discard_seqs: set = set()
+    try:
+        # 单源：engine._recall_global_seqs() = 召回段 id 集 → 全局 seq 集
+        # （compress 结算点 T3 discard 决策同源，去冗余 store.replay() 扫描）
+        _pre_discard_pages = engine._recall_page_seqs(
+            ledger, set(engine._recall_global_seqs()))
+        for _page_seq in (_pre_discard_pages or []):
+            _entry = ledger.entry_by_seq(_page_seq)
+            if _entry:
+                _body = str(_entry.get("text", ""))
+                _ms = [int(_m.group(1)) for _m in _LEAD_SEQ_RE.finditer(_body)]
+                _pre_discard_seqs.update(_ms)
+                _drop_seqs.update(_ms)
+    except Exception:
+        pass
+    _out = []
+    for _item in (rendered or []):
+        _ws, _ff, _tx = _item
+        _seq = getattr(getattr(_ws, "segment", None), "seq", None)
+        if _seq is not None and int(_seq) in _known_seqs \
+                and int(_seq) not in _drop_seqs:
+            continue    # 已在账本内 → 剔（新页只靠 notes 区记账，不重吐）
+        # P0-1 过渡面：discard 当轮被丢页段 → 剔（§2.2 owner 选 i 单轮纪律）
+        if _seq is not None and int(_seq) in _drop_seqs \
+                and int(_seq) not in _pre_discard_seqs:
+            continue
+        if (_tx.startswith("[supercompress compact-ledger]")
+                or _tx.startswith("[supercompress] staged P0/P1 segments")):
+            continue    # re-feed 池染段 → 剔
+        _out.append(_item)
+    return _out
+
 def _expand_small_code_placeholders(rendered: list) -> list:
     """R5（owner 批次 A #6 · 记账面小占位符展开，确定性零 LLM，fail-open）：
 
@@ -790,6 +882,8 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # 恒不进存根账）。
         self._last_recall_seg_ids: set = set()
         self._last_recall_page_seqs: list = []
+        # P0-1（T4 防递归闭环）：discard 前快照被丢页 text（engine 侧，非账本面）
+        self._last_discarded_page_texts: Dict[int, str] = {}
 
         # R1 版本戳（报告#1 #1）：构造期算一个稳定 build_id —— 一眼判断"本进程跑的
         # 到底是哪一代"：git checkout → 短 sha（working tree 有改动带 -dirty）；env 冻结
@@ -2003,6 +2097,19 @@ class SupercompressContextEngine(sc_context_engine_base()):
             _idx = {}
         return _idx
 
+    def _recall_global_seqs(self) -> set:
+        """v6 §2.2 单源：上轮召回段 id 集 → 全局 seq 集。
+
+        `_last_recall_seg_ids`（select_context 注入 head 时打的轻标记）与
+        `_last_discarded_page_texts` 快照、`_staged_ledger_dedup` 的 pre-discard
+        豁免面共用——同一张 `store.replay()` 扫描，单点收敛（reviewer #1：
+        dedup 不再重扫 replay()，与 compress 结算点 T3 discard 决策同源）。
+        空召回 → 空集（fail-open，零误面）。纯读内存面。"""
+        _ids = self._last_recall_seg_ids
+        if not _ids:
+            return set()
+        return {s.seq for s in self.store.replay() if s.segment_id in _ids}
+
     def _recall_page_seqs(self, ledger, global_seqs) -> List[int]:
         """§2.2 结算点召回先清映射面（MED-2 单源）：全局段 seq → 含该段的账本页 seq 集。
 
@@ -2208,6 +2315,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 # 前缀单调契约不被陈旧旧段破坏（append-only 只增不改，旧段已被超集覆盖）。
                 out = [m for m in out if not str(m.get("content", "")).startswith(_COMPACT_LEDGER_PREFIX)]
                 ledger = self._compact_ledger()
+                # staged dedup（2026-10-16 · 治 byte-superset 残留 + 账本头自嵌漏网）：
+                # 剔「全局 seq 已在活账本」段 + re-feed 账本/staged 头自嵌段（T4 召回先清页异常保留），
+                # 新页 c#N 只装真新增段（前页已记段只靠 notes 区记账，不重吐全文）。
+                _expanded = _staged_ledger_dedup(_expanded, ledger, self)
                 # tier 分层（owner 裁定）：staged 块按 tier 拆 P0 定案块 + P1 推理可裁层，
                 # 分别 append 进账本——定案账本不再被 P1 推理段撑爆，P1 可裁层封顶优先裁。
                 #
@@ -2224,12 +2335,19 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 # 召回来回 N 次」活账本只 1 条存根（T4 防递归）。丢弃 = entries 面
                 # 删除；durable 锚点仍在 store 可审计（丢弃 ≠ 删数据）。
                 if self._last_recall_seg_ids:
-                    _recall_seqs = {s.seq for s in self.store.replay()
-                                    if s.segment_id in self._last_recall_seg_ids}
+                    # 单源：召回 id 集 → 全局 seq（_recall_global_seqs，dedup 豁免面同源）
+                    _recall_seqs = self._recall_global_seqs()
                     # MED-2 单源映射：行首段标记位锚定（_evict_seq_index），body 字面
                     # seq=NNN 不再参与误丢面；L0 行形恒不映射（fail-open 同源）。
                     _drop_page_seqs = self._recall_page_seqs(ledger, _recall_seqs)
                     if _drop_page_seqs:
+                        # P0-1（T4 防递归闭环）：丢弃前快照被丢页 text → 后续
+                        # _staged_ledger_dedup 的清算当轮过渡面（discard 后
+                        # entry_by_seq 已失活映射，dedup 靠快照剔除被丢页段，
+                        # 防「原始存根 + 召回来回 N 次」活账本递归堆积）。
+                        self._last_discarded_page_texts = {
+                            _ps: str((ledger.entry_by_seq(_ps) or {}).get("text", ""))
+                            for _ps in _drop_page_seqs}
                         ledger.discard_entries(_drop_page_seqs)
                         self._last_recall_page_seqs = list(_drop_page_seqs)
                         logger.info("supercompress: compact-ledger discarded %d "
@@ -2238,6 +2356,7 @@ class SupercompressContextEngine(sc_context_engine_base()):
                                     len(_drop_page_seqs))
                     else:
                         self._last_recall_page_seqs = []
+                        self._last_discarded_page_texts = {}
                 _p0_block, _p0_forms = _staged_by_tier(_expanded, "P0")
                 _p1_block, _p1_forms = _staged_by_tier(_expanded, "P1")
                 _entry = None
