@@ -2292,9 +2292,9 @@ class SupercompressContextEngine(sc_context_engine_base()):
                                {"role": "user",
                                 # R5（owner 批次 A #4 头去重）：消息头不再双渲染
                                 # generation/seals——单源 = section 首行 MARK
-                                # （ledger.text() 的 `[supercompress compact-ledger]
-                                # generation=… seals=…`），壳只做前缀标记 + 拼接，
-                                # 消「第 1/2 行重复」，壳薄度原则。
+                                # （ledger.text() 的 `[supercompress compact-ledger]`，
+                                # 2026-10-16 起首行零变体数字，壳只做前缀标记 + 拼接，
+                                # 壳薄度原则）。
                                 "content": _COMPACT_LEDGER_PREFIX + "\n" + section})
             else:
                 # 短会话：无 middle → 不发行账本前缀消息，staged 照走既有 S1 尾投递

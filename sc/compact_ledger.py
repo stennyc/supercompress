@@ -555,6 +555,14 @@ class CompactLedger:
         逐出段自己那页的 entries 面；召回段（§2.2 source=recall）恒不进 notes 区。
         未传 new_text = 只渲染已 append 的既有条目（幂等读面，compress() 常见调用）；
         传入 new_text = 预览「若再 append 一块」的前缀形态（new_text 与末条相同 → 不重复追加）。
+        header 面（2026-10-16 owner 裁定 · 前缀缓存面收窄）：首行 MARK **不再渲染
+        generation/seals 变体数字**——seal/scrap/reset 才 +1 的计数进活渲染面首行
+        = 前缀断裂点从「块头」扩散到「整个 section 前部旧页」（旧页字节不变也救不
+        回，前缀匹配从块头起算，首行变体 → 全落）。审计面单源保留：计数仍写在
+        <sid>.compact.json（generation/seals 键，_persist 零改动）+ logger.info
+        （append/scrap/reset 各观测位零改动）——活渲染面只读不渲染变体数字。
+        前缀缓存面收窄后 = 旧页字节不变（铁律 4）+ 尾行滚动 tail，header 变体
+        不再是已知刷位。
         settled 块折出：settled=True 的 P0 块渲染为**单行存根**（_settled_stub_line），
         原文不吐——模型只看到「#seq P0 settled <hash> <kind>」，不重读全文（治重复问）；
         trimmed 块（R5 #2 封顶折存根的 P1 可裁层）同折单行存根（_trimmed_stub_line，
@@ -576,7 +584,10 @@ class CompactLedger:
             return ""
         # P5：存根定位提示渲染真实盘形 <sid>.p0.<seq>（sid 从 self.path 基名取）
         _sid = os.path.splitext(os.path.basename(self.path))[0].replace(".compact", "")
-        lines = [f"{MARK} generation={self.generation} seals={self.seals}"]
+        # header 面收窄（2026-10-16）：首行只留 MARK（零变体数字）——前缀缓存命中面
+        # = 旧页字节不变 + 尾行滚动 tail；generation/seals 计数退审计面（JSON 侧车
+        # + logger，_persist 零改动），不进活渲染面。
+        lines = [MARK]
         for i, e in enumerate(all_entries):
             # 页头 notes 区：本页写入时前 N-1 页的 settled 快照（冻结）。
             # 旧盘（无 notes 键）→ 空快照 → "notes: -" 占位（不回填旧页）。
