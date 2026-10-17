@@ -43,6 +43,14 @@ MARK = "[supercompress compact-ledger]"
 SECTION_MARKER = f"{MARK} "
 _FORMAT_VERSION = 1
 
+# §2.5 页脚（owner 2026-10-16 拍 · 每页页尾 1 行固定历史参考指令，治漂移）：
+# 文案固定、不引用页号 N → 各页逐字节相同 → 旧页字节冻结（铁律 4 不破）、
+# 整条账本消息仍 append-only（旧页段含页脚是新一段渲染的严格前缀，前缀缓存不破）。
+# 推理面降级：模型读 c#1（最早 P0、漂移重灾区）时，c#1 自己的页脚就在几 token 之内
+# （同页尾）→ 旧段被当场标"历史参考、不作为任务"，指令贴身生效（不必够到最末页）。
+# token 面零扰动：不碰 ③ P0 push cap 15% / ④ 逃生门 / ⑤ cache-aware / settled 折存根。
+PAGE_FOOTER = "[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"
+
 # ── settled 折出 + 单行存根 + 落盘旧 P0（owner 裁定：L1 区 + 纯+半 + 看板走半）──
 # 不变量：存根 #seq == 盘文件名 <seq>.p0（一一对应，重开按 seq 捞原文）。
 # 存根 16 hex（session 内 seq 无碰撞，审计面够）；kind = kanban(半自动) / adhoc(纯自动)。
@@ -612,6 +620,10 @@ class CompactLedger:
                 lines.append(f"c#{e['seq']}: " + _settled_stub_line(e["seq"], e["text"], e.get("kind", "adhoc"), _sid))
             else:
                 lines.append(f"c#{e['seq']}: {e['text']}")
+            # §2.5 页脚（每页页尾 1 行固定历史参考指令，append-only 静态字节）：
+            # 各页逐字节相同（文案不引用页号）→ 旧页生成后字节冻结（铁律 4 不破），
+            # 整条账本消息仍 append-only（旧页段含页脚 = 新一段渲染严格前缀）。
+            lines.append(PAGE_FOOTER)
         return "\n---\n".join(lines)
 
     # ───────────── v6 §2.1 存根挂逐出事件（engine 逐出点接线，§2.1 唯一新增环节）────
