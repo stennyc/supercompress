@@ -33,16 +33,23 @@ class TestBlock1_Distill:
             assert got is not None and got.original_text == p.original_text, "P0 点查 0-loss"
 
     def test_p0_eviction_blocked_when_digest_pending(self, store, aux):
-        p0 = mkseg(store, "p0 pending fact " * 500, "P0")   # 7000 tok：真压穿水位
+        """旧锚更新（§4.5 90% 超压强制面 owner 拍板 2026-10-17）：
+
+        cap=1000 单段 7000 tok（700% over）→ 90% 超压强制面开 →
+        digest 未 ready 的 P0 走 head80 占位存根逐出（不再 backpressure）。
+        旧锚"turn 内 digest 未 ready → 逐不出"被 90% 面的绕 digest 闸取代。
+        """
+        p0 = mkseg(store, "p0 pending fact " * 500, "P0")   # 7000 tok：90% 超压（cap 1000）
         aux.start_turn()
         assert aux.ensure_digest(p0) is None, "turn 内 digest 入队未 ready"
         w = mk_window(1000, [p0])
         d = Distiller(w, store, aux).run()
-        assert d.status == "backpressure", "P0 逐不出（digest 未 ready）且超物理窗口 → 硬 backpressure"
-        assert w.segs[0].form == "resident", "P0 digest 未 ready → 不可逐出，保持常驻"
+        assert "p0_90pct_force" in d.events, "90% 超压强制面触发（纯超压驱动，aux 健康）"
+        assert w.segs[0].form == "digest_only", "digest 未 ready 的 P0 在 90% 超压时走 head80 占位存根逐出"
+        assert p0.digest_text and len(p0.digest_text) >= 80, "head80 占位摘要（原文头 80 字符）"
         aux.end_turn()  # digest 生成
         Distiller(w, store, aux).run()
-        assert w.segs[0].form == "digest_only", "digest ready 后 P0 可逐出"
+        assert w.segs[0].form == "digest_only", "digest ready 后 P0 仍 digest_only（幂等）"
 
     def test_p0_evictable_only_when_digest_ready(self, store, aux):
         p0 = mkseg(store, "p0 ready fact " * 500, "P0")     # 7000 tok：真压穿水位
@@ -54,6 +61,13 @@ class TestBlock1_Distill:
         assert any(m.segment_id == p0.segment_id for m in d.anchor_manifest)
 
     def test_structural_p0_and_ledger_tail_never_evicted(self, store, aux):
+        """旧锚更新（§4.5 90% 超压强制面）：cap=100 used≈335（335%）→ 90% 超压面开。
+
+        - user 指令 P0（kind=segment，structural）：90% 超压时放开可逐（owner 拍板 2026-10-17）
+        - ledger 尾 P0（kind=ledger，structural 结构地板）：永不逐
+        - 非结构 P0/P1/P2：走 ③/⑤/90% 面正常逐
+        status：90% 面可逐 user 指令 P0 + 非结构段 → 不再 backpressure（窗口压到 0.9cap 下）
+        """
         u = mkseg(store, "user: ship it and keep /srv/x " * 12, "P0", "user", structural=True)
         led = mkseg(store, "ledger:" * 45, "P0", "user", structural=True, kind="ledger",
                     goal="ship v1", phase_id="p1")
@@ -64,9 +78,9 @@ class TestBlock1_Distill:
         w = mk_window(100, [u, led, lp0, p1, p2])
         d = Distiller(w, store, aux).run()
         forms = {s.segment_id: s.form for s in w.segs}
-        assert forms[u.segment_id] == "resident", "structural P0 永不逐出"
-        assert forms[led.segment_id] == "resident", "活账本链尾永不逐出"
-        assert d.status == "backpressure", "钉死的 P0 单独顶穿物理窗口 → 硬 backpressure"
+        assert "p0_90pct_force" in d.events, "90% 超压强制面触发"
+        assert forms[led.segment_id] == "resident", "ledger 尾（结构地板）永不逐"
+        assert forms[u.segment_id] == "digest_only", "user 指令 P0 90% 超压放开可逐（head80 存根）"
 
     def test_p0_fsync_before_anchor_fail_safe(self, store, aux):
         p0 = Segment(kind="segment", tier="P0", provenance="model",
@@ -104,12 +118,17 @@ class TestBlock1_Distill:
         assert store.pending_count == 0
 
     def test_backpressure_only_on_physical_full(self, store, aux):
+        """旧锚更新（§4.5 90% 超压强制面）：cap=100 u≈270（270% over）→ 90% 超压面开。
+
+        user 指令 P0 走 head80 占位存根逐出 → 不再 backpressure（§4.5 的新行为）。
+        """
         p2s = [mkseg(store, f"fill {i} " * 40, "P2") for i in range(3)]
         d1 = Distiller(mk_window(100, p2s), store, aux).run()
         assert d1.status == "ok", "80% 是软目标不是硬闸：可暂越、不 backpressure"
         u = mkseg(store, "user: keep /srv/x " * 60, "P0", "user", structural=True)
         d2 = Distiller(mk_window(100, [u]), store, aux).run()
-        assert d2.status == "backpressure", "物理窗口满 → 硬 backpressure"
+        assert "p0_90pct_force" in d2.events, "90% 超压强制面触发"
+        assert d2.status == "ok", "90% 超压时 user 指令 P0 折存根逐出 → 窗口压下、不 backpressure"
 
     def test_transient_fail_single_event_self_heal(self, store, aux):
         ep = aux.main_endpoint

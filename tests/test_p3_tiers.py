@@ -132,7 +132,12 @@ class Test90Tier_P0Exempt:
     structural P0/AC 永不逐出、非结构 P0 只在 push cap / 100% force 下离开 90% 档。"""
 
     def test_structural_p0_and_ac_never_evicted_at_high_water(self, store, aux):
-        """AC（goal/ledger structural P0）在高压水位下永驻留（90% 档 + 100% force 都不逐）。"""
+        """旧锚更新（§4.5 90% 超压强制面）：cap=100 used≈427（427%）→ 90% 超压面开。
+
+        - goal 变量（kind=segment，user 指令 structural P0）：90% 超压时放开可逐（owner 拍板 2026-10-17）
+        - led（kind=ledger，结构地板）：永不逐
+        - 100% force 仍豁免 kind=ledger（活账本永不裁）
+        """
         from sc.distill import Distiller
         goal = mkseg(store, "user: ship it keep /srv/x " * 12, "P0", "user", structural=True)
         led = mkseg(store, "ledger:" * 45, "P0", "user", structural=True,
@@ -141,15 +146,15 @@ class Test90Tier_P0Exempt:
         w = mk_window(100, [goal, led] + filler)
         form = {ws.segment_id: ws.form for ws in w.segs}
         assert w.used_tokens >= 0.8 * w.capacity_tokens, "前置：真到 80% 软水位（否则不逐=假绿）"
-        Distiller(w, store, aux).run()                                   # 90% 档（正常流）
+        d = Distiller(w, store, aux).run()                                   # 90% 档（正常流）
         form = {ws.segment_id: ws.form for ws in w.segs}
-        assert form[goal.segment_id] == "resident", "goal(AC) 90% 档不逐"
-        assert form[led.segment_id] == "resident", "ledger(AC) 90% 档不逐"
-        # 100% force 也豁免 structural
-        Distiller(w, store, aux, force_evict=True).run()
+        assert "p0_90pct_force" in d.events, "90% 超压强制面触发"
+        assert form[goal.segment_id] == "digest_only", "user 指令 P0（kind=segment）90% 超压放开可逐"
+        assert form[led.segment_id] == "resident", "ledger(AC 结构地板) 90% 超压仍不逐"
+        # 100% force 也豁免 kind=ledger（活账本链尾永不裁）
+        d2 = Distiller(w, store, aux, force_evict=True).run()
         form = {ws.segment_id: ws.form for ws in w.segs}
-        assert form[goal.segment_id] == "resident" and form[led.segment_id] == "resident", \
-            "structural P0/AC 连 100% force 都不逐（活账本永不裁，push cap 语义）"
+        assert form[led.segment_id] == "resident", "ledger 尾连 100% force 都不逐（活账本永不裁）"
 
     def test_non_struct_p0_not_evicted_at_soft_tier_only_pushcap(self, store, aux):
         """非结构 P0 < push cap(15%) → 90% 软水线不逐（P1 先逐满）；这是 P0「只在 push cap/100% 兜底」的可观测面。"""

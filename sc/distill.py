@@ -108,6 +108,7 @@ class Distiller:
         w, store, aux = self.window, self.store, self.aux
         cap = w.capacity_tokens
         water = int(0.8 * cap)
+        p0_90pct_water = int(0.9 * cap)   # §4.5 90% 超压强制 P0 折存根线（owner 拍板 2026-10-17）
         result = DistillResult("ok", self.events, None, [], [], [])
         aux.transient = False   # 瞬态标志按事件重置：上事件的 transient 本事件自愈（单事件 skip 语义）
 
@@ -170,6 +171,16 @@ class Distiller:
                 break
             self._evict(cand, result, self.ledger_evict_cb)
 
+        # 5.5 §4.5 90% 超压强制 P0 折存根面（owner 拍板 2026-10-17，4bb2e8 卡死治点）：
+        #     窗口 > 0.9×cap（纯超压驱动，aux 健康也触发；不依赖逃生门/force_evict）→
+        #     P0 段绕 digest 闸 + 放开 user 指令 structural P0（goal/ledger 尾永不逐）折存根
+        #     （head80 占位 + ledger_evict_cb 折活账本存根行）——80%-90% 区间行为零变化。
+        if w.used_tokens > p0_90pct_water:
+            if "p0_90pct_force" not in self.events:
+                self.events.append("p0_90pct_force")
+            self._evict_until(w, p0_90pct_water, aux, result, tiers=("P0",),
+                              p0_force=True, ledger_evict_cb=self.ledger_evict_cb)
+
         # 6. gate⑤ 故障注入点（off-by-default：生产恒 inert；SC_INJECT_FAULT=1 → 真生效）
         if self.inject_fault_after and marker_enabled():
             self.events.append("fault:" + self.inject_fault_after)
@@ -209,7 +220,8 @@ class Distiller:
         return result
 
     # ─────────────────────────── 逐出核心 ───────────────────────────
-    def _next_candidate(self, w: Window, aux, tiers: tuple[str, ...]) -> WindowSeg | None:
+    def _next_candidate(self, w: Window, aux, tiers: tuple[str, ...],
+                        p0_force: bool = False) -> WindowSeg | None:
         for tier in tiers:
             cands = sorted((ws for ws in w.segs
                             if ws.form == "resident" and ws.segment.tier == tier),
@@ -217,12 +229,25 @@ class Distiller:
             for ws in cands:
                 seg = ws.segment
                 if seg.structural_p0:
-                    continue                        # 结构 P0（goal / ledger 尾 / 用户指令）永不逐出
+                    # §4.5 90% 超压强制面（owner 拍板 2026-10-17）：放开 user 指令
+                    # structural P0（kind="segment"，classify_user 标）；goal/ledger 尾 P0
+                    # （kind=goal/ledger，结构地板）仍永不逐
+                    if p0_force and tier == "P0" and seg.kind not in ("goal", "ledger"):
+                        pass
+                    else:
+                        continue                        # 结构 P0（goal / ledger 尾 / 用户指令）永不逐出
                 # force_evict 模式：跳过 digest 检查，直接逐出
                 if self.force_evict:
                     return ws
                 # 正常模式：检查 digest
                 if tier == "P0" and not seg.digest_ready:
+                    if p0_force:
+                        # §4.5 90% 超压强制面：绕 digest 闸——digest 未 ready 也允许逐出
+                        # （head80 占位摘要，同逃生门 L241 口径：digest_text 预填原文头 80 字符，
+                        # pending digest 经幂等三元组下事件再生）——纯超压驱动，不依赖 aux 健康
+                        if not seg.digest_text:
+                            seg.digest_text = seg.original_text[:80]
+                        return ws
                     if aux.in_turn:
                         continue                    # turn 内 digest 未 ready → P0 不可逐出（gate）
                     aux.ensure_digest(seg)          # 出 turn 即时生成
@@ -248,9 +273,9 @@ class Distiller:
 
     def _evict_until(self, w: Window, water: int, aux, result: DistillResult,
                      tiers: tuple = ("P2", "P1", "P0"),
-                     ledger_evict_cb=None) -> None:
+                     ledger_evict_cb=None, p0_force: bool = False) -> None:
         while w.used_tokens > water:
-            cand = self._next_candidate(w, aux, tiers=tiers)
+            cand = self._next_candidate(w, aux, tiers=tiers, p0_force=p0_force)
             if cand is None:
                 break                               # 无段可逐（结构 P0 钉死 / P0 digest 未 ready）
             self._evict(cand, result, ledger_evict_cb)
