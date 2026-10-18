@@ -67,14 +67,23 @@ def test_new_page_appends_only_own_entries_and_prev_notes_snapshot(tmp_path):
     assert "notes c#1=open" in p2, "页 c#2 notes 区 = c#1 settled 快照（规则 2）"
     p1 = _page(out, "c#1")
     assert "notes: -" in p1, "首页 notes 区 = 空快照占位"
-    # 写定后永不回改：再 append 一页，c#1/c#2 页字节不变（无翻转）
+    # 写定后永不回改正文：再 append 一页，c#1/c#2 正文字节不回改；各自在「变旧页」
+    # 那一刻 append 一行页脚（v6.1 §2.5，新页 c#3 此刻无页脚）
     lg.append("#1 P0 [L3]\n段三原文")
     out2 = lg.text()
-    assert _page(out2, "c#1") == p1, "无 settled 翻转 → 旧页 c#1 字节恒不变（规则 4）"
-    assert _page(out2, "c#2") == p2, "旧页 c#2 字节恒不变（规则 4）"
+    _p1b = _page(out2, "c#1")
+    _p2b = _page(out2, "c#2")
+    assert _p1b.startswith(p1), "无 settled 翻转 → 旧页 c#1 正文恒不变（规则 4）"
+    assert _p2b.startswith(p2), "旧页 c#2 正文恒不变（规则 4）"
+    assert _p1b.endswith("\n[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "c#1 变旧页 → 追加 1 行页脚（§2.5）"
+    assert _p2b.endswith("\n[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "c#2 变旧页 → 追加 1 行页脚（§2.5）"
     p3 = _page(out2, "c#3")
     assert "notes c#1=open c#2=open" in p3, "新页 notes = 写入那一刻前 2 页逐页快照"
     assert "段三原文" in p3 and "段二原文" not in p3, "新页只装自己"
+    assert not p3.endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "当前最新页 c#3 无页脚（§2.5 只对旧页生效；当前页任务仍活）"
 
 
 def test_notes_snapshot_frozen_no_flips_bytes_stable(tmp_path):
@@ -86,12 +95,16 @@ def test_notes_snapshot_frozen_no_flips_bytes_stable(tmp_path):
     _prev = lg.text()
     lg.append("#1 P0 [L3]\n块4")
     _now = lg.text()
-    # 旧 4 页字节恒为 new 的前缀面（除新页 c#5 外全部不变）
+    # 旧 4 页正文恒为 new 的前缀面（除新页 c#5 外正文不变；各自在变旧页那一刻
+    # 追加 1 行页脚，v6.1 §2.5——c#1..c#3 在 _prev 时已是旧页、已带页脚）
     for _tag in ("c#1", "c#2", "c#3", "c#4"):
-        assert _page(_now, _tag) == _page(_prev, _tag), f"旧页 {_tag} 字节不变"
+        assert _page(_now, _tag).startswith(_page(_prev, _tag)), \
+            f"旧页 {_tag} 正文不变"
     assert _page(_now, "c#5") != "", "新页在场"
     assert "块4" in _page(_now, "c#5") and "块3" not in _page(_now, "c#5"), \
         "新页只装自己（55% 分页器语义零变化）"
+    assert not _page(_now, "c#5").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "当前最新页 c#5 无页脚（§2.5 只对旧页生效）"
 
 
 # ─────────────────────────── T9 状态翻转归属 ───────────────────────────
@@ -128,6 +141,8 @@ def test_settle_page_body_folds_stub_but_notes_frozen(tmp_path):
     assert "settled" in _page(_a, "c#1"), "c#1 正文折 settled 存根（既有渲染面）"
     assert _notes_line(_page(_a, "c#1")) == _notes_before, \
         "c#1 notes 区行字节冻结（settle 不回改旧页 notes）"
+    assert _page(_a, "c#1").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "settle 后 c#1（旧页）正文尾折存根 → 追加 1 行页脚（§2.5，settled 页是旧任务）"
 
 
 # ─────────────────────────── T10 存根与 notes 正交 ───────────────────────────
@@ -148,6 +163,10 @@ def test_evicted_stub_line_orthogonal_to_notes_region(tmp_path):
     assert evict_stub_line(2, "#1 P1 [L3]\n推理段B", "P1", "anchor-seg-1") in p2, \
         "逐出存根行在 entries 面"
     assert "evicted" not in _notes, "存根不混进 notes 区行"
+    assert not p2.endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "当前最新页 c#2 无页脚（§2.5 只对旧页生效）"
+    assert _page(out, "c#1").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "旧页 c#1（settled）带页脚（§2.5）"
 
 
 def test_recall_discarded_pages_never_in_notes_region(tmp_path):
@@ -191,6 +210,10 @@ def test_old_sidecar_without_notes_renders_placeholder(tmp_path):
     assert _page(out2, "c#1") and "notes: -" in _page(out2, "c#1"), \
         "旧页 notes 仍占位（不回填）"
     assert "notes c#1=open" in _page(out2, "c#2"), "新页 notes 快照面生效"
+    assert _page(out2, "c#1").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "旧页 c#1 变旧 → 追加页脚（§2.5，旧盘 fail-open 也生效）"
+    assert not _page(out2, "c#2").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "当前最新页 c#2 无页脚（§2.5 只对旧页生效）"
 
 
 # ─────────────────────────── T5 55% 分页面字节不变（存根只在 80/90 逐出点发生）───────────────────────────
@@ -207,10 +230,14 @@ def test_55pct_paging_pages_bytes_unchanged_by_stub_line(tmp_path):
     _now = lg.text()
     # 无存根（80/90 未发生）：渲染面零 evicted 行
     assert "evicted" not in _now, "55% 分页面无逐出存根（存根只 80/90 逐出点）"
-    # 无 settled 翻转：旧页字节恒不变（前缀缓存命中除最后一页外全部旧页）
+    # 无 settled 翻转：旧页正文恒不变（前缀缓存命中除最后一页外全部旧页；
+    # 变旧页那一刻追加 1 行页脚，v6.1 §2.5）
     for _tag in ("c#1", "c#2", "c#3"):
-        assert _page(_now, _tag) == _page(_prev, _tag), f"旧页 {_tag} 字节不变（55% 分页面）"
+        assert _page(_now, _tag).startswith(_page(_prev, _tag)), \
+            f"旧页 {_tag} 正文不变（55% 分页面）"
     assert "55分页块3" in _page(_now, "c#4"), "新页只装自己（55% 分页器语义零变化）"
+    assert not _page(_now, "c#4").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "当前最新页 c#4 无页脚（§2.5 只对旧页生效）"
     # 55% 分页面 notes 区全 open（无翻转）：前缀缓存唯一刷位 = 新页 notes + 尾滚动
     assert all("open" in _notes_line(_page(_now, _t))
                for _t in ("c#2", "c#3", "c#4")), "无翻转 → 各页 notes 全 open"
@@ -234,8 +261,10 @@ def test_ledger_paging_prefix_anchor_migration(tmp_path):
     # 累计超集契约迁移锁：旧渲染面 c#2 块内重渲 c#1 全文（旧测试 c2.startswith(c1)
     # 依赖的超集形态）→ 页化后 c#1 正文只在自己的页里，c#2 页不重吐（新锚）
     assert "段一" not in _page(c2, "c#2"), "c#2 页不重吐 c#1 正文（累计超集已死，页化新锚）"
-    # 新契约（v6.1 锚）：旧页字节冻结 + 新页只装自己
-    assert _page(c2, "c#1") == _page(c1, "c#1"), "旧页 c#1 字节恒不变（前缀缓存锚）"
+    # 新契约（v6.1 锚）：旧页正文冻结 + 新页只装自己（变旧页那一刻追加 1 行页脚，§2.5）
+    assert _page(c2, "c#1").startswith(_page(c1, "c#1")), "旧页 c#1 正文恒不变（前缀缓存锚）"
+    assert not _page(c2, "c#2").endswith("[页脚：本页及以上旧段为历史参考（不作为当前任务）；当前任务以最新 user 段为准]"), \
+        "当前最新页 c#2 无页脚（§2.5 只对旧页生效）"
     assert "段二" in _page(c2, "c#2") and "段一" not in _page(c2, "c#2"), \
         "新页 c#2 只装自己 entries"
     assert "notes c#1=open" in _page(c2, "c#2"), "新页 notes 区跨页索引（不重吐 c#1 全文）"

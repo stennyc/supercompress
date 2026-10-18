@@ -30,7 +30,7 @@ import re
 from pathlib import Path
 
 from engine import SupercompressContextEngine, _COMPACT_LEDGER_PREFIX
-from sc.compact_ledger import compact_ledger_path_for_jsonl
+from sc.compact_ledger import compact_ledger_path_for_jsonl, PAGE_FOOTER
 from sc.schema import Segment
 
 MARK = _COMPACT_LEDGER_PREFIX   # 账本前缀消息 marker（单源 = engine._COMPACT_LEDGER_PREFIX，e2e 断言同源）
@@ -116,14 +116,18 @@ def test_ledger_appends_across_compacts_and_prefix_stable(tmp_path):
     assert "notes: -" in _page1, "页 c#1 notes 区 = 首页空快照（notes: - 占位）"
     assert "c#2" not in _page1, "页 c#1 不含 c#2 正文（每页只装自己）"
 
-    # compact #2：窗口又长大（+新 user 段），账本追加页 c#2 且页 c#1 字节冻结
+    # compact #2：窗口又长大（+新 user 段），账本追加页 c#2；页 c#1 正文冻结，
+    # 但它在「变旧页」那一刻追加 1 行页脚（v6.1 §2.5，铁律 4 的有意代价：
+    # 每页留一行 → 旧页字节含页脚，不再是纯字节恒不变）
     _seed_user(e, "回滚开关位置在网关配置第三节保留现场")
     out2 = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
     c2 = _ledger_section(out2)
     assert "c#2" in c2 and "c#1" in c2, "compact #2 账本块含 c#1 + c#2 两页"
     _p1_in_c2 = _page_segment(c2, "c#1")
-    assert _p1_in_c2.rstrip("\n---") == _page1, \
-        "旧页字节冻结：页 c#1 段在 c#2 渲染中原样（无 settled 翻转；尾部页间分隔符除外）"
+    assert _p1_in_c2.startswith(_page1), \
+        "旧页 c#1 正文冻结：c#2 渲染里 c#1 正文原样（无 settled 翻转）"
+    assert _p1_in_c2.rstrip("\n---").endswith(PAGE_FOOTER), \
+        "旧页 c#1 变旧页 → 追加 1 行页脚（§2.5，铁律 4 有意代价）"
     _p2 = _page_segment(c2, "c#2")
     assert "c#2" in _p2, "页 c#2 页段在场"
     assert "回滚开关位置在网关配置第三节保留现场" in _p2, "页 c#2 只装自己（本段新增 entries）"

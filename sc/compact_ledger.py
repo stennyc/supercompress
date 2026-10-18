@@ -596,6 +596,7 @@ class CompactLedger:
         # = 旧页字节不变 + 尾行滚动 tail；generation/seals 计数退审计面（JSON 侧车
         # + logger，_persist 零改动），不进活渲染面。
         lines = [MARK]
+        _total = len(all_entries)
         for i, e in enumerate(all_entries):
             # 页头 notes 区：本页写入时前 N-1 页的 settled 快照（冻结）。
             # 旧盘（无 notes 键）→ 空快照 → "notes: -" 占位（不回填旧页）。
@@ -620,10 +621,14 @@ class CompactLedger:
                 lines.append(f"c#{e['seq']}: " + _settled_stub_line(e["seq"], e["text"], e.get("kind", "adhoc"), _sid))
             else:
                 lines.append(f"c#{e['seq']}: {e['text']}")
-            # §2.5 页脚（每页页尾 1 行固定历史参考指令，append-only 静态字节）：
-            # 各页逐字节相同（文案不引用页号）→ 旧页生成后字节冻结（铁律 4 不破），
-            # 整条账本消息仍 append-only（旧页段含页脚 = 新一段渲染严格前缀）。
-            lines.append(PAGE_FOOTER)
+            # §2.5 页脚（旧页页尾 1 行固定历史参考指令，append-only 静态字节）：
+            # 只贴旧页（前 N-1 页）——最新页 = 当前任务正文页，不降级（2026-10-18 owner 拍，
+            # 治"模型把最新页也当历史参考、主观感觉中间过程被压掉"的误伤面）。
+            # 各旧页逐字节相同（文案不引用页号）→ 旧页生成后字节冻结（铁律 4 不破），
+            # 整条账本消息仍 append-only（旧页段含页脚 = 新一段渲染严格前缀）；
+            # 最新页本就是每次 compact 新增/变化的页，不在旧页冻结面，去页脚零前缀缓存代价。
+            if i < _total - 1:
+                lines.append(PAGE_FOOTER)
         return "\n---\n".join(lines)
 
     # ───────────── v6 §2.1 存根挂逐出事件（engine 逐出点接线，§2.1 唯一新增环节）────
