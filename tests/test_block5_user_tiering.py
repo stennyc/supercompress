@@ -77,6 +77,11 @@ class TestDistill_EvictablePushCap:
         assert w.segs[0].form == "digest_only", "长 user 注入块已可逐出（不再钉死）"
 
     def test_short_user_structural_still_never_evicted(self, store, aux):
+        """旧锚更新（§4.5 90% 超压强制面 owner 拍板 2026-10-17）：
+
+        user 指令 P0（kind=segment，structural）在 90% 超压时**放开可逐**（head80 存根）；
+        goal/ledger 尾（结构地板）永不逐。cap=100 4 段≈335% → 90% 档触发。
+        """
         u = mkseg(store, "ship v1", "P0", "user", structural=True)
         lp0 = mkseg(store, "llm p0 " * 30, "P0")
         complete_digest(aux, lp0)
@@ -85,7 +90,9 @@ class TestDistill_EvictablePushCap:
         w = mk_window(100, [u, lp0, p1, p2])
         d = Distiller(w, store, aux).run()
         forms = {s.segment_id: s.form for s in w.segs}
-        assert forms[u.segment_id] == "resident", "短指令 structural 地板仍永不逐出"
+        assert "tier90" in d.events, "90% 超压强制面触发"
+        assert forms[u.segment_id] == "digest_only", "user 指令 P0（kind=segment）90% 超压放开可逐"
+        assert forms[lp0.segment_id] == "digest_only", "非结构 P0 90% 超压正常逐"
 
 
 class TestRetag_ExistingEntries:

@@ -108,7 +108,6 @@ class Distiller:
         w, store, aux = self.window, self.store, self.aux
         cap = w.capacity_tokens
         water = int(0.8 * cap)
-        p0_90pct_water = int(0.9 * cap)   # §4.5 90% 超压强制 P0 折存根线（owner 拍板 2026-10-17）
         result = DistillResult("ok", self.events, None, [], [], [])
         aux.transient = False   # 瞬态标志按事件重置：上事件的 transient 本事件自愈（单事件 skip 语义）
 
@@ -158,28 +157,53 @@ class Distiller:
 
         store.kpi_log.append({"regime": "normal"})
 
-        # 4. 80% 软水位：P2 → P1 逐出至水位（P3 梯级：90% 水线不逐 P0/AC——P0 只走
-        #    ① push cap（P0 常驻集 ≤15%）② 100% force_evict 兜底 两出口；本档 P0 豁免）
-        #    v6 §2.1：存根挂逐出事件（engine 注入 cb 时，durable 被逐出段在活账本折存根）
-        self._evict_until(w, water, aux, result, tiers=("P2", "P1"),
-                          ledger_evict_cb=self.ledger_evict_cb)
+        # 4. S1 降档水位递进带（owner 拍板 2026-10-17 · 从 90% 往 55% 一档一档压）：
+        #    每档"压到目标下就停、压不到 pass 给下一档"；估值 gate 分母=当前用量
+        #    （每档进档前重算）；90/75/65 档确定性算（P0 逐 + 存根折省），55% 是 LLM
+        #    出块面、不做执行前估值（兜底档，全 pass 不落地靠降档本身兜死、无死循环）。
+        # 80-90% 区间 P0 面零变化（owner 红线③：P0 只在 90% 档逐，80-90% 区间 P0 行为
+        # 与现状逐出链一致；P2/P1 软水线由 tier75 替代原 80% 软水线——水位线 80%→75%
+        # 是 owner 定的降档带语义，非回归）。
+        _cap = cap
+        # 降档逐出面：90%（P0 超压折存根）→ 75%（P2/P1 常规逐）→ 65%（compact 兜底 pass-through）
+        # → 55%（清垃圾 pass-through；LLM 出块面 S2 接、本切片 S1 只落 90/75 两确定性档 + gate）
+        # 格式: (water_frac, gate_frac_of_used, tiers, label, p0_force, no_gate)
+        # no_gate=True → 该档跳过估值 gate（90% 纯容量档，不走 gate-pass）
+        _tiers_by_water = [
+            (0.90, 0.00, ("P0",),       "tier90", True,  True),   # 90% 超压：纯容量 P0 逐出（no_gate）
+            (0.75, 0.20, ("P2","P1"),   "tier75", False, False),  # 75%：软水线常规逐（替代 80% 软水线；P0 只在 90% 档）
+        ]
+        _executed = False
+        for _wf, _gate, _tiers, _label, _p0_force, _no_gate in _tiers_by_water:
+            _water_line = int(_wf * _cap)
+            if w.used_tokens <= _water_line:
+                break                       # 没超这条线 = 后面更低水线档也不用看（降档序：从高压往下压）
+            # 估值 gate：分母=当前用量，进档前重算（no_gate 档跳过——纯容量面不走 gate）
+            if not _no_gate:
+                _est = self._reclaim_est(w, _tiers)
+                if _est < _gate * w.used_tokens:
+                    self.events.append(_label + ":gate-pass")     # 省不够 → pass 给下一档（更低压、更强逐出）
+                    continue
+            self.events.append(_label)
+            if _p0_force:
+                # 90% 超压：纯容量 P0 逐出（绕 digest 闸 + 放开 user 指令 structural P0）
+                self._evict_until(w, _water_line, aux, result, tiers=_tiers,
+                                   p0_force=True, ledger_evict_cb=self.ledger_evict_cb)
+            else:
+                self._evict_until(w, _water_line, aux, result, tiers=_tiers,
+                                  ledger_evict_cb=self.ledger_evict_cb)
+            _executed = True
+            if w.used_tokens <= _water_line:
+                break                       # 压到目标下 = 停（降档序核心：每档压够就停）
 
-        # 5. push cap：P0 常驻集 ≤ 15%（goal / structural P0 永不裁）
-        while self._p0_resident_tokens(w) > self.push_cap_tokens:
-            cand = self._next_candidate(w, aux, tiers=("P0",))
-            if cand is None:
-                break
-            self._evict(cand, result, self.ledger_evict_cb)
-
-        # 5.5 §4.5 90% 超压强制 P0 折存根面（owner 拍板 2026-10-17，4bb2e8 卡死治点）：
-        #     窗口 > 0.9×cap（纯超压驱动，aux 健康也触发；不依赖逃生门/force_evict）→
-        #     P0 段绕 digest 闸 + 放开 user 指令 structural P0（goal/ledger 尾永不逐）折存根
-        #     （head80 占位 + ledger_evict_cb 折活账本存根行）——80%-90% 区间行为零变化。
-        if w.used_tokens > p0_90pct_water:
-            if "p0_90pct_force" not in self.events:
-                self.events.append("p0_90pct_force")
-            self._evict_until(w, p0_90pct_water, aux, result, tiers=("P0",),
-                              p0_force=True, ledger_evict_cb=self.ledger_evict_cb)
+        # push cap 兜底（15%，既有 ③ 面保留）：若上面降档带没把 P0 常驻集压到 cap，
+        # 逐 P0 常驻集 ≤15%（goal/structural 地板永不裁——_next_candidate 结构门保证）。
+        if not _executed:
+            while self._p0_resident_tokens(w) > self.push_cap_tokens:
+                cand = self._next_candidate(w, aux, tiers=("P0",))
+                if cand is None:
+                    break
+                self._evict(cand, result, self.ledger_evict_cb)
 
         # 6. gate⑤ 故障注入点（off-by-default：生产恒 inert；SC_INJECT_FAULT=1 → 真生效）
         if self.inject_fault_after and marker_enabled():
@@ -298,6 +322,33 @@ class Distiller:
             return
         if ws.segment.content_hash in getattr(self.store, "durable", set()):
             ledger_evict_cb(ws.segment)
+
+    # ───────────── S1 降档水位递进带（owner 拍板 2026-10-17 · 估值 gate 分母=当前用量）────
+    def _reclaim_est(self, w: Window, tiers: tuple[str, ...]) -> int:
+        """该档动作预估回收量（代码层确定性算、零 LLM）：Σ(resident 段 est_tokens(原文)
+        − est_tokens(digest 摘录)) over 可逐 tiers 段。
+
+        估值 gate 面（owner 拍"分母=当前用量 w.used_tokens"）：
+          某档"预估省 < 阈值×used"→ 不执行该档、pass 给下一档（省 LLM/无效逐出开销）。
+          阈值常量在 run() 降档分档里用（本方法只出分子、阈值判定在调用面）。
+        - P0/P1/P2 段：est_tokens(original_text) − est_tokens(digest_text or "[no digest]")
+          （digest ready → 省≈原文全量；pending → 省≈原文−head80 占位 ~20 tok）。
+        - 结构 P0（goal/ledger 尾）不在可逐集（_next_candidate 永不逐）→ 不计回收（估 0）。
+        纯函数、幂等、零写盘、零 LLM、零宿主——fail-open（估算异常 → 0，不炸宿主 turn）。"""
+        try:
+            total = 0
+            for ws in w.segs:
+                seg = ws.segment
+                if seg.tier not in tiers or ws.form != "resident":
+                    continue
+                if seg.structural_p0 and seg.kind in ("goal", "ledger"):
+                    continue                # 结构地板永不逐（估 0）
+                _full = est_tokens(seg.original_text)
+                _stub = est_tokens(seg.digest_text or "[no digest]")
+                total += max(0, _full - _stub)
+            return total
+        except Exception:
+            return 0
 
     def _p0_pending_escape_allowed(self, w: Window) -> bool:
         """R3 逃生门谓词（pending 兜底）：端点持续劣化 + digest 全 pending + 窗口超压。

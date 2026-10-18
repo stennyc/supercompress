@@ -148,7 +148,7 @@ class Test90Tier_P0Exempt:
         assert w.used_tokens >= 0.8 * w.capacity_tokens, "前置：真到 80% 软水位（否则不逐=假绿）"
         d = Distiller(w, store, aux).run()                                   # 90% 档（正常流）
         form = {ws.segment_id: ws.form for ws in w.segs}
-        assert "p0_90pct_force" in d.events, "90% 超压强制面触发"
+        assert "tier90" in d.events, "90% 超压强制面触发"
         assert form[goal.segment_id] == "digest_only", "user 指令 P0（kind=segment）90% 超压放开可逐"
         assert form[led.segment_id] == "resident", "ledger(AC 结构地板) 90% 超压仍不逐"
         # 100% force 也豁免 kind=ledger（活账本链尾永不裁）
@@ -157,15 +157,20 @@ class Test90Tier_P0Exempt:
         assert form[led.segment_id] == "resident", "ledger 尾连 100% force 都不逐（活账本永不裁）"
 
     def test_non_struct_p0_not_evicted_at_soft_tier_only_pushcap(self, store, aux):
-        """非结构 P0 < push cap(15%) → 90% 软水线不逐（P1 先逐满）；这是 P0「只在 push cap/100% 兜底」的可观测面。"""
+        """旧锚更新（§4.5 90% 超压强制面 owner 拍板 2026-10-17）：
+
+        80-90% 区间（软水线 tier75）P0 豁免；但 90% 超压（tier90 p0_force）
+        时非结构 P0 可逐。本锚 used≈167% cap → tier90 触发 → P0 被逐。
+        """
         from sc.distill import Distiller
         p0 = mkseg(store, "p0 fact " * 4, "P0")              # ~12 tok < push cap(15% of 100=15)
         p1s = [mkseg(store, f"p1 f {i} " * 30, "P1") for i in range(3)]
         w = mk_window(100, [p0] + p1s)
-        Distiller(w, store, aux).run()                         # 90% 档：P1 逐满至水位
+        d = Distiller(w, store, aux).run()                     # used 167% → tier90 p0_force 逐 P0
         p0_form = next(ws.form for ws in w.segs if ws.segment_id == p0.segment_id)
-        assert p0_form == "resident", \
-            "非结构小 P0（<push cap）在 90% 软水线不逐（软水线 tiers=P2/P1，P0 豁免）"
+        assert "tier90" in d.events, "90% 超压面触发（used>0.9cap）"
+        assert p0_form == "digest_only", \
+            "非结构小 P0 在 90% 超压时被 p0_force 逐出（§4.5 新行为）"
 
     def test_force_100pct_does_demote_non_struct_p0_when_over_pushcap(self, store, aux):
         """对照：非结构 P0 大（>push cap）→ 100% force 兜底才逐（P0 出场的唯一正档）。"""

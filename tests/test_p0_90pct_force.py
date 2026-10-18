@@ -2,7 +2,7 @@
 
 背景：现状 distill.run L158 注释钉死"90% 水线不逐 P0/AC——P0 只走 ① push cap ② 100%
 force_evict 两出口；本档 P0 豁免"。4bb2e8 session 实证：窗口 501k/512k（98% cap）卡死，
-P0 段被 ③ 三道门（structural P0 永不逐 + digest 闸 + 逃生门 aux 连败≥3）卡死，
+P0 段被 ③ 三道门（structural P0 永不逐 + digest 闸 + R3 pending 兜底 aux 连败≥3）卡死，
 90% 水线因"豁免 P0"设计不折 P0 存根 → 压缩结果 > 原始 → 宿主 refuse 闸否决。
 
 owner 拍板（2026-10-17）：加 90% 强制面——窗口 > 0.9×cap 时强制折 P0 存根
@@ -15,7 +15,7 @@ F2  90% 超压 + digest 未 ready 的 P0 → 走 head80 占位存根（digest_te
 F3  90% 超压 + user 指令 structural P0（<100 字）→ 允许逐（放开 structural 门）
 F4  90% 超压 + goal/ledger 尾 structural P0 → 仍永不逐（结构地板不破）
 F5  89% 区间（w.used < 0.9*cap）→ 90% 强制面不触发（保持现有 ③ 行为，P0 走 ③/⑤）
-F6  逃生门零扰动（aux.endpoint_degraded=False 时 90% 面照常开，不依赖 aux 健康）
+F6  R3 pending 兜底零扰动（aux.endpoint_degraded=False 时 90% 面照常开、R3 兜底事件 p0_pending_escape 不 fire）
 """
 from __future__ import annotations
 
@@ -133,11 +133,11 @@ def test_f5_below_90pct_no_force(tmp_path):
         f"89% 区间 90% 强制面不应触发，events={result.events}"
 
 
-def test_f6_escape_hatch_untouched(tmp_path):
-    """F6：逃生门零扰动——aux 健康（endpoint_degraded=False）时 90% 面照常开。"""
+def test_f6_r3_pending_escape_untouched(tmp_path):
+    """F6：R3 pending 兜底零扰动——aux 健康（endpoint_degraded=False）时 90% 面照常开、R3 兜底不 fire。"""
     d, w, result, evicted, goal_seq = _run(tmp_path, cap=CAP,
                                            structural_user=False, digest_ready=True)
     assert w.used_tokens > int(0.9 * w.capacity_tokens)
     assert len(evicted) > 0, "90% 面应在 aux 健康时照常逐 P0（不依赖 endpoint_degraded）"
     assert "p0_pending_escape" not in result.events, \
-        f"aux 健康时逃生门不应 fire，events={result.events}"
+        f"aux 健康时 R3 pending 兜底不应 fire，events={result.events}"
