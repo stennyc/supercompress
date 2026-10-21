@@ -250,16 +250,19 @@ class CompactLedger:
         'flock' 零命中），多进程并发 = 数据丢失。
 
         修法（owner 裁定）：给 ledger 一个**专属 flock 文件** `<target_dir>/.ledger.flock`
-        （不进账本 JSON、不随账本 GC），fcntl.flock(LOCK_EX) 阻塞拿锁、LOCK_UN
-        释放；**fail-open**——锁文件 open 失败 / flock 抛 OSError → 静默返回
+        （不进账本 JSON、不随账本 GC），平台门控阻塞拿锁：fcntl.flock(LOCK_EX)
+        [unix] / msvcrt.locking(LK_LOCK) [windows]，LOCK_UN/LK_UNLCK 释放
+        （fcntl 在 Windows 不存在、msvcrt 在 unix 不存在——两者 ImportError 均
+        fail-open）；**fail-open**——锁文件 open 失败 / 加锁抛 OSError → 静默返回
         _LockedNullContext（原 fail-soft 语义不破坏，宿主 worker 不被阻塞），
         竞争退化为无锁 RMW（丢行风险 = 既有行为，零回归），绝不炸宿主。
         threading.Lock（model_store 面）只管单进程内线程，跨进程面 = 本 flock。
         与 scdata 沉盘面解耦（flock 只护账本 JSON 的 read-RMW-write 临界区，
         <seq>.p0/.p1 沉盘走各自 O_APPEND，不在本锁面内）。
         """
-        # 锁的 open/flock 失败 = fail-open 退化（null_cm 走裸 RMW，同 pre-F1）
-        import fcntl
+        # 锁的 open/flock 失败 = fail-open 退化（null_cm 走裸 RMW，同 pre-F1）。
+        # 平台门控（cross-process-file-locking 纪律）：fcntl 仅 unix、msvcrt 仅
+        # windows；两者 ImportError 都 fail-open，绝不在锁面炸宿主。
         import contextlib
 
         @contextlib.contextmanager
@@ -267,22 +270,81 @@ class CompactLedger:
             yield
 
         lock_path = os.path.join(target_dir, ".ledger.flock")
+
+        # ── 选平台锁原语（双 ImportError → 无锁 RMW fail-open）──
+        _lock_op = None
+        _fcntl = None
+        _msvcrt = None
         try:
-            _lf = open(lock_path, "a+")   # a+ 不截断、不创建内容竞争（flock 只看 inode）
+            import fcntl as _fcntl
+            _lock_op = "fcntl"
+        except ImportError:
+            pass
+        if _lock_op is None:
+            try:
+                import msvcrt as _msvcrt
+                _lock_op = "msvcrt"
+            except ImportError:
+                pass
+        if _lock_op is None:
+            if self._log is not None:
+                self._log.warning("compact-ledger: no lock primitive available "
+                                  "(fcntl/msvcrt both missing) -> no-lock RMW "
+                                  "(fail-open)")
+            return _null_cm
+
+        try:
+            _lf = open(lock_path, "a+b")   # a+b 二进制：'a' 不截断、锁文件内容无语义
         except OSError:
             if self._log is not None:
                 self._log.warning("compact-ledger: flock open failed -> no-lock RMW "
                                   "(fail-open, same as pre-F1 behavior)")
             return _null_cm
+
+        # ── 阻塞拿独占锁：fcntl.flock(LOCK_EX) / msvcrt.locking(LK_LOCK, 1) ──
+        # msvcrt 两个怪癖（cross-process-file-locking 纪律 + 本机实测）：
+        # (1) 0 字节文件 / EOF：对越过 EOF 的 byte range locking 必败（OSError）
+        #     → 锁 byte 0 前必须先让文件 ≥1 字节。预留写是安全的：0 字节文件上
+        #     无人可能持有 byte-0 锁（锁 range 不能越过 EOF），O_APPEND 空文件
+        #     写即落 byte 0，锁文件专属、内容无语义。
+        # (2) Windows byte-range 锁**非 advisory**（与 fcntl flock 根本不同）：
+        #     竞争进程持有 byte-0 锁期间，对该 byte range 的**读/写直接抛
+        #     EACCES（PermissionError，OSError 子类）**。故拿锁**之前绝不读
+        #     预留字节**（旧修法在 pre-lock read 上撞 EACCES → 被 fail-open
+        #     except OSError 吞成无锁 RMW = 恰在竞争时丢锁，实测 4 进程 0-loss
+        #     退化成 8/32 条）。EOF 判定走 os.fstat（stat 不涉锁语义、永不撞
+        #     EACCES）：LK_LOCK 失败且 size==0 → 预留 byte 0 重试；size>0 仍
+        #     失败 = 真异常 → 抛出走外层 fail-open。
+        def _lock_acquire():
+            if _lock_op == "fcntl":
+                _fcntl.flock(_lf.fileno(), _fcntl.LOCK_EX)  # type: ignore[union-attr]
+                return
+            while True:
+                _lf.seek(0)
+                try:
+                    _msvcrt.locking(_lf.fileno(), _msvcrt.LK_LOCK, 1)  # type: ignore[union-attr]
+                    return
+                except OSError:
+                    # 唯一可预期的失败：range 越过 EOF（0 字节文件，或竞争者的
+                    # 预留写尚未落盘）→ 预留 byte 0（O_APPEND 空文件 = byte 0）
+                    # 立即重试；size>0 还失败 = 非 EOF 异常 → 抛出，外层
+                    # except OSError → fail-open 无锁 RMW（锁文件专属不被 GC，
+                    # 进程死亡 OS 自动释放 byte-range 锁，等待必收敛）。
+                    if os.fstat(_lf.fileno()).st_size == 0:
+                        _lf.write(b"0")     # 预留 byte 0（0 字节文件 EOF 锁会失败）
+                        _lf.flush()
+                        continue
+                    raise
+
         try:
-            fcntl.flock(_lf.fileno(), fcntl.LOCK_EX)
+            _lock_acquire()
         except OSError:
             try:
                 _lf.close()
             except OSError:
                 pass
             if self._log is not None:
-                self._log.warning("compact-ledger: flock LOCK_EX failed -> no-lock RMW "
+                self._log.warning("compact-ledger: lock acquire failed -> no-lock RMW "
                                   "(fail-open)")
             return _null_cm
 
@@ -292,7 +354,11 @@ class CompactLedger:
                 yield
             finally:
                 try:
-                    fcntl.flock(_lf.fileno(), fcntl.LOCK_UN)
+                    if _lock_op == "fcntl":
+                        _fcntl.flock(_lf.fileno(), _fcntl.LOCK_UN)  # type: ignore[union-attr]
+                    else:
+                        _lf.seek(0)
+                        _msvcrt.locking(_lf.fileno(), _msvcrt.LK_UNLCK, 1)  # type: ignore[union-attr]
                 except OSError:
                     pass
                 try:
