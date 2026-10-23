@@ -25,6 +25,116 @@ from sc.schema import Segment, est_tokens
 
 # ───────────────────────── S2a：digest 响应解析（修 S5）────────────────────────
 
+# ───────────────────── 偏离根因修复：L1 fact 扩 head + anchor 豁免 ─────────────────────
+# 根因（2026-10-23 owner 实测）：compact 两次后模型段降档 L1，fact = original_text[:20]
+# 碎片不可读 → 模型"失忆"自己的进行中结论，拿注入 mem 上下文猜下一步 → 偏离任务。
+# 修法：① L1 fact head 20→60 字符 + 截断标记；② anchor 豁免（最近 user P0 + 其模型末响应
+# 强制 L3，不受 800 cap / 细节池约束）+ cap 兜底（anchor 超 cap 走常规降档，不破 6K 总帽）。
+
+
+class TestL1FactWiderHead:
+    """detail_budget=0 + l3_cap=0 强制 L1（单段 4K 细节池装得下默认 L3，须显式挤掉细节池）。"""
+
+    def test_long_text_head60_with_marker(self, store):
+        """无 key_fact 时 head 扩到 60 字符 + '…' 截断标记（原 head20 太碎）。"""
+        s = mkseg(store, "head-marker " + "x" * 60, "P1")  # 71 字符，L1 行 ≈ 19t
+        s.seq = 1
+        ws = WindowSeg(s)
+        line = choose_forms([ws], mk_window(100000, [s]), query="",
+                            index_budget=100, detail_budget=0, l3_max_tokens=0)
+        form, text = next((f, t) for w, f, t in line if w is ws)
+        assert form == "L1", "无细节池 → L1 索引行"
+        assert text.endswith("…"), f"超长 fact 须带截断标记: {text!r}"
+        assert "x" * 48 in text, "head 须含 60 字符原文前缀（前 12 字符 'head-marker ' + 48 个 x）"
+
+    def test_short_text_no_marker(self, store):
+        """短于 head 长度的段：fact 原样，不截断、不加标记。"""
+        s = mkseg(store, "ok", "P1")
+        s.seq = 1
+        ws = WindowSeg(s)
+        line = choose_forms([ws], mk_window(100000, [s]), query="",
+                            index_budget=100, detail_budget=0, l3_max_tokens=0)
+        form, text = next((f, t) for w, f, t in line if w is ws)
+        assert form == "L1", text
+        assert "…" not in text, "短段不加截断标记"
+        assert "· ok" in text, text
+
+    def test_key_fact_still_preferred(self, store):
+        """有 key_fact 段：L1 仍优先用 key_fact（不变）。"""
+        s = mkseg(store, "long body " + "z" * 300, "P1")
+        s.seq = 1
+        s.key_fact = "the fact"
+        ws = WindowSeg(s)
+        line = choose_forms([ws], mk_window(100000, [s]), query="",
+                            index_budget=100, detail_budget=0, l3_max_tokens=0)
+        form, text = next((f, t) for w, f, t in line if w is ws)
+        assert "· the fact" in text, text
+
+
+class TestAnchorL3Exempt:
+    def test_last_user_p0_and_model_response_anchor_l3(self, store):
+        """anchor = 最近 user P0 + 紧随其后的第一段 model P0（该 user 的末响应）→ 豁免 L3
+        （**L3 成本 ≤ l3 cap 时**；cap 兜底面见 test_anchor_cap_fallback）。
+        非 anchor model 段（seq 更大 / P1 filler）正常降档。"""
+        u = mkseg(store, "goal fix", "P0", "user"); u.seq = 1
+        resp = mkseg(store, "done, commit landed", "P0"); resp.seq = 2   # 短 anchor（≤cap）
+        later = mkseg(store, "o" * 8000, "P1"); later.seq = 3           # P1 filler 不抢 anchor
+        segs = [u, resp, later]
+        rendered = choose_forms([WindowSeg(s) for s in segs], mk_window(100000, segs),
+                                query="", index_budget=10, detail_budget=0,
+                                l3_max_tokens=800)
+        form_r = next(f for ws, f, t in rendered if ws.segment is resp)
+        form_l = next(f for ws, f, t in rendered if ws.segment is later)
+        assert form_r == "L3", f"短 anchor（≤cap）须 L3 豁免，实得 {form_r}"
+        assert form_l in ("L1", "L0", "L2"), f"非 anchor 超 cap 段须降档，实得 {form_l}"
+
+    def test_anchor_not_last_model_response(self, store):
+        """模型末响应不是最后一段时（其后再有 user 段）→ 失去 anchor 身份，正常降档。"""
+        u = mkseg(store, "goal fix", "P0", "user"); u.seq = 1
+        mid_model = mkseg(store, "m" * 8000, "P1"); mid_model.seq = 2
+        later_user = mkseg(store, "next question", "P0", "user"); later_user.seq = 3
+        segs = [u, mid_model, later_user]
+        rendered = choose_forms([WindowSeg(s) for s in segs], mk_window(100000, segs),
+                                query="", index_budget=10, detail_budget=0,
+                                l3_max_tokens=800)
+        form_mid = next(f for ws, f, t in rendered if ws.segment is mid_model)
+        assert form_mid in ("L1", "L0", "L2"), \
+            f"末 user 之前的 model 段非 anchor，须降档，实得 {form_mid}"
+
+    def test_last_user_p0_always_l3(self, store):
+        """最近 user P0 本身恒 L3（anchor 的 user 侧）。"""
+        u1 = mkseg(store, "older user", "P0", "user"); u1.seq = 1
+        u2 = mkseg(store, "latest user P0", "P0", "user"); u2.seq = 2
+        m = mkseg(store, "model reply", "P1"); m.seq = 3
+        segs = [u1, u2, m]
+        rendered = choose_forms([WindowSeg(s) for s in segs], mk_window(100000, segs),
+                                query="", index_budget=10, detail_budget=0,
+                                l3_max_tokens=800)
+        form_u2 = next(f for ws, f, t in rendered if ws.segment is u2)
+        assert form_u2 == "L3", f"最近 user P0 须 L3，实得 {form_u2}"
+
+    def test_anchor_cap_fallback(self, store):
+        """reviewer 必修项：anchor 段 L3 成本超 l3 cap → 不再无脑 L3（破 DoD 总帽 6K
+        实测面），走常规选档 L1/L0。anchor = 末 user P0 + 其后首段 model P0。"""
+        # 场景 1：末 user 后的 model 响应短（≤cap）→ 豁免 L3
+        u = mkseg(store, "goal fix", "P0", "user"); u.seq = 1
+        short = mkseg(store, "done, commit landed", "P0"); short.seq = 2   # anchor（≤cap）
+        segs1 = [u, short]
+        r1 = choose_forms([WindowSeg(s) for s in segs1], mk_window(100000, segs1),
+                          query="", index_budget=10, detail_budget=0, l3_max_tokens=800)
+        form_short = next(f for ws, f, t in r1 if ws.segment is short)
+        assert form_short == "L3", f"短 anchor（≤cap）仍豁免 L3，实得 {form_short}"
+        # 场景 2：末 user 后的 model 响应超长（>cap）→ cap 兜底降档
+        u2 = mkseg(store, "next task", "P0", "user"); u2.seq = 1
+        big = mkseg(store, "m" * 8000, "P0"); big.seq = 2                 # anchor（>cap）
+        segs2 = [u2, big]
+        r2 = choose_forms([WindowSeg(s) for s in segs2], mk_window(100000, segs2),
+                          query="", index_budget=10, detail_budget=0, l3_max_tokens=800)
+        form_big = next(f for ws, f, t in r2 if ws.segment is big)
+        assert form_big in ("L1", "L0", "L2"), \
+            f"超长 anchor 须 cap 兜底降档（破 6K 帽），实得 {form_big}"
+
+
 class TestParseDigestResponse:
     def test_clean_json(self):
         raw = json.dumps({"key_fact": "auth service binds 10.0.0.5:8080",

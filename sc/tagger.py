@@ -49,14 +49,28 @@ REASONING_MONOLOGUE_CUES = (
     # 独白带前缀。同中文红线，结论词不收（误杀结论段 = 真丢失）。
     "let me", "i need to", "now i need", "i will", "i'll check",
     "now i", "first i", "i need to check",
+    # 2026-10-23 owner 病灶实测（compact-ledger 36 行 model L1 碎片偏离面）：
+    # 开首独白惯用形 "I'm <verb>-ing …"（"I'm checking…"/"I'm noticing…"）是 agent
+    # 进行中推理独白，非结论；结论段开首是 "I found/I confirmed"（完成时）。
+    # 只收 "i'm "（带尾空格，避免 "i'm" 误配词中），宁漏勿错同红线。
+    "i'm ",
 )
 _MONOLOGUE_WINDOW = 60     # 开首判定窗口（strip 后前 N 字符内命中才算开首独白）
+
+
+# 2026-10-23 reviewer 中修：`i'm ` 误杀结论句（"i'm sure/confirming/found/done/complete…"
+# 是结论不是独白）。is_reasoning_monologue 命中 `i'm ` 后，若同 60 字符窗口内出现任一
+# 结论词 → 不判独白（宁漏勿错，同既有红线）。前缀词表 let me/i need to 等不动。
+IAMS_CONCLUSION_CUES = ("sure", "confirm", "found", "discovered", "done", "complete",
+                        "verified", "finished", "resolved")
 
 
 def is_reasoning_monologue(text: str) -> bool:
     """R4 开首独白判定（确定性、零 LLM、纯 stdlib；大小写不敏感）。
 
     text strip 后前 60 字符内命中 REASONING_MONOLOGUE_CUES 任一 → True。
+    例外（2026-10-23 reviewer 中修）：`i'm ` 命中且同窗口含结论词
+    （i'm sure/confirming/found/done…）→ False（结论句不误杀）。
     空文本 → False。user 段免疫不在此函数（纯文本面），由调用面
     （Tagger.classify 只对 provenance=="model" 生效）保证。
     """
@@ -64,7 +78,16 @@ def is_reasoning_monologue(text: str) -> bool:
     if not t:
         return False
     head = t[:_MONOLOGUE_WINDOW]
-    return any(c in head for c in REASONING_MONOLOGUE_CUES)
+    hit = None
+    for c in REASONING_MONOLOGUE_CUES:
+        if c in head:
+            hit = c
+            break
+    if hit is None:
+        return False
+    if hit == "i'm " and any(cc in head for cc in IAMS_CONCLUSION_CUES):
+        return False
+    return True
 
 
 def classify_user(text: str) -> tuple[str, bool]:

@@ -35,6 +35,45 @@ def _l3_text(ws) -> str:
     return ws.excerpt()
 
 
+# L1 fact head 长度（2026-10-23 偏离根因修复）：无 key_fact 段取 original_text 前 N 字符
+# 作 L1 行 fact（原 N=20 太碎 → 模型降档后失忆进行中结论）。截断加 '…' 明示可点查。
+_L1_FACT_HEAD = 60
+
+
+def _l1_fact_head(seg) -> str:
+    """无 key_fact 段 L1 fact：original_text 前 60 字符；超长加 '…' 截断标记。"""
+    text = seg.original_text or ""
+    head = text[:_L1_FACT_HEAD]
+    return head + ("…" if len(text) > _L1_FACT_HEAD else "")
+
+
+def _anchor_ids(segs: list) -> set:
+    """任务锚点集合（2026-10-23 偏离根因修复）：最近 user P0 段 + 紧随其后的第一段 model P0。
+
+    语义：compact 两次后，模型必须仍知道"当前任务是什么 + 我刚做到哪"——
+    最近 user P0（任务指令）与其**紧邻其后的第一段 model P0**（该指令的结论级响应）
+    组成 anchor 对，双双强制 L3 全文豁免（不受细节池 / l3 cap 约束，同 structural P0）。
+    P1/P2 filler 不抢 anchor 身份（2026-10-23 test_p3_tiers 实证：P1 filler 段抢 anchor
+    会把池归零降级面抢成 L3）。判定确定性（seq 顺序 + provenance + tier，零 LLM）；
+    union 窗口双 seq 空间同号时按稳定序 tiebreak（与 _rank_key 同方向）。
+    """
+    anchors: set[str] = set()
+    # 最近 user P0：tier==P0 且 provenance==user，seq 最大者
+    user_p0s = [ws for ws in segs
+                if ws.segment.tier == "P0" and ws.segment.provenance == "user"]
+    if user_p0s:
+        last_user = max(user_p0s, key=lambda w: (w.segment.seq, w.segment.content_hash[:16]))
+        anchors.add(last_user.segment.segment_id)
+        # 末响应：紧邻其后（seq 最小且 > last_user.seq）的第一段 **model P0** 段
+        later = [ws for ws in segs
+                 if ws.segment.provenance == "model" and ws.segment.tier == "P0"
+                 and ws.segment.seq > last_user.segment.seq]
+        if later:
+            first_model = min(later, key=lambda w: (w.segment.seq, w.segment.content_hash[:16]))
+            anchors.add(first_model.segment.segment_id)
+    return anchors
+
+
 def _l1_line(ws, rel: int = 1) -> str:
     """L1 索引行（~20-40t）：块内相对号 + tier + prov + 全局 seq + 时间戳 + key_fact（无则 head20）。
 
@@ -53,7 +92,11 @@ def _l1_line(ws, rel: int = 1) -> str:
     稳定靠 text() 整段渲染保证，不靠单 L1 行逐字不变）。ts=0 省略 ts 段是 R4 的
     增量，叠加在 R5 新行形之上。"""
     seg = ws.segment
-    fact = getattr(seg, "key_fact", "") or seg.original_text[:20]
+    # 2026-10-23 偏离根因修复：无 key_fact 段 L1 fact 取 head 前 60 字符（原 [:20]
+    # 太碎——compact 两次后模型段降档 L1，"I'm checking whether…" 20 字符碎片让模型
+    # 失忆自己的进行中结论，拿注入 mem 上下文猜下一步 → 偏离任务）。超长段加 '…'
+    # 截断标记，明示"这行只是开头、全文在盘上可点查"，模型知道去 recall.get 捞原文。
+    fact = getattr(seg, "key_fact", "") or _l1_fact_head(seg)
     ts = getattr(seg, "ts", 0) or 0
     ts_part = f" ts={ts:.0f}" if ts > 0 else ""
     prov = getattr(seg, "provenance", "") or "?"
@@ -141,13 +184,20 @@ def choose_forms(
             "digest": has_digest,
         }
     structural = {ws.segment.segment_id for ws in segs if ws.segment.structural_p0}
+    # 任务锚点（2026-10-23 偏离根因修复）：最近 user P0 + 其模型末响应 强制 L3 豁免
+    # （同 structural P0 语义：push cap 内永不降档——compact 后模型仍知"当前任务 +
+    # 刚做到哪"）。豁免集随窗口逐次重算（确定性），不影响既有 structural 豁免面。
+    # reviewer 必修项（2026-10-23）：anchor 段超 l3 cap → 不再无脑 L3（破 DoD 总帽 6K
+    # 实测：anchor 8000 字符全文 block_tokens=2001 顶满）。cap 兜底：anchor 段 L3 成本
+    # > cap → 走常规选档（L2/L1/L0），保"可定位+可读"不保"无限全文"。
+    anchors = {a for a in _anchor_ids(segs) if costs[a]["l3"] <= cap}
 
     form_of: dict[str, tuple[str, str]] = {}
     index_used = 0
     # 相关性高者先选高档（structural P0 永不降级，直接 L3）
     for ws in sorted(segs, key=lambda w: _rank_key(w, query_terms)):
         sid = ws.segment.segment_id
-        if sid in structural:
+        if sid in structural or sid in anchors:
             form_of[sid] = ("L3", _l3_text(ws))
             continue
         c = costs[sid]
