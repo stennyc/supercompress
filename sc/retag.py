@@ -29,6 +29,8 @@ if _INSTALL_ROOT not in sys.path:
 from plugins.context_engine.supercompress.engine import SupercompressContextEngine
 from sc.store import JsonlStore
 from sc.schema import Segment
+from scdata import to_line as scdata_to_line
+from sc.tagger import is_reasoning_monologue
 
 def retag_segments(store_path: str, dry_run: bool = False, max_segments: int = 0):
     """对存量条目重打分并生成 digest"""
@@ -108,6 +110,49 @@ def retag_segments(store_path: str, dry_run: bool = False, max_segments: int = 0
         print("   生产路径零配置（宿主 update_model 注入 agent 运行时）；")
         print("   离线工具需 shell 导出 LIVE_ENDPOINT_URL/KEY/MODEL（sc/live_endpoint 解析链）")
         print("   或检查 agent LLM API 端点健康度")
+
+def retag_monologue(store_path: str, dry_run: bool = True) -> list:
+    """R2（2026-10-23 data-engineer 复盘项 #3）：`i'm ` 独白词批量修复面。
+
+    tagger REASONING_MONOLOGUE_CUES 加 "i'm " 后，历史 store 里已有的 model P0
+    非结构段（开首 "I'm checking/noticing…" 独白）仍按旧 tagger 留在 P0 注入面，
+    新段才降 P2 → 同 session 内新旧 tier 断层。本函数对全量段重跑
+    `is_reasoning_monologue`，命中者降 P2 并落盘（tier 可变，content_hash 只验
+    original_text → 原地重写合法；replay 不重跑 tiering → 批量重打是唯一一致面）。
+
+    面：只翻转「P0 + 非 structural + provenance=model + 独白命中」段；
+    user 段 / structural P0 / 结论句（i'm + 结论词）一律不动。幂等（已 P2 段
+    不再翻转）。dry_run=True（默认）只报不写，返回 [segment_id, ...]。
+    """
+    store = JsonlStore(store_path)
+    segs = store.replay()
+    flipped = []
+    for seg in segs:
+        if seg.tier != "P0" or seg.structural_p0 or seg.provenance != "model":
+            continue
+        if not is_reasoning_monologue(seg.original_text or ""):
+            continue
+        flipped.append(seg.segment_id)
+        if not dry_run:
+            seg.tier = "P2"
+    if not dry_run and flipped:
+        _rewrite_store(store, segs)
+    print(f"独白重打标: 命中 {len(flipped)} 段"
+          + ("（dry-run，未写盘）" if dry_run else "（已降 P2 落盘）"))
+    return flipped
+
+
+def _rewrite_store(store, segs):
+    """tier 变更批量落盘：整文件按 replay 行序重写（原子：临时文件 + rename）。
+
+    行字节 = scdata.to_line(seg.to_dict())（与 append 面同源），content_hash 不变
+    （只验 original_text）→ 重写后 replay 验证面零扰动。"""
+    tmp_path = store.path + ".retag.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        for seg in segs:
+            f.write(scdata_to_line(seg.to_dict()) + "\n")
+    os.replace(tmp_path, store.path)
+
 
 if __name__ == '__main__':
     import argparse

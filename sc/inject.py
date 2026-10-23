@@ -12,7 +12,8 @@
 - L3 全文   = 原文（digest_only 段 = digest 摘录，与 distill.WindowSeg.excerpt 同义）；
   structural P0（goal/ledger 活账本）**永不降级**（push cap 语义：活账本永不裁）
 - L2 摘要   = digest_text（LLM summary；无 digest 段不可用 L2 → 直落 L1）
-- L1 索引行 = 「#seq tier ts · key_fact」一行（无 key_fact → head20）
+- L1 索引行 = 「#seq tier ts · key_fact」一行（无 key_fact → head60 + '…' 截断标记；
+  2026-10-23 偏离根因修复：原 head20 太碎，compact 两次后模型段降档失忆进行中结论）
 - L0 指针   = 「#seq tier [segment_id] on-demand」（预算榨干时的最小足迹）
 
 相关性排序（零 LLM / 零网络 / 确定性）：query 词面子串命中数 desc → tier（P0 先）
@@ -75,7 +76,7 @@ def _anchor_ids(segs: list) -> set:
 
 
 def _l1_line(ws, rel: int = 1) -> str:
-    """L1 索引行（~20-40t）：块内相对号 + tier + prov + 全局 seq + 时间戳 + key_fact（无则 head20）。
+    """L1 索引行（~20-40t）：块内相对号 + tier + prov + 全局 seq + 时间戳 + key_fact（无则 head60 + '…' 截断标记）。
 
     R4（2026-10-13 · owner 病灶 c ts 不刷新）：段 ts 为 0/缺（回放段未刷新
     的不可信值，`_ts_zero_ratio` 观测面同口径）→ 省略 ts 段——不新造时间戳
