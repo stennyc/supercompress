@@ -375,19 +375,5 @@ def parse_prefold_llm_response(text) -> dict:
         except Exception:
             continue
         if isinstance(d, dict):
-            return {k: str(d.get(k, '')).strip() for k in ("why", "next", "done")}
+            return {k: str(d.get(k, "")).strip() for k in ("why", "next", "done")}
     return {}
-
-
-# ── 文件级 GC 联动（与 digest_pool.gc_session_pool 同 sid 前缀口径，独立文件名）────
-def gc_session_prefold(sid: str, hermes_home: Optional[str] = None) -> bool:
-    """删会话边界预折旁路文件（会话 GC 面；独立于 digest_pool 的 GC，不误删 durable 池）。"""
-    p = prefold_tmp_path_for_jsonl(os.path.join(hermes_home, sid + ".jsonl")) \
-        if hermes_home else None
-    if p and os.path.exists(p):
-        try:
-            os.unlink(p)
-            return True
-        except OSError:
-            pass
-    return False

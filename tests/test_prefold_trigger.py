@@ -209,6 +209,45 @@ def _mkseg_test_seg():
     return s
 
 
+class TestSessionBoundaryPrefoldClear:
+    """D8 会话边界清零面（宿主 /new 走 on_session_reset，非 on_session_end）：
+    /new 交接面必须清掉旧 session 的 prefold.tmp（此刻 store 仍绑旧 session，
+    删的正是旧文件；宿主随后 on_session_start rebind 新路径）。"""
+
+    def _full_engine(self, tmp_path):
+        # 走真实 __init__（依赖面全）：aux 缺省 Async=False sync；store 外置 tmp。
+        e = SupercompressContextEngine(context_length=100000,
+                                      external_store_path=str(tmp_path))
+        e.on_session_start("s_reset_pf")
+        e.prefold_enabled = True                  # 开预折面（缺省 off no-op）
+        return e
+
+    def test_on_session_reset_clears_old_prefold(self, tmp_path):
+        e = self._full_engine(tmp_path)
+        f = e._prefold_file()
+        f.upsert("old", StubList(segment_id="old", done="did thing").normalize())
+        assert os.path.exists(f.path)
+        e.on_session_reset()                      # 宿主 /new 交接面
+        assert not os.path.exists(f.path), "reset 后旧 session prefold.tmp 必须被清"
+
+    def test_on_session_end_clears_prefold(self, tmp_path):
+        e = self._full_engine(tmp_path)
+        f = e._prefold_file()
+        f.upsert("old", StubList(segment_id="old", done="did thing").normalize())
+        assert os.path.exists(f.path)
+        e.on_session_end("s_reset_pf", [])
+        assert not os.path.exists(f.path), "会话收尾面 prefold.tmp 必须被清"
+
+    def test_reset_off_noop_zero_io(self, tmp_path):
+        # prefold_enabled=False 缺省 → reset 整面 no-op（不触达 prefold 文件，零 IO）
+        e = SupercompressContextEngine(context_length=100000,
+                                       external_store_path=str(tmp_path))
+        e.on_session_start("s_off")
+        assert e.prefold_enabled is False
+        e.on_session_reset()                      # off → 零 IO，不炸
+        assert not os.path.exists(prefold_tmp_path_for_jsonl(e.store.path))
+
+
 def _fake_aux_with_response(canned_json: str):
     """aux 端点投喂 canned LLM 响应（PREFOLD_LLM_TASK → 固定 JSON；零网络零崩溃）。"""
     ep = FakeEndpoint()

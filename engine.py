@@ -1465,7 +1465,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
             return {}                               # fail-open：提取失败 → 空面，存根回退纯编号
 
     def _prefold_clear(self, reason: str = "") -> None:
-        """D8 清零（compact 后 / 会话边界三处调用点；水位回落清零在 _prefold_trigger 内）。"""
+        """D8 清零（compact 结算点 + 会话边界两面 + 水位回落清零在 _prefold_trigger 内）。
+
+        会话边界两调用点（本函数被调处）：
+        - on_session_reset（宿主 /new，engine.py 末段）——删旧 session 的 prefold.tmp
+          （此刻 store 仍绑旧 session；宿主随后 on_session_start rebind 新路径）；
+        - on_session_end（engine.py 末段）——会话收尾面。
+        缺省 prefold_enabled=False → 整面 no-op，零 IO 零炸。"""
         if not self.prefold_enabled:
             return
         try:
@@ -3043,6 +3049,13 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # block-② recall cache（t_12f38672）：会话边界（/new）清 recall 实例态（session
         # 记忆 scope，防旧 session 指纹/recall 结果泄漏进新 session；与 rerank/p4 缓存清零同口径）。
         self._recall_cache = None
+        # 预折旁路清零（D8 会话边界 · /new 面）：宿主 /new 走 on_session_reset（非
+        # on_session_end，base 契约）——此刻 store 仍绑旧 session，_prefold_clear 删的是
+        # 旧 session 的 <sid>.prefold.tmp（compact 不会跨 /new 复用 0.45 带产物；宿主随后
+        # on_session_start rebind 新 store 后新 session 走新路径）。与 on_session_end 的
+        # session-end 清零点对称，补齐 D8 契约"会话边界"面（此前 /new 路径漏清，旧文件留存）。
+        # prefold_enabled=False 缺省 → 整面 no-op，现状零变化。
+        self._prefold_clear("session-reset")
         # 紧凑摘要账本（t_63bf3ba2）：会话边界（/new）整段清——条目归 0、generation/seals +1
         # （同 /new 新 session 首 turn 不复用旧 session 累计前缀；与 rerank/p4 缓存清零同口径）。
         # 路径不变（宿主随后 on_session_start rebind 新 session 时 _compact_ledger 访问器按
