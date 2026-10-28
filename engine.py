@@ -53,16 +53,17 @@ from sc import (
 # 数据子目录名单一事实源（G2）：telemetry_report_path / on_session_start 的 legacy 回退
 # 各带 env/kwarg 分支（合法独立规则），但目录名字面引用共享常量，杜绝「改一处漏一处」。
 from sc._bootstrap import STORE_SUBDIR
-from sc.inject import choose_forms, render_block, block_tokens
+from sc.inject import choose_forms, render_block, block_tokens, _l1_line
 from sc.recall import Recaller, tokenize
 from sc.rerank import RerankGate, rerank_hits
 from sc.semantic import BoundaryExpander, BOUNDARY_TASK
-from sc.tagger import Tagger
+from sc.tagger import Tagger, is_reasoning_monologue
 from sc.drift import DriftTracker
 from sc.telemetry import TelemetryCollector, filler_form_share
 from sc.version import build_id, desync_warning
 from sc import digest_pool as sc_digest_pool
 from sc import model_store as sc_model_store
+from sc import prefold as sc_prefold
 from sc.compact_ledger import CompactLedger, compact_ledger_path_for_jsonl  # t_63bf3ba2 append-only 累计布局（与 cache-aware 卡共用本侧车模块）
 import scdata  # scdata.sink_p0/restore_p0：settled P0 原文沉盘（侧车同目录 <seq>.p0，可复活可审计）
 
@@ -692,6 +693,14 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.context_length: int = _get("context_length", DEFAULT_CONTEXT_LENGTH)
         self.compact_ratio: float = _get("compact_ratio", DEFAULT_COMPACT_RATIO)
         self.force_compact_ratio: float = _get("force_compact_ratio", DEFAULT_FORCE_COMPACT_RATIO)
+        # 预折（prefold）触发面（owner 定稿 2026-10-28 · task_406/D4）：每 turn 检查水位，
+        # ≥prefold_water_frac（默认 0.45，可配）→ 划定蒸区（对齐 distill _evict_until 逐出判据）
+        # → 逐段预蒸 6 槽存根 list 落 <sid>.prefold.tmp（独立旁路，不进 digest_pool）；
+        # compact(0.55) 执行时纯数据提取替换该区间（零 LLM，不 hang）。
+        # prefold_enabled 默认 False（fail-safe：缺省 = 现状零变化，owner 显式开才走预折面）；
+        # prefold_water_frac 缺省 0.45（0.55 compact 触发线之下，留 0.10 时间窗预蒸）。
+        self.prefold_enabled: bool = bool(_get("prefold_enabled", False))
+        self.prefold_water_frac: float = float(_get("prefold_water_frac", 0.45))
         self.max_tail_turns: int = _get("max_tail_turns", DEFAULT_MAX_TAIL_TURNS)
         self.max_tail_tokens: int = _get("max_tail_tokens", DEFAULT_MAX_TAIL_TOKENS)
         # P1 extended-BM25 招③：召回时间衰减接线面（按参数控制启用面；默认 0 = 钉死面不扰动）
@@ -723,6 +732,20 @@ class SupercompressContextEngine(sc_context_engine_base()):
         # 显式 True 才恢复现状每 turn 自动注入（保留回滚路径）。
         # compress（compact 事件驱动面）不受本开关影响。
         self.auto_recall_enabled: bool = bool(_get("auto_recall", False))
+        # 召回暂存区（recall staging area）——独立于账本的 LRU 容器。
+        # 暂存区段**不进账本**（choose_forms/_staged_ledger_dedup/compact_ledger_max_tokens 零感知）；
+        # compact 结算点清暂存区字节（_recall_staging_clear_on_compact），保留 _recall_cache（立刻重填复用）。
+        # 预算 = _recall_budget_tokens()（纯读 last_prompt_tokens / context_length，零账本耦合）：
+        #   headroom = context_length * DISTILL_WATER_FRAC - last_prompt_tokens
+        #   budget   = max(0, min(int(headroom * recall_budget_frac), int(context_length * recall_budget_cap_frac)))
+        # 超帽段按 LRU 序踢旧纳新（整段不劈段）；单段 est_tokens > 预算 → 整段降 L1 行（_l1_line）。
+        # 段数上限 recall_staging_max_segs（默认 32，防无界段数）。
+        self.recall_budget_frac: float = float(_get("recall_budget_frac", 0.3))
+        self.recall_budget_cap_frac: float = float(_get("recall_budget_cap_frac", 0.05))
+        self.recall_staging_max_segs: int = int(_get("recall_staging_max_segs", 32))
+        # 暂存区容器（OrderedDict 语义：最近 touch 的在尾部，LRU 踢头）
+        # key=seg_id, value=est_tokens（动态帽累加用）
+        self._recall_staging: Dict[str, int] = {}
         self._recall_cache: Optional[dict] = None
         # P3-block-② persistence: per-session sidecar next to <sid>.jsonl
         # (supercompress_store/<sid>.recall_cache.json) so the in-memory
@@ -1278,6 +1301,180 @@ class SupercompressContextEngine(sc_context_engine_base()):
         段自身 model_version 非壳注入面，宿主零改动约束下取 当前运行时模型 为池条目版本键）。"""
         return (self._main_runtime or {}).get("model") or None
 
+    # ── 预折（prefold）接线面（owner 定稿 2026-10-28 · 切面 3/4/5/8，算法全在 sc/prefold.py）──
+
+    def _prefold_file(self):
+        """预折旁路文件访问器（rebind-safe：store 会话边界 rebind 后路径变 → 重建）。
+
+        同 digest_pool 的 lazy 绑定口径：路径 = 主 store jsonl 同目录同 sid 前缀的
+        `<sid>.prefold.tmp`（sc.prefold.prefold_tmp_path_for_jsonl 单源）。"""
+        p = sc_prefold.prefold_tmp_path_for_jsonl(self.store.path)
+        return sc_prefold.StubListFile(p)
+
+    def _prefold_water_line(self) -> int:
+        """预折带水线（D4）：context_length × prefold_water_frac（缺省 0.45，0.55 compact
+        触发线之下，留 0.10 时间窗预蒸）。纯算术，零 LLM。"""
+        return int(self.context_length * self.prefold_water_frac)
+
+    def _prefold_neighbor_key_facts(self, segs) -> dict:
+        """邻段 key_fact 滑窗（task_407 · 前 1 后 1）：seq → {prev_key_fact, next_key_fact}。
+
+        按 seq 排序后每段取相邻两段的 key_fact（既有 80 字单串，durable 在 digest_pool 回填面）；
+        首末段单邻（缺侧 = ""，prompt 面渲染 "(无前段)"/"(无后段)"）。确定性（seq 序 + key_fact
+        是段既有字段），零 LLM、零新 IO（只读 store.replay 段内存态）。"""
+        ordered = sorted(segs, key=lambda s: (s.seq, s.content_hash[:16]))
+        out: dict = {}
+        for i, s in enumerate(ordered):
+            prev_kf = getattr(ordered[i - 1], "key_fact", "") if i > 0 else ""
+            next_kf = getattr(ordered[i + 1], "key_fact", "") if i + 1 < len(ordered) else ""
+            out[s.seq] = {"prev": prev_kf or "", "next": next_kf or ""}
+        return out
+
+    def _prefold_trigger(self) -> None:
+        """D4/D5 触发面：每 turn 检查水位 ≥prefold_water_frac（0.45 带）→ 划定蒸区
+        （prefold_evict_region 对齐 distill _evict_until 逐出判据）→ 逐段预蒸 6 槽存根 list
+        → 写 <sid>.prefold.tmp。零 LLM 路径（3 确定性槽），P1/P2 的 3 LLM 槽同步预生成
+        （aux 主端点，超时/失败 → 该 3 槽 None 回退确定性面，fail-open 不炸宿主 turn）。
+
+        门控（任一不满足 → no-op，现状零变化）：
+        - prefold_enabled=False（缺省）→ 整面 no-op（owner 显式开才走）；
+        - 水位 < 0.45 带 → no-op（未进预折带，蒸区空，零预折）；
+        - 蒸区空 → no-op（无段可预折）。
+        白蒸回落清零（D8）：水位 < 0.45 带时 clear() prefold.tmp（产物即失效）。"""
+        if not self.prefold_enabled:
+            return
+        # 白蒸回落清零（D8 之一）：当前水位退出 0.45 预折带 → 旧预折产物作废（compact 不会发生）
+        if self.last_prompt_tokens < self._prefold_water_line():
+            _f = self._prefold_file()
+            if _f.load():
+                _f.clear()
+                logger.info("supercompress: prefold clear (water below %.2f band, "
+                            "stale product discarded)", self.prefold_water_frac)
+            return
+        try:
+            window = self._window_fresh()
+            water_line = self._prefold_water_line()
+            region_seqs = sc_prefold.prefold_evict_region(window, water_line)
+            if not region_seqs:
+                return                                    # 无蒸区（fail-open 零预折）
+            _by_seq = {s.segment.seq: s.segment for s in window.segs}   # WindowSeg → 底层 Segment
+            _kf = self._prefold_neighbor_key_facts([_by_seq[q] for q in region_seqs])
+            entries: dict = {}
+            n_llm = 0
+            for seq in region_seqs:
+                seg = _by_seq.get(seq)
+                if seg is None:
+                    continue
+                sl = self._prefold_one_segment(seg, _kf.get(seq, {}))
+                if sl is not None:
+                    entries[seg.segment_id] = sl
+                    if getattr(seg, "tier", "") in ("P1", "P2") and not seg.structural_p0:
+                        n_llm += 1
+            if entries:
+                _f = self._prefold_file()
+                _n = _f.upsert_many(entries)
+                logger.info("supercompress: prefold triggered (water=%.2f%%, region=%d segs, "
+                            "llm_slots=%d, new=%d)",
+                            100.0 * self.last_prompt_tokens / max(1, self.context_length),
+                            len(region_seqs), n_llm, _n)
+        except Exception as e:
+            # fail-open：预折面任何异常不炸宿主 turn（同 digest_pool / compact_ledger 宽 catch 口径）
+            logger.warning("supercompress: prefold trigger no-op (fail-open): %s", e)
+
+    def _prefold_one_segment(self, seg, kf_ctx: dict):
+        """单段 6 槽 StubList 成文（D2/D3/D6；seg = 底层 Segment，非 WindowSeg）：
+        - 3 确定性槽：files_changed（path_terms）、open（未闭环 open_tasks 清单）、
+          user_decisions（settled P0 定案码 + 决策句，P0 段走确定性、非 P0 留空不臆测）；
+        - 3 LLM 槽（why/next/done）：P1/P2 model 段走 aux 主端点预生成（sync，超时/失败 →
+          None 回退确定性面）；P0 段（structural_p0 / user 指令）恒 None（"确定性面"，D3 免 LLM 蒸）。"""
+        sl = sc_prefold.StubList(segment_id=seg.segment_id,
+                                 files_changed=sc_prefold.StubList.extract_files_changed(
+                                     seg.original_text))
+        sl.open = self._prefold_open_slot(seg)
+        sl.user_decisions = self._prefold_decisions_slot(seg)
+        if seg.tier in ("P1", "P2") and not getattr(seg, "structural_p0", False):
+            sl.p0_deterministic = False
+            _prompt = sc_prefold.build_prefold_llm_prompt(
+                seg, kf_ctx.get("prev", ""), kf_ctx.get("next", ""))
+            _resp = self._prefold_llm_call(_prompt)
+            _parsed = sc_prefold.parse_prefold_llm_response(_resp)
+            sl.why = _parsed.get("why") or None
+            sl.next = _parsed.get("next") or None
+            sl.done = _parsed.get("done") or None
+        else:
+            sl.p0_deterministic = True            # P0 段：3 LLM 槽恒 None（"确定性面"）
+        return sl.normalize()
+
+    def _prefold_open_slot(self, seg) -> list:
+        """open 槽（D2 确定性）：未闭环任务清单（Segment.open_tasks 既有字段，零 LLM）。
+
+        open_tasks 每项 = {id, desc}（AC 任务表）→ 取未 done 项的 id+desc；无清单 → []
+        （渲染面整槽省略，不臆测"应该做的事"当待办——owner 红线，防虚假待办）。"""
+        out: list = []
+        for t in (getattr(seg, "open_tasks", None) or []):
+            if not isinstance(t, dict):
+                continue
+            state = str(t.get("state", "")).lower()
+            if state == "done":
+                continue
+            out.append(str(t.get("id") or t.get("desc") or "").strip())
+        return [o for o in out if o]
+
+    def _prefold_decisions_slot(self, seg) -> list:
+        """user_decisions 槽（D2/D3 确定性）：P0 段 = 定案码（settled_signal）+ 决策句
+        （decisions 字段既有）；非 P0 段 = []（决策归属 P0 user 指令段，P1/P2 不臆测）。"""
+        if seg.tier != "P0":
+            return []
+        out: list = []
+        for d in (getattr(seg, "decisions", None) or []):
+            _s = str(d).strip()
+            if _s:
+                out.append(_s)
+        # 定案码（settled_signal 0/1/2）若 >0，作一条确定性决策标记（零 LLM）
+        _sig = getattr(seg, "settled_signal", 0) or 0
+        if _sig > 0 and not out:
+            out.append(f"settled_signal={_sig}")
+        return out
+
+    def _prefold_llm_call(self, prompt: str) -> str:
+        """3 LLM 槽预生成（D6）：aux 主端点同步调用（pre-fold 在 0.45 带提前跑，不抢
+        compact 的 LLM 面）。超时/异常/端点未注入 → 空串（壳侧 parse → {} → 三槽 None 回退
+        确定性面，fail-open 零崩溃）。纯读 self._aux.main_endpoint，零新 provider。"""
+        try:
+            ep = self._aux.main_endpoint
+            if ep is None:
+                return ""
+            return ep.call(sc_prefold.PREFOLD_LLM_TASK, prompt) or ""
+        except Exception:
+            return ""                               # 端点劣化/超时 → 三槽 None 回退（不炸 turn）
+
+    def _prefold_replace_on_compact(self) -> dict:
+        """D9 compact 提取替换（切面 5）：纯数据提取 prefold.tmp 已蒸区域 list，
+        映射到本次 compact 逐出的段（segment_id），返回 {segment_id: StubList}。
+
+        零 LLM（compact 执行路径无 aux 调用——时序炸弹已拆：LLM 蒸在 0.45 带、compact
+        0.55 只提取）。调用方（compress 逐出点 / 存根折点）据此把 6 槽 list 挂到存根行。
+        提取后不在此处清零（清零时机 = compact 结算点 D8，调用方负责）；返回提取的段集，
+        供调用方决定清零面（compact 全消费 → clear；部分消费 → 保留剩余）。"""
+        if not self.prefold_enabled:
+            return {}
+        try:
+            _f = self._prefold_file()
+            return _f.load() or {}
+        except Exception:
+            return {}                               # fail-open：提取失败 → 空面，存根回退纯编号
+
+    def _prefold_clear(self, reason: str = "") -> None:
+        """D8 清零（compact 后 / 会话边界三处调用点；水位回落清零在 _prefold_trigger 内）。"""
+        if not self.prefold_enabled:
+            return
+        try:
+            _f = self._prefold_file()
+            if _f.clear():
+                logger.info("supercompress: prefold cleared (%s)", reason or "session-boundary")
+        except Exception as e:
+            logger.warning("supercompress: prefold clear no-op (fail-open): %s", e)
+
     # ── B 卡 model 旁路 store（engine 薄壳接线，算法全在 sc/model_store.py；仿 P4 digest pool 钩子形）──
 
     def _model_store_path(self) -> str:
@@ -1782,6 +1979,102 @@ class SupercompressContextEngine(sc_context_engine_base()):
         except Exception:
             self._recall_cache = None  # corrupt sidecar -> cold-start, fail-safe
 
+    # ── 召回暂存区（recall staging area）──
+    # 独立于账本的 LRU 容器：暂存区段不进 c#n 账本（choose_forms 零感知）；
+    # compact 结算点清暂存区字节（_recall_staging_clear_on_compact），保留
+    # _recall_cache（供同 turn select_context 立刻按当前 query 重填复用）。
+    # 预算 _recall_budget_tokens()：纯读 last_prompt_tokens / context_length，
+    # 与 compact_ledger_max_tokens（账本帽）零关联。
+
+    def _recall_budget_tokens(self) -> int:
+        """暂存区动态 token 预算（纯 O(1) 读，零 LLM / 零账本耦合）。
+
+        公式（owner 定稿）：
+            headroom = context_length * DISTILL_WATER_FRAC - last_prompt_tokens
+            cap      = context_length * recall_budget_cap_frac
+            budget   = max(0, min(int(headroom * recall_budget_frac), int(cap)))
+
+        行为曲线（256K 窗口、frac=0.3、cap_frac=0.05）：
+            用量 0       → 12800（封顶）
+            用量 100K    → 12240（收窄）
+            用量 ≥ 水线  → 0（暂存区归零，fail-open，宁空勿顶破水线）
+
+        哨兵钳位：last_prompt_tokens = -1（宿主 compact 提交哨兵）钳到 0，
+        保证 headroom 取最保守值（窗口全空），与 pressure() 哨兵防御对称。
+        """
+        headroom = self.context_length * DISTILL_WATER_FRAC - max(0, self.last_prompt_tokens)
+        cap = int(self.context_length * self.recall_budget_cap_frac)
+        return max(0, min(int(headroom * self.recall_budget_frac), cap))
+
+    def _recall_staging_add(self, seg_id: str, seg_tokens: int) -> None:
+        """暂存区写入/刷新一段（LRU touch：已有 id 移到尾部，新 id 追加尾部）。"""
+        # 已有：删除后重新追加（移到尾部 = LRU 序更新为最新）
+        if seg_id in self._recall_staging:
+            del self._recall_staging[seg_id]
+        self._recall_staging[seg_id] = seg_tokens
+        # 超帽 → 踢最旧（直到 Σ est_tokens ≤ 预算 或 容器空）
+        # 维护 running total 避免 while 循环内每次 sum() → O(N) 单段写入
+        total = sum(self._recall_staging.values())
+        budget = self._recall_budget_tokens()
+        while total > budget and self._recall_staging:
+            oldest_id = next(iter(self._recall_staging))
+            total -= self._recall_staging[oldest_id]
+            del self._recall_staging[oldest_id]
+        # 段数上限（独立于 token 帽，防小段无界堆积）
+        self._recall_staging_enforce_max_segs()
+
+    def _recall_staging_add_batch(self, seg_ids: List[str]) -> None:
+        """批量写入（est_tokens 暂用 0 占位——select_context 投递面在
+        调用 _recall_staging_add_batch 前先算好 est_tokens 传进来更准；
+        这里用 0 = 暂不扣 token 帽（0 值段在 while sum>budget 中永不触发，
+        由段数帽 enforce_max_segs 兜底防无界），段数帽仍生效）。
+
+        0 不是 est_tokens 的合法输出值（下限 1，sc/schema.py:30），
+        此处作占位符语义 = "本批段不贡献 token 帽消耗，仅计段数"，
+        与生产路径 select_context 逐段精确 est_tokens≥1 不同。
+        """
+        for sid in seg_ids:
+            self._recall_staging_add(sid, 0)
+
+    def _recall_staging_touch(self, seg_id: str) -> None:
+        """LRU 刷新：已存在的 seg_id 移到尾部（最近召回 = 最新）。"""
+        if seg_id in self._recall_staging:
+            val = self._recall_staging.pop(seg_id)
+            self._recall_staging[seg_id] = val
+
+    def _recall_staging_evict_oldest(self) -> Optional[str]:
+        """踢最旧（容器头），返回被踢的 seg_id；容器空 → None。"""
+        if not self._recall_staging:
+            return None
+        oldest = next(iter(self._recall_staging))
+        del self._recall_staging[oldest]
+        return oldest
+
+    def _recall_staging_enforce_max_segs(self) -> None:
+        """段数上限 recall_staging_max_segs（默认 32）：超限踢 LRU 最旧，不降 L1。"""
+        excess = len(self._recall_staging) - self.recall_staging_max_segs
+        for _ in range(max(0, excess)):
+            self._recall_staging_evict_oldest()
+
+    def _recall_staging_should_degrade(self, seg_id: str, seg_tokens: int,
+                                       budget: int) -> bool:
+        """单段超预算判定：est_tokens(seg) > budget → 整段降 L1（不劈段）。
+
+        返回 True = 该段应走 _l1_line 降级（~30t L1 行，不劈段中段）；
+        False = 原文整段投（装得下）。
+        """
+        return seg_tokens > budget
+
+    def _recall_staging_clear_on_compact(self) -> None:
+        """compact 结算点：清暂存区字节，**保留 _recall_cache**（供立刻重填复用）。
+
+        - 暂存区段**不进账本**（c#n+1 只含账本自己的 choose_forms 结算）
+        - 原文 durable 锚在 store（<sid>.p0 + segment_id 点查），清暂存区 ≠ 删数据
+        - _recall_cache 不清：同 turn select_context 紧接重跑，Jaccard≥0.85 时
+          复用上轮 K 段（O(1)，不重跑 BM25），暂存区立刻重填，无空窗
+        """
+        self._recall_staging.clear()
+
     @staticmethod
     def _coerce_threshold_tokens_cap(value: Any) -> Optional[int]:
         """宿主实调位（tui_gateway/session_compression.py:169）：规整 threshold_tokens 配置。
@@ -1917,6 +2210,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # P4 钩子②（digest 完成回写池，t_026a17f8）：本事件蒸馏可能新完成 digest
             # （sync 即时 / async 经 end_turn 入队）→ 池落盘；幂等零 IO 快退，fail-open 不炸宿主。
             self._digest_pool_write_hook()
+            # 预折触发面（owner 定稿 D4，切面 3）：每 turn 末查水位 ≥0.45 带 → 划定蒸区
+            # 逐段预蒸 6 槽存根 list 落 prefold.tmp（prefold_enabled 缺省 False = 整面 no-op，
+            # 现状零变化；fail-open 宽 catch 不炸宿主 turn）。LLM 蒸在 0.45 带提前跑，
+            # compact(0.55) 执行时 _prefold_replace_on_compact 纯数据提取替换（时序炸弹已拆）。
+            self._prefold_trigger()
             # P0.4：turn 末 pressure 检查（防抖口径）+ 会话边界外不触碰任何持久态
             self._check_rotation_advisory()
             # per-turn cache 遥测（item 3）：宿主 turn 末喂入 usage=agent._last_turn_usage（含 cache 桶）
@@ -2045,11 +2343,83 @@ class SupercompressContextEngine(sc_context_engine_base()):
                             len(_selfrep_out))
             _recalled_pairs = [(t, x, _sid, _prov) for (t, x, _sid, _prov) in _recalled_pairs
                                if not is_agent_self_report(x, _prov)]
+            # R5-monologue egress（2026-10-27 owner 拍 A+B · 治 auto_recall 复读第二燃料源）：
+            # model 段开首推理独白（"I see…"/"The user is asking…"/"Let me…"）命中 R4
+            # 词表（is_reasoning_monologue，确定性零 LLM，同 Tagger.classify R4 短路面同源）
+            # → 逐出自动注入面（不删盘、可点查，同 is_agent_self_report / is_room_skeleton
+            # egress 纪律）——旧独白段躺在 durable model.jsonl 里按词重叠被 auto_recall 反复
+            # 捞回重注入 head → 模型逐轮回看自己旧推理独白又逐字复述 = 7 轮复读死循环根因。
+            # 宁漏勿错：user 段免疫（is_reasoning_monologue 纯文本面不认 provenance，
+            # 故本面显式 prov=="model" 硬门，user 段恒不命中）。
+            _mono_out = [(t, x) for (t, x, _sid, _prov) in _recalled_pairs
+                         if _prov == "model" and is_reasoning_monologue(x)]
+            if _mono_out:
+                logger.info("supercompress: recall egress cut %d reasoning-monologue "
+                            "segment(s) (model provenance replay residue, R5 egress)",
+                            len(_mono_out))
+            _recalled_pairs = [(t, x, _sid, _prov) for (t, x, _sid, _prov) in _recalled_pairs
+                               if not (_prov == "model" and is_reasoning_monologue(x))]
+            # 预折存根 list 比对面（D11 · owner 定稿 2026-10-28）：粗捞命中"已存根段"
+            # （该段在 prefold.tmp 有 6 槽 StubList）→ 先看 list 是否信息足够：
+            #   - 非空（has content）→ 以该存根行（锚点 + 6 槽 list）代替原文回填
+            #     （省 point_fetch 原文膨胀，"模型先看 list 判断够不够再点查"的意图面）；
+            #   - 全空（is_empty）→ 回退原文（现状零变化，fail-open）。
+            # prefold_enabled=False 缺省 → 提取面 {} → 全回退原文，整面 no-op（现状零变化红线）。
+            _prefold_stubs = self._prefold_replace_on_compact()
+            _stubby = [(t, x, _sid, _prov) for (t, x, _sid, _prov) in _recalled_pairs
+                       if _prefold_stubs.get(_sid) is not None
+                       and not _prefold_stubs[_sid].is_empty()]
+            if _stubby:
+                _new_pairs = []
+                for (t, x, _sid, _prov) in _recalled_pairs:
+                    _sl = _prefold_stubs.get(_sid)
+                    if _sl is not None and not _sl.is_empty():
+                        # 该段已存根且 list 信息足够 → 存根行（锚点 + 6 槽）代替原文回填
+                        # 锚点用该段真实 seq/tier 拼（store 点查 O(1)，fail-open 缺则用 sid）
+                        try:
+                            _s = self.store.get(_sid)
+                            _anchor = (f"#{_s.seq} {_s.tier} [{_sid}] on-demand"
+                                       if _s is not None else f"[{_sid}] on-demand")
+                        except Exception:
+                            _anchor = f"[{_sid}] on-demand"
+                        _new_pairs.append((t, _sl.render_line(_anchor), _sid, _prov))
+                    else:
+                        _new_pairs.append((t, x, _sid, _prov))
+                _recalled_pairs = _new_pairs
+                logger.info("supercompress: recall stub-list substituted %d seg(s) "
+                            "(存根 list 足够省原文 point_fetch)", len(_stubby))
             if not _recalled_pairs:
                 return None
             _bg = [(x, sid) for (t, x, sid, _prov) in _recalled_pairs if t != "P0"]
             _p0 = [(x, sid) for (t, x, sid, _prov) in _recalled_pairs if t == "P0"]
-            recalled = [x for (x, _sid) in _bg + _p0]
+            # ── 暂存区容量管理（独立于账本，token 帽 + 段数帽）──
+            # 逐段精确 est_tokens 写入暂存区；超 token 帽 → LRU 踢最旧（不劈段）；
+            # 单段 est_tokens > 预算 → 整段降 L1 行（_l1_line，~30t，不劈段中段）；
+            # 段数 > recall_staging_max_segs（默认 32）→ 额外踢 LRU，不降 L1。
+            # 预算 = _recall_budget_tokens()（纯读 last_prompt_tokens/context_length，
+            # 与 compact_ledger_max_tokens 零关联——账本帽一条线都不碰）。
+            _budget = self._recall_budget_tokens()
+            _delivered = []
+            for _sid, _seg_text in [(sid, x) for (x, sid) in _bg + _p0]:
+                _seg_tok = est_tokens(_seg_text)
+                if self._recall_staging_should_degrade(_sid, _seg_tok, _budget):
+                    # 单段超预算 → 整段降 L1 行投（_l1_line head60+key_fact，不劈段）
+                    # 降级走 store 查段（segment_id 点查，原文 durable 锚在 store）
+                    try:
+                        _seg = self.store.get(_sid)
+                        if _seg is not None:
+                            _l1ws = WindowSeg(_seg)
+                            _l1ws.form = "L1"
+                            _delivered.append(_l1_line(_l1ws, rel=1))
+                        else:
+                            _delivered.append(_seg_text)  # 查不到段 → fail-open 投原文
+                    except Exception:
+                        _delivered.append(_seg_text)  # 降级异常 → fail-open 投原文
+                else:
+                    _delivered.append(_seg_text)
+                # 写入暂存区（精确 est_tokens；已有 id LRU touch 移尾，新 id 追加）
+                self._recall_staging_add(_sid, est_tokens(_delivered[-1]))
+            recalled = _delivered
             # S1 尾投递（PRD §0.4）：recall 块不再注位置 2 的第二条 in-list system（cache
             # 断点 + Anthropic 覆盖赋值 bug 双免疫）——投到列尾：末条 user 并入 / 非 user
             # 追加独立 user。main system 保持原位（位置 0），recall 移到末条 user。
@@ -2143,9 +2513,50 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 _page_seq = self._evict_seq_index(_lg).get(str(_seg.seq))
                 if _page_seq is not None:
                     _lg.evict_page(_page_seq, _seg.tier, _seg.segment_id)
+                    # D9/切面 5：预折 6 槽存根 list 提取挂存根行（纯数据，零 LLM）——
+                    # 该段若在 0.45 带已预折（prefold.tmp 有 StubList）→ 挂到存根行尾，
+                    # 模型/自动面可直接看存根讲什么（D10）；miss → 存根行保持纯编号锚点
+                    # （fail-open 零膨胀，同 evict_page 映射 miss 口径）。
+                    self._prefold_attach_stub(_seg.segment_id, _page_seq, _lg)
             except Exception as _e:
                 logger.warning("supercompress: evict-ledger-stub wiring degraded: %s", _e)
         return _v6_evict_stub
+
+    def _prefold_attach_stub(self, segment_id: str, page_seq: int, lg) -> None:
+        """D9/切面 5（owner 定稿 2026-10-28）：compact 提取替换 —— 纯数据把该段预折 6 槽
+        list 挂到活账本存根行（evicted 字段）尾，零 LLM（LLM 蒸在 0.45 带 prefold.trigger
+        提前跑，compact 执行路径无 aux 调用——时序炸弹已拆）。
+
+        口径（全 fail-open，不炸宿主）：
+        - prefold_enabled=False（缺省）→ 整面 no-op（现状零变化，存根行保持纯编号锚点）；
+        - prefold.tmp 无该段 StubList（未预折 / 提取 miss）→ 不挂（存根行原样，零膨胀）；
+        - 该 StubList 全空（is_empty）→ 不挂（render_line 回退纯编号锚点，零膨胀）；
+        - 账本已 sealed（settled）→ 不动（§2.4 页快照冻结不变量：旧页字节冻结、
+          不回改；存根提取挂面只在未 settle 的 evicted 存根行上做）。
+        挂法：账本 entry["evicted"] 行尾追加 " · files=[…] done=… open=[…] …"（StubList.
+        render_line 单源，锚点 = 原 evicted 行形），tokens 按挂后实渲染面重记账（3-A 账实
+        单口径）；重记账后 _persist（账本侧车原子写）。"""
+        if not self.prefold_enabled:
+            return
+        try:
+            _stubs = self._prefold_replace_on_compact()
+            _sl = _stubs.get(segment_id)
+            if _sl is None or _sl.is_empty():
+                return                                   # 无预折 / 全空 → 不挂（零膨胀）
+            for _e in lg.entries:
+                if _e.get("seq") == page_seq:
+                    _anchor = str(_e.get("evicted", ""))
+                    _new_line = _sl.render_line(_anchor)   # 全空回退锚点（上方 is_empty 已挡）
+                    if _new_line != _anchor:
+                        _e["evicted"] = _new_line
+                        _e["tokens"] = est_tokens(_new_line)   # 3-A 账实：挂后存根实权重
+                        lg._persist()
+                        logger.info("supercompress: prefold stub-list attached to c#%s "
+                                    "(seg=%s, +%dtok)", page_seq, segment_id,
+                                    est_tokens(_new_line) - est_tokens(_anchor))
+                    return
+        except Exception as _e:
+            logger.warning("supercompress: prefold attach no-op (fail-open): %s", _e)
 
     def compress(
         self, messages: List[Dict[str, Any]], current_tokens: Optional[int] = None,
@@ -2193,6 +2604,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
             # async 在途部分由会话末 aux.flush 汇合点兜底）→ 池落盘；幂等零 IO 快退，
             # fail-open（钩子自含宽 catch，不炸宿主 compress 返回面）。
             self._digest_pool_write_hook()
+            # 预折旁路清零（D8 之二：compact 结算点）——本次 compact 已把 prefold.tmp 的
+            # 6 槽 list 提取挂到 evicted 存根行（_prefold_attach_stub，distill 逐出点消费）
+            # → 产物即失效（下一次 0.45 带命中重新蒸新区）。清零在 compress 成功 try 块末
+            # （fail-open 早退路径不清——压缩失败时 pre-fold 产物仍有效，下次 compact 复用）。
+            self._prefold_clear("compact-settle")
         except (StoreError, OSError) as e:
             # R2：full-disk 时 store 交互抛 OSError（EIO/ENOSPC）——store 写路径已归一为
             # StoreError("io_error: ...")，此处双 catch 防御 replay/aux 面裸 OSError 逃逸。
@@ -2260,7 +2676,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
             _fs = filler_form_share(window, query=focus_topic or "", segs=kept)
         except Exception:
             _fs = {}
-        rendered = choose_forms(kept, window, query=focus_topic or "")
+        # D10/D12：L0 指针存根 list 面——把预折 6 槽 list（_prefold_replace_on_compact 纯数据
+        # 提取，零 LLM）作为 choose_forms 的 stub_lists 注入面，被降档 L0 的段渲染 6 槽尾；
+        # prefold_enabled=False 缺省 → 提取面返回 {} → L0 恒走纯编号锚点（现状零变化，fail-open）。
+        rendered = choose_forms(kept, window, query=focus_topic or "",
+                                stub_lists=self._prefold_replace_on_compact())
         block = render_block(rendered)
         _forms: Dict[str, int] = {}
         for _ws, _ff, _tx in rendered:
@@ -2276,6 +2696,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 pass
         out: List[Dict[str, Any]] = list(messages[:self.protect_first_n])
         out.extend(messages[-self.protect_last_n:] if messages else [])
+        # R2-2（治 compact #N→#N+1 账本消息双发·前缀断裂活体根因）：上一轮 compact 的
+        # 累计账本消息若落在本轮 rolling tail 保护窗内 → head+tail 拼接后残留尾区，
+        # 与 c#N+1 新账本消息并存 → 前缀断裂 + 模型逐轮回看旧账本全文 = 复读死循环。
+        # 剥除规则与下方 L2453 同源（只认专属前缀），幂等，零误伤。
+        out = [m for m in out if not str(m.get("content", "")).startswith(_COMPACT_LEDGER_PREFIX)]
         # 紧凑摘要账本（t_63bf3ba2 · append-only 累计布局）：长会话（head+tail 之间仍有
         # 可压缩 middle）→ 本次 staged 块 **append** 进累计段（旧块 c#1.. 字节原样保留）
         # 并注入 head/tail 缝作独立 user 消息 = 前缀单调稳定位 → provider 前缀缓存跨
@@ -2357,6 +2782,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
                     else:
                         self._last_recall_page_seqs = []
                         self._last_discarded_page_texts = {}
+                # 召回暂存区结算点：清暂存区字节（§2.2 防递归语义——召回段不进账本存根），
+                # **保留 _recall_cache**（同 turn select_context 紧接重跑，Jaccard≥0.85 时
+                # 复用上轮 K 段 O(1) 重填暂存区，无空窗）。暂存区独立于账本：
+                # c#n+1 只含账本自己的 choose_forms 结算，暂存区段 id 不在 ledger entries 里。
+                self._recall_staging_clear_on_compact()
                 _p0_block, _p0_forms = _staged_by_tier(_expanded, "P0")
                 _p1_block, _p1_forms = _staged_by_tier(_expanded, "P1")
                 _entry = None
@@ -2640,6 +3070,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
                 pass
         # B 卡：model 旁路 lazy 批 flush（aux worker flush 后；OSError 优雅降级，镜像主 store 块，marker + store=model 判别）
         self._model_session_flush("session-end")
+        # 预折旁路清零（D8 之三：会话边界）——会话收尾预折产物即失效（compact 不会跨会话
+        # 复用 0.45 带产物；新会话 on_session_start rebind store 后 prefold.tmp 路径变、
+        # 旧文件随会话 GC 删）。prefold_enabled=False 缺省 → 整面 no-op，现状零变化。
+        self._prefold_clear("session-end")
 
         logger.info("supercompress: session %s end, store lines=%d",
                     session_id, self.store.line_count)

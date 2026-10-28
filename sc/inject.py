@@ -104,8 +104,15 @@ def _l1_line(ws, rel: int = 1) -> str:
     return (f"#{rel} {seg.tier} prov={prov} seq={seg.seq}{ts_part} · {fact}")
 
 
-def _l0_ptr(ws) -> str:
-    return f"#{ws.segment.seq} {ws.segment.tier} [{ws.segment.segment_id}] on-demand"
+def _l0_ptr(ws, stub=None) -> str:
+    """L0 指针行形（D10/D12）：纯编号锚点 `#seq tier [segment_id] on-demand`，
+    预折 6 槽存根 list 在场时追加尾（`stub` = StubList，非空则 render_line 挂尾；
+    缺省/全空 → 原样纯编号锚点，零膨胀 fail-open——与 compact_ledger evicted 存根行
+    同渲染单源，模型/自动面可直接看"这段讲什么"）。"""
+    anchor = f"#{ws.segment.seq} {ws.segment.tier} [{ws.segment.segment_id}] on-demand"
+    if stub is not None and not stub.is_empty():
+        return stub.render_line(anchor)
+    return anchor
 
 
 def _rank_key(ws, query_terms: set[str]) -> tuple:
@@ -146,6 +153,7 @@ def choose_forms(
     index_budget: int | None = None,
     detail_budget: int | None = None,
     l3_max_tokens: int | None = None,
+    stub_lists: dict | None = None,
 ) -> list[tuple]:
     """预算驱动选档（核心，确定性）→ [(ws, form, text), ...]，输出 = seq 稳定序。
 
@@ -161,8 +169,13 @@ def choose_forms(
     超 cap 段整段不再装细节池 → 降 L2（有 digest）/ L1/L0 指针（无 digest 兜底）。
     structural P0 豁免 cap（活账本永不裁，push cap 语义一致）。
 
-    确定性不变（同 segs/window/query → 同输出）。
+    L0 指针存根 list 面（D10/D12）：`stub_lists`（{segment_id: StubList}，可选）在场时，
+    被降档 L0 的段渲染 6 槽存根 list 尾（_l0_ptr 带 stub）；缺省 / 该段无 StubList / 全空
+    → 回退纯编号锚点（零膨胀 fail-open，现状零变化）。纯数据注入面，不碰选档算法。
+
+    确定性不变（同 segs/window/query/stub_lists → 同输出）。
     """
+    stub_lists = stub_lists or {}
     ib = DEFAULT_INDEX_BUDGET if index_budget is None else max(0, int(index_budget))
     db = DEFAULT_DETAIL_BUDGET if detail_budget is None else max(0, int(detail_budget))
     # L3 单段 cap（fix-3）：None → 800 保守默认；宿主 config 经参面覆盖，禁裸读 env。
@@ -181,7 +194,7 @@ def choose_forms(
             "l3": est_tokens(_l3_text(ws)),
             "l2": est_tokens(seg.digest_text) if has_digest else None,
             "l1": est_tokens(_l1_line(ws)),
-            "l0": est_tokens(_l0_ptr(ws)),
+            "l0": est_tokens(_l0_ptr(ws, stub_lists.get(seg.segment_id))),
             "digest": has_digest,
         }
     structural = {ws.segment.segment_id for ws in segs if ws.segment.structural_p0}
@@ -213,7 +226,7 @@ def choose_forms(
             form_of[sid] = ("L1", _l1_line(ws))
             index_used += c["l1"]
         else:
-            form_of[sid] = ("L0", _l0_ptr(ws))
+            form_of[sid] = ("L0", _l0_ptr(ws, stub_lists.get(sid)))
 
     out = []
     # 展示序 = (seq, content_hash[:16]) 升序（fix-1 t_ad82f732 / gate t_2d213ce9 裁定表 #1：
