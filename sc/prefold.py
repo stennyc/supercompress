@@ -291,8 +291,17 @@ def prefold_evict_region(window, water_line: int,
     （与 _evict_until 的 `while used > water: evict next` 同停点）。
 
     structural P0（goal/ledger 尾，结构地板）永不进蒸区（对齐 distill `_next_candidate`
-    结构门）；kind=segment 的 user 指令 P0 可进蒸区（对齐 90% 超压 p0_force 口径——
-    预折面向 compact 兜底档，user 指令段被折存根时需要确定性 6 槽，故纳入）。
+    结构门）；kind=segment 的 user 指令 P0 可进蒸区。
+
+    档位口径说明（reviewer 备查 #2 · 与 distill tier 表逐档对齐，非缺陷）：
+    蒸区选段**超集覆盖**——纳入 user 指令 P0（对齐 90% 超压 p0_force 口径）。但默认
+    0.45 预折带下 distill 实际走 tier75（p0_force=False，仅 P2/P1 档，P0 不触达）→
+    该 user-P0 段的预折 StubList 在默认面不会被 0.55 compact 逐出消费，只能被后续
+    90% 超压档（p0_force=True）或 L0 降档面消费。即：预折区比默认 compact 档"多蒸"
+    user-P0 段是**提前备料**（一旦水位真冲到 90% 或段被降 L0，6 槽 list 已就绪），
+    不造成当前档的误蒸/误替——蒸区只吐 seq 列表供壳侧预蒸，实际替换由 compact
+    逐出点 / choose_forms L0 面按各档真实逐出面消费，纯读零写零 LLM 的蒸区划定本身
+    对默认 tier75 零行为影响（fail-open 超集）。
 
     # 返回 = 该预折段 seq 升序列表（空窗 / 未超水线 → 空列表，fail-open 零误面）。
     # 注：蒸区 seq 升序（跨 tier 合并，供 compact 精准替换按 seq 区间对齐，D9）；
