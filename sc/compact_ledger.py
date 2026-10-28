@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from typing import Any, Dict, List, Optional
 
@@ -57,6 +58,33 @@ PAGE_FOOTER = "[页脚：本页及以上旧段为历史参考（不作为当前�
 _SETTLED_STUB_HASH_LEN = 16
 
 
+# 行首段标记位（engine L589-597 L3/L2 行 + sc.inject._l1_line L1 行行首均
+# `#<rel> <tier> prov=<…> seq=<全局>`；L0 指针行无 seq= 位 → 全 L0 高压页解析空，
+# 渲染面 fail-open 退化旧行形，与既有 L0 行首无 seq= fail-open 面同源）。
+_PAGE_SEQ_RE = re.compile(r"(?m)^#\d+ \w+ prov=\S+ seq=(\d+)")
+_PAGE_USER_RE = re.compile(r"(?m)^#\d+ \w+ prov=user seq=(\d+)")
+
+
+def _page_seg_ranges(text: str) -> tuple:
+    """该页 staged 块的段序锚三元组 (mn, mx, last_user_seq)（纯函数，零 LLM）。
+
+    mn/mx = 行首段标记位（L3/L2/L1 行）的全局 seq 区间；last_user_seq = 该页
+    prov=user 行中最大 seq（= 该页进度断点，compact 后模型据此定位"现在干哪段"）。
+    全 L0 页 / 空 text / 无 user 行 → 对应位 0（渲染面 fail-open 退化旧行形，
+    不误标 0..0）。"""
+    seqs = [int(m) for m in _PAGE_SEQ_RE.findall(str(text or ""))]
+    if not seqs:
+        return (0, 0, 0)
+    users = [int(m) for m in _PAGE_USER_RE.findall(str(text or ""))]
+    return (min(seqs), max(seqs), max(users) if users else 0)
+
+
+def _norm_segs(segs: tuple):
+    """全 0 占位（全 L0 页 / 解析空）归一 None，渲染面逐字旧行形；非 0 才留。"""
+    _g = [int(x) for x in segs]
+    return None if not any(_g) else _g
+
+
 def _settled_stub_line(seq: int, text: str, kind: str, sid: str = "") -> str:
     """settled P0 块在活渲染面里的单行存根（固定短字节，不随原文长度变）。
 
@@ -68,13 +96,15 @@ def _settled_stub_line(seq: int, text: str, kind: str, sid: str = "") -> str:
     return f"#seq={seq} P0 settled sha256={h} kind={kind} (full text on disk: {disk})"
 
 
-def _trimmed_stub_line(seq: int, text: str, kind: str = "P1") -> str:
+def _trimmed_stub_line(seq: int, text: str, kind: str = "P1", sid: str = "") -> str:
     """R5（owner 批次 A #2 编号空洞）：trimmable P1 块封顶被裁时折的单行存根。
 
     与 settled 存根同形（sha256 可审计 + 定位提示），但定位面不同：P1 可裁块
     原文**在 recall 层（segment_id 点查 / 主 store 行）**，不在 <seq>.p0 沉盘面
     （那是 settled P0 专属）。折存根而非硬删 = 账本行不产生编号空洞（seq 连续），
     被裁块仍经存根行可被人工定位原文（hash 与 store 行逐字可核）。
+    落盘路径提示（owner 2026-10-24）：sink_p1 同事务沉 <sid>.p1.<seq>（与
+    <seq>.p0 对称）——存根行渲染真实盘形；sid 空退化为 <seq>.p1。
 
     参数名 `kind`（第三轮 owner 修正）：调用面传 `e.get("kind", "P1")`（'adhoc' /
     'kanban'，P1 块的 kind 审计值），存根渲染成 `#seq=N <kind> trimmed...`。
@@ -82,7 +112,8 @@ def _trimmed_stub_line(seq: int, text: str, kind: str = "P1") -> str:
     """
     import hashlib
     h = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:_SETTLED_STUB_HASH_LEN]
-    return f"#seq={seq} {kind} trimmed sha256={h} (full text in recall/store)"
+    disk = f"{sid}.p1.{seq}" if sid else f"{seq}.p1"
+    return f"#seq={seq} {kind} trimmed sha256={h} (full text on disk: {disk}; recall/store layer)"
 
 
 def evict_stub_line(seq: int, text: str, tier: str, anchor_ids: str) -> str:
@@ -204,8 +235,13 @@ class CompactLedger:
                         # 只对新写页生效——旧页 notes 缺失按其写入时快照缺失渲染）。
                         _notes = []
                         if isinstance(_notes_raw, list):
-                            _notes = [(int(_p[0]), bool(_p[1])) for _p in _notes_raw
-                                      if isinstance(_p, (list, tuple)) and len(_p) == 2]
+                            for _p in _notes_raw:
+                                if isinstance(_p, (list, tuple)) and len(_p) == 2:
+                                    _notes.append((int(_p[0]), bool(_p[1]), None))
+                                elif (isinstance(_p, (list, tuple)) and len(_p) == 3
+                                      and isinstance(_p[2], list) and len(_p[2]) == 3):
+                                    _notes.append((int(_p[0]), bool(_p[1]),
+                                                   _norm_segs(tuple(_p[2]))))
                         self.entries.append({
                             "seq": e["seq"], "text": e["text"],
                             "tokens": int(e.get("tokens") or est_tokens(e["text"])),
@@ -529,7 +565,12 @@ class CompactLedger:
         # 某页 later settle 只在它之后的新页 notes 区体现，绝不回头改旧页，否则
         # 旧页字节变 → 前缀缓存断）。零新状态面：快照 = 当前 entries 既有各页实态
         # 的投影，append-only，不回读不回写旧页。
-        entry["notes"] = [[e["seq"], bool(e.get("settled"))]
+        # 段序锚三元组（owner 2026-10-24 a 方案）：[seq, settled, segs]，segs =
+        # 该前页 staged 块的 _page_seg_ranges(text)（行首 seq= 位解析，零 LLM）；
+        # 全 L0 高压页解析空 → 全 0 → 归一 None（渲染面 fail-open 退化旧行形，
+        # 不误标 0..0；与 load() 读面同一归一判据）。
+        entry["notes"] = [[e["seq"], bool(e.get("settled")),
+                            _norm_segs(_page_seg_ranges(e.get("text", "")))]
                           for e in self.entries]
         # 3-A 账实一致：直接 append(settled=True) 的块按存根实渲染权重记账（活渲染面
         # 折存根），与 settle() 翻转后的 tokens 口径对称；未 settled 块按原文全权重。
@@ -567,7 +608,8 @@ class CompactLedger:
             if e.get("trimmable") and not e.get("settled") and not e.get("trimmed"):
                 e["trimmed"] = True
                 e["tokens"] = est_tokens(
-                    _trimmed_stub_line(e["seq"], e["text"], e.get("kind", "P1")))
+                    _trimmed_stub_line(e["seq"], e["text"], e.get("kind", "P1"),
+                                       getattr(self, "_sid", "")))
         did = sum(1 for e in self.entries if e.get("trimmed")) > _trimmed_before
         if did:
             # R5 #2 同事务沉盘（fail-open 只告警不炸宿主，同 engine settle_p0 sink 口径）：
@@ -651,8 +693,9 @@ class CompactLedger:
             _preview = self.entries + [{"seq": self.seq + 1, "text": str(new_text),
                                        "tokens": est_tokens(new_text)}]
             _preview[-1].setdefault("notes",
-                                    [[e["seq"], bool(e.get("settled"))]
-                                     for e in self.entries])
+                                   [[e["seq"], bool(e.get("settled")),
+                                     _norm_segs(_page_seg_ranges(e.get("text", "")))]
+                                    for e in self.entries])
             all_entries = _preview
         if not all_entries:
             return ""
@@ -669,9 +712,15 @@ class CompactLedger:
             _notes = e.get("notes")
             if _notes:
                 lines.append(f"── 页 c#{e['seq']} ──")
-                lines.append("notes " + " ".join(
-                    f"c#{_n}={ 'settled' if _s else 'open' }"
-                    for _n, _s in _notes))
+                _note_parts = []
+                for _p in _notes:
+                    _n, _s = _p[0], _p[1]
+                    _g = _p[2] if len(_p) > 2 else None
+                    _part = f"c#{_n}={'settled' if _s else 'open'}"
+                    if _g:  # 新写页三列 + 有效 segs（非全 0）才附锚；旧 2 列 / 全 L0 页逐字旧行形
+                        _part += f" segs={_g[0]}..{_g[1]}" + (f" task={_g[2]}" if _g[2] else "")
+                    _note_parts.append(_part)
+                lines.append("notes " + " ".join(_note_parts))
             else:
                 lines.append(f"── 页 c#{e['seq']} ──")
                 lines.append("notes: -")
@@ -681,7 +730,10 @@ class CompactLedger:
             elif e.get("trimmed"):
                 # R5 #2：trimmable P1 块被封顶裁 → 单行存根（不硬删 = 无编号空洞；
                 # 原文 recall/store 可定位，sha256 可核）
-                lines.append(f"c#{e['seq']}: " + _trimmed_stub_line(e["seq"], e["text"], e.get("kind", "P1")))
+                lines.append(f"c#{e['seq']}: " + _trimmed_stub_line(
+                    e["seq"], e["text"], e.get("kind", "P1"),
+                    os.path.splitext(os.path.basename(self.path))[0]
+                    .replace(".compact", "")))
             elif e.get("settled"):
                 # settled P0 块 → 单行存根（原文沉盘 <sid>.p0.<seq>，重开按 seq 捞回，见 sink/restore）
                 lines.append(f"c#{e['seq']}: " + _settled_stub_line(e["seq"], e["text"], e.get("kind", "adhoc"), _sid))

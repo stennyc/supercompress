@@ -54,6 +54,13 @@ REASONING_MONOLOGUE_CUES = (
     # 进行中推理独白，非结论；结论段开首是 "I found/I confirmed"（完成时）。
     # 只收 "i'm "（带尾空格，避免 "i'm" 误配词中），宁漏勿错同红线。
     "i'm ",
+    # 2026-10-27 owner 病灶实测（session 20261026_230639_293ca8 活体：
+    # seq 75-77 模型独白 "I see…"/"The user is asking…"/"I started…" 被打 P0
+    # → 每轮全文回喂 → 模型逐字复读 7 轮死循环）。
+    # "i see" = "我发现/注意到" 开首独白（非结论，结论是 "i found/confirmed"）。
+    # "the user" 开首 = 转述用户问句的独白（"The user is asking…"），纯自述。
+    # "i started" = 进行中动作独白（"I started a rebuild earlier…"），非结论。
+    "i see", "the user", "i started",
 )
 _MONOLOGUE_WINDOW = 60     # 开首判定窗口（strip 后前 N 字符内命中才算开首独白）
 

@@ -186,6 +186,38 @@ def _ledger_sections(out) -> list:
     return [str(m.get("content", "")) for m in out if MARK in str(m.get("content", ""))]
 
 
+def test_ledger_refeed_tail_residue_dedup(tmp_path):
+    """R2-2（2026-10-27 活体：compact #N→#N+1 账本消息双发·前缀断裂·复读死循环根因）：
+
+    活体 compact #2 的 messages = out1（compact #1 全量输出，账本消息含在尾区）
+    + 6 条新 user 段（让账本消息随 tail 滚动）→ 账本消息位置（idx ≥ protect_first_n）
+    落进 protect_last_n 保护窗 → 若无修复，旧账本消息残存 out2 尾区，
+    c#2 新账本消息 append 后**两条账本消息并存** = 前缀断裂 + 模型逐轮回看旧账本全文
+    （2026-10-27 活体实锤：compact #2 后 c#2 双发，模型 7 轮复读「重新 build 了吗？」）。
+
+    无修复（RED）→ out2 里 2 条账本消息；GREEN → 恰 1 条（新 c#2 累计段）。"""
+    e = _mk(tmp_path)
+    e.on_session_start("s_tailres")
+    _seed_user(e, "网关限流阈值调至每秒五百请求并配置告警通知")
+    _seed_user(e, "部署发布版本四十二到生产环境保留回滚入口并输出工具结果")
+    out1 = e.compress(_mkmsgs_long(), current_tokens=4000, force=True)
+    assert len(_ledger_sections(out1)) == 1, "compact #1 恰 1 条账本消息"
+    # compact #2：宿主 re-feed 面——out1 作为前段（账本消息落尾区）+ 新 user 段
+    _seed_user(e, "回滚开关位置在网关配置第三节保留现场")
+    msgs2 = list(out1)
+    for i in range(6):
+        msgs2.append({"role": "user", "content": f"live{15+i}"})
+    out2 = e.compress(msgs2, current_tokens=4000, force=True)
+    secs = _ledger_sections(out2)
+    assert len(secs) == 1, \
+        f"tail 残存旧账本消息须剥除，output 恒单条累计段，实得 {len(secs)} 条"
+    c2 = secs[0]
+    assert "c#2" in c2, "compact #2 账本含 c#2 页"
+    # 前缀单调：out2 里无第二条带 MARK 的消息
+    marked = [m for m in out2 if MARK in str(m.get("content", ""))]
+    assert len(marked) == 1, f"out2 恰 1 条 MARK 消息，实得 {len(marked)}"
+
+
 # ─────────────────────────── 封顶 = 整段清 + 重新积累 ───────────────────────────
 def test_ledger_cap_seals_whole_section(tmp_path):
     """累计条目 > cap → 旧块整段清掉、只留新块（seal +1、generation 单调），不做 mid-block 回改。"""

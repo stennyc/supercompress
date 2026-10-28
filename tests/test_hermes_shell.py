@@ -93,9 +93,19 @@ def test_register_produces_active_context_engine(tmp_path):
     if hermes_root and hermes_root not in saved:
         sys.path.insert(0, hermes_root)
     mod_name = _probe_mod_name()
+    # P1 根因修复：del 前保存原始 engine module 身份（module_A = conftest 首次 import 的对象）。
+    # test_recall_cache.py 在 COLLECTION 阶段 `from engine import SupercompressContextEngine`
+    # 绑定了 module_A；若本 test 把 sys.modules["engine"] 删掉后 fresh import → module_B，
+    # conftest autouse fixture 在后续 EXECUTION 阶段 patch 的是 module_B，
+    # 而 class_A.__init__ 的 _load_config 仍从 module_A.__dict__ 解析 → 宿主 config 泄漏。
+    _orig_engine = sys.modules.get("engine")
     for m in list(sys.modules):
         if m == mod_name or m.startswith(mod_name + ".") or m == "engine":
             del sys.modules[m]
+    import importlib
+    if _orig_engine is None:
+        # 从未 import 过 engine（异常场景）→ 走 importlib 兜底
+        sys.modules["engine"] = importlib.import_module("engine")
     try:
         mod = _load_plugin_module(_ROOT, mod_name)
         assert hasattr(mod, "register"), "shell __init__.py must expose register(ctx)"
@@ -118,6 +128,14 @@ def test_register_produces_active_context_engine(tmp_path):
         for m in list(sys.modules):
             if m == mod_name or m.startswith(mod_name + ".") or m == "engine":
                 del sys.modules[m]
+        # 恢复原始 engine module 身份（module_A = conftest/test_recall_cache 绑定的对象）。
+        # 不恢复 module_A 而是 fresh import → module_B → conftest patch 落在 module_A 上，
+        # module_B 的 _load_config 未 patch → 宿主 config 泄漏 → TestAutoRecallDefaultOff 失败。
+        import importlib
+        if _orig_engine is not None:
+            sys.modules["engine"] = _orig_engine
+        else:
+            sys.modules["engine"] = importlib.import_module("engine")
 
 
 def test_shell_thin_invariant_no_algorithm_in_shell():
@@ -136,8 +154,15 @@ def test_host_live_compression_contract():
     （正 int 保留 / None、非数、<=0 → None）；缺它 = 宿主每 session 打
     "Could not apply live compression config" WARNING（2026-09-27 17:22:20 实锤）。"""
     import sys
+    import importlib
     saved = list(sys.path)
     sys.path.insert(0, _ROOT)
+    # 保存原 engine module 对象身份（conftest 的 monkeypatch 打在它身上）：
+    # del sys.modules["engine"] + 重新 import engine 会拿到一个新 exec 的 module 对象，
+    # 上面 conftest patch 的 _load_config 不在新对象上 → 后续测试（test_recall_cache
+    # 的 TestAutoRecallDefaultOff）读宿主 config 泄漏 → "默认关"断言失败。
+    # finally 恢复 sys.modules["engine"] = 原对象身份，保证 conftest patch 持续有效。
+    _orig_engine = sys.modules.get("engine")
     for m in list(sys.modules):
         if m == "engine" or m.startswith("sc.") or m in ("sc", "scdata"):
             del sys.modules[m]
@@ -158,3 +183,10 @@ def test_host_live_compression_contract():
         assert "threshold_tokens_cap" in src, "threshold_tokens_cap attr must be initialized"
     finally:
         sys.path = saved
+        # 恢复原 engine module 身份（_orig_engine = del 前的 sys.modules["engine"] 对象）：
+        # 让后续 import engine 拿到 conftest patch 过的那个对象，TestAutoRecallDefaultOff
+        # 的 "缺省默认关" 断言才不被宿主 config 泄漏击穿。
+        if _orig_engine is not None:
+            sys.modules["engine"] = _orig_engine
+        else:
+            sys.modules["engine"] = importlib.import_module("engine")

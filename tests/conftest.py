@@ -9,10 +9,17 @@ from sc.store import JsonlStore
 
 @pytest.fixture(autouse=True)
 def _hermetic_hermes_home(monkeypatch):
-    """测试 hermetic：清 HERMES_HOME env，保证 engine 默认路径回退（~/.hermes）与
-    runner 所在 Hermes 会话的 env 解耦——env 驱动路径解析有专属测试
-    （test_session_store.TestStoreRoot_EnvAware）单独封住，此处保持零 env 依赖。"""
+    """测试 hermetic：清 HERMES_HOME env + patch engine._load_config 返回空 dict，
+    保证 engine 默认路径回退（~/.hermes）与宿主 config 读取解耦——
+    宿主 venv 里 hermes_cli 可导入时，_load_config 会读 HERMES_HOME/config.yaml，
+    把宿主 profile 的 auto_recall:true 等键泄漏进测试面（TestAutoRecallDefaultOff 2 条失败根因）。
+    patch 引擎模块的 _load_config 恒返回 {}（最 hermetic，不依赖 env 删净程度）；
+    env 驱动路径解析有专属测试（test_session_store.TestStoreRoot_EnvAware）单独封住。"""
     monkeypatch.delenv("HERMES_HOME", raising=False)
+    # 宿主 config 泄漏面：engine._load_config() → hermes_cli.load_config() → HERMES_HOME/config.yaml。
+    # patch 为恒空 dict（零宿主 config），保证「缺省 = 代码默认」语义（auto_recall 缺省 False 等）。
+    import engine as _engine_mod
+    monkeypatch.setattr(_engine_mod, "_load_config", lambda: {}, raising=True)
 
 
 @pytest.fixture

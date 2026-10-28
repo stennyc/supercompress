@@ -41,6 +41,7 @@ import scdata
 
 from .schema import Segment, nfc_hash
 from .store import JsonlStore, StoreError
+from .tagger import is_reasoning_monologue
 
 logger = logging.getLogger(__name__)
 
@@ -477,10 +478,19 @@ class ModelStore:
         h = nfc_hash(text)
         if h in self.store.by_hash or h in (main_by_hash or {}):
             return (False, "dedup")
-        if len(text) >= min_chars:
-            gate = "chars"
-        elif model_marker_hit(text):
+        # R5（2026-10-27 · 治模型独白段 P0 永久驻活账本 → 逐轮全文回喂 → 复读死循环）：
+        # 开首推理独白（"I see…"/"Let me…"/"I need to…"）确定性预判（is_reasoning_monologue，
+        # 同源 sc/tagger R4，零 LLM）→ 不入 P0 临时档（P0/P1 注入门 = compress kept 面，
+        # P2 段不进 staged 块，但 durable 锚点仍在 store 可召回，数据零丢失）；
+        # 宁漏勿错：命中 = 独白段不进账本 = 治复读根因；未命中 = 原样 P0 地板零变化。
+        # marker gate（<compaction-summary> 等）先判，独白段命中 marker 时保留原路
+        #（压缩摘要类无论长度恒持久化，owner 已锁定）。
+        if model_marker_hit(text):
             gate = "marker"
+        elif is_reasoning_monologue(text):
+            return (False, "monologue_skip")
+        elif len(text) >= min_chars:
+            gate = "chars"
         else:
             return (False, "below_min_no_marker")
         # T1 脏水归一（确定性零 LLM）：入库字节 = 归一后字节（顶层裸 JSON → key 索引单行；
