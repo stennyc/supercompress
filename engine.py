@@ -812,6 +812,19 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_cache_read_tokens: int = 0
         self.last_cache_write_tokens: int = 0
         self.last_cache_hit_ratio: Optional[float] = None  # read/prompt（prompt>0 时；miss/无读数 → None）
+        # cache-stuck 检测（2026-11-11 owner「修」指令，session 555e 实证根因）：
+        # 连续 cache_stuck_detect 轮 read 值不变 且 prompt 在涨 → 打 1 条 WARNING（观测，
+        # 零行为变化；N<=0 = 整面关）。555e 实证根因：filemem 注入面逐轮跳变（67→11→109→168
+        # 条）拼进当前轮 user content 尾部（turn_context.compose_user_api_content L132，
+        # 位置在尾部非 head 区）→ 该 user 消息进下轮历史回放后尾部字节逐轮漂 → provider
+        # 前缀缓存从第一个变的 user 消息起失效，只在更前面静态段命中（read 锁死 8192）。
+        # 本面把盲飞变可定位；根治在 filemem prefetch 输出面（注入集合按 session 收敛，
+        # 另卡处理），supercompress 内不做前缀区/尾部重排（避免误导归属）。
+        self.cache_stuck_detect: int = int(_get("cache_stuck_detect", 3))
+        # 实例态（会话边界对称清零，防跨 session 泄漏；纯内存面零持久）：
+        self._stuck_read_prev: Optional[int] = None      # 上一轮 cache_read_tokens
+        self._stuck_prev_prompt: int = 0                  # 上一轮 prompt tokens（stuck 增长判据）
+        self._stuck_read_count: int = 0                  # 连续 read 不变 且 prompt 增长的轮数
         # 宿主契约 real-usage pairing（对齐内置 ContextCompressor，_reset_real_usage_pairing 口径，
         # context_compressor.py:2193-2196；宿主 0 改动原则：只补契约必需字段，壳不引入算法核）：
         # - last_real_prompt_tokens：provider 真实 prompt 读数账（0 = 尚无真实读数、meter 走本地粗估）。
@@ -1717,6 +1730,39 @@ class SupercompressContextEngine(sc_context_engine_base()):
         if log_hit and read > 0 and prompt > 0:
             logger.info("supercompress: turn cache hit read=%d prompt=%d (%.0f%%) write=%d",
                         read, prompt, 100.0 * read / prompt, write)
+        # cache-stuck 检测（①，默认开，N=cache_stuck_detect；N<=0 整面关）：
+        # 连续 N 轮 cache_read_tokens 不变 且 prompt 在涨 → provider 前缀缓存未在累积
+        # （典型根因 = 尾部动态注入块逐轮变，如 filemem 注入面跳变——
+        #   compose_user_api_content 把 filemem prefetch 块拼在当前轮 user content 尾部，
+        #   该 user 消息进下轮历史回放后尾部字节逐轮漂 → 前缀从第一个变处失效）
+        # → 打 1 条 WARNING。
+        # 纯观测（零 prompt/账本字节变化）；read 在变 / prompt 未涨 / 首轮 → 计数归零不打。
+        # 计数只在跨轮比较（_stuck_read_prev 非 None 即已有前轮读数）后累加，
+        # 避免首轮冷读误报（555e 型：轮 1 read=8192 冷读是正常起点，不是卡死）。
+        _n = self.cache_stuck_detect
+        if _n > 0 and log_hit and read > 0 and prompt > 0:
+            # streak 计数语义（owner 测试锁死）：_stuck_read_count = 连续同 read 值轮数（含本轮）。
+            # - 首轮（prev None）→ count=1（基线，555e 型冷读不误报）
+            # - read 不变 + prompt 在涨 → count+=1；count>=N → 打 1 条 WARNING（纯观测，
+            #   后续轮每达到 N 的整数倍不重打——只打 1 次判卡死，防刷屏）
+            # - read 不变 + prompt 未涨（compact 回落）→ count 归 1（不判卡死，streak 中断）
+            # - read 变 → count 归 1（新 streak 起点）
+            _prev_prompt = getattr(self, "_stuck_prev_prompt", 0) or 0
+            if self._stuck_read_prev is not None and read == self._stuck_read_prev:
+                if prompt > _prev_prompt:
+                    self._stuck_read_count += 1
+                    if self._stuck_read_count == _n:
+                        logger.warning(
+                            "supercompress: cache_read stuck at %d for %d turn(s) while prompt grew "
+                            "%d→%d (provider prefix cache not accumulating — check tail-area dynamic "
+                            "injection / filemem injection stability)",
+                            read, self._stuck_read_count, _prev_prompt, prompt)
+                else:
+                    self._stuck_read_count = 1
+            else:
+                self._stuck_read_count = 1
+            self._stuck_read_prev = read
+            self._stuck_prev_prompt = prompt
 
     def update_from_response(self, usage: Dict[str, Any]) -> None:
         """token 账更新（宿主每次 LLM 调用后）：直接存 canonical 桶，无算法。
@@ -2249,6 +2295,10 @@ class SupercompressContextEngine(sc_context_engine_base()):
         杜绝每 turn 自动把 model P0（agent 自述）/recall 块投到末条 user 造成的
         "回放当用户拍板"归属错乱；仅 auto_recall 显式 True 时走下方全量召回路径。
         compress（compact 事件驱动注入面）不受本开关影响。
+        2026-11-11 owner 拍板：原 head-freeze 自愈面（②）已撤——555e 型断裂源在尾部
+        filemem 注入块逐轮漂（位置本就对），锁前缀区治不到病根、且误导归属；根治在
+        filemem prefetch 输出面按 session 收敛注入集合（另卡处理）。select_context 恢复
+        原契约：auto_recall 关 → return None，字节不变。
         """
         if not self.auto_recall_enabled:
             return None
@@ -2975,6 +3025,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_cache_read_tokens = 0
         self.last_cache_write_tokens = 0
         self.last_cache_hit_ratio = None
+        # cache-stuck 检测实例态会话边界清零（对称 on_session_reset，
+        # 防旧 session 的卡死计数泄漏进 rebind/轮转新 session）：
+        self._stuck_read_prev = None
+        self._stuck_prev_prompt = 0
+        self._stuck_read_count = 0
         self.session_id = session_id
         self._bound_session = session_id
 
@@ -3035,6 +3090,11 @@ class SupercompressContextEngine(sc_context_engine_base()):
         self.last_cache_read_tokens = 0
         self.last_cache_write_tokens = 0
         self.last_cache_hit_ratio = None
+        # cache-stuck 检测实例态会话边界清零（对称 on_session_start，
+        # 防旧 session 的卡死计数泄漏进 /new 新 session）：
+        self._stuck_read_prev = None
+        self._stuck_prev_prompt = 0
+        self._stuck_read_count = 0
         # P0.4：rotation advisory 会话边界清零（对称 on_session_start，防泄漏进新 session）
         self.rotation_advisory = False
         self._adv_consec = 0
