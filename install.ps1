@@ -60,11 +60,56 @@ try {
     Pop-Location
 }
 
-# ── 5. 配齐 config.yaml（supercompress 配置面；与 install.sh 第 5 步同语义）──
+# ── 5. 配齐 config.yaml（supercompress 配置面；多 profile 走 -AllProfiles）──
 # 定位顺序：$env:HERMES_HOME > ~/.hermes/profiles/$env:HERMES_ACTIVE_PROFILE > ~/.hermes\config.yaml
 # 缺失 → 写入 config.default.yaml 完整配置块；已有 → 不覆盖，仅报告缺键。
+#
+# 多 profile / multiplex mode（宿主实码）：multiplex gateway 每个 profile turn 把
+# HERMES_HOME 切到该 profile 目录，load_config() 读"当前 profile 自己的 config.yaml"。
+# 各 profile 要走 supercompress 须各自配齐；-AllProfiles 扫 profiles\* 逐个处理（已有不覆盖）。
+$AllProfiles = $false
+foreach ($a in $args) { if ($a -eq "-AllProfiles" -or $a -eq "--all-profiles") { $AllProfiles = $true } }
+
+function Process-Config {
+    param([string]$Cfg)
+    if (-not (Test-Path $Cfg)) {
+        Write-Host "==> 写入完整默认配置块 → $Cfg"
+        $block = Select-String -Path $DefaultBlock -Pattern '# ── 配置块开始|# ── 配置块结束'
+        if ($block.Count -eq 2) {
+            $lines = Get-Content $DefaultBlock
+            $start = [int]$block[0].LineNumber + 1
+            $end   = [int]$block[1].LineNumber
+            $lines[($start-1)..($end-1)] | Where-Object { $_ -notmatch '^#' -or $_ -match '配置块' } |
+                Out-File -FilePath $Cfg -Encoding utf8
+            Write-Host "    已写入（context.engine + compression.supercompress 全键默认值）"
+        } else {
+            throw "config.default.yaml 配置块标记缺失（# ── 配置块开始/结束）"
+        }
+        return 2
+    }
+    Write-Host "==> 检查现有配置 → $Cfg（不覆盖）"
+    $cfgText = Get-Content $Cfg -Raw
+    $missing = @()
+    foreach ($k in $DefaultKeys) {
+        if ($cfgText -notmatch "(?m)^[[:space:]]+$k:") { $missing += $k }
+    }
+    if ($missing.Count -gt 0) {
+        Write-Host "    缺失键（当前走 engine 内置默认，如需显式配齐请并入 $DefaultBlock 配置块）:"
+        $missing | ForEach-Object { Write-Host "      $_" }
+    } else {
+        Write-Host "    全部键已就位"
+    }
+    if ($missing.Count -gt 0) { return 1 } else { return 0 }
+}
+
 $HermesCfg = $null
-if ($env:HERMES_HOME) {
+# --all-profiles：强制从 $HOME\.hermes 数据根起步（不读 HERMES_HOME——gateway 运行时
+# 注入的 per-profile env 会带偏定位；多 profile 面要的是"所有 profile"而非当前这一个）
+if ($AllProfiles) {
+    if ((Test-Path "$HOME\.hermes\config.yaml") -or (Test-Path "$HOME\.hermes")) {
+        $HermesCfg = "$HOME\.hermes\config.yaml"
+    }
+} elseif ($env:HERMES_HOME) {
     # profile 安装形态：HERMES_HOME 已设 = 数据根锚定（缺失也写这里，不 fallback）
     if (-not (Test-Path $env:HERMES_HOME)) { New-Item -ItemType Directory -Path $env:HERMES_HOME | Out-Null }
     $HermesCfg = Join-Path $env:HERMES_HOME "config.yaml"
@@ -84,32 +129,34 @@ $DefaultKeys = Select-String -Path $DefaultBlock -Pattern '^\s{4}[a-z_]+:' |
 
 if (-not $HermesCfg) {
     Write-Host "WARN: 未定位 Hermes config.yaml（设 \$env:HERMES_HOME）"
-} elseif (-not (Test-Path $HermesCfg)) {
-    Write-Host "==> 写入完整默认配置块 → $HermesCfg"
-    $block = Select-String -Path $DefaultBlock -Pattern '# ── 配置块开始|# ── 配置块结束'
-    if ($block.Count -eq 2) {
-        $lines = Get-Content $DefaultBlock
-        $start = [int]$block[0].LineNumber + 1
-        $end   = [int]$block[1].LineNumber
-        # 区段内的注释行（# 开头非标记）保留为配置说明
-        $lines[($start-1)..($end-1)] | Where-Object { $_ -notmatch '^#' -or $_ -match '配置块' } |
-            Out-File -FilePath $HermesCfg -Encoding utf8
-        Write-Host "    已写入（context.engine + compression.supercompress 全键默认值）"
-    } else {
-        throw "config.default.yaml 配置块标记缺失（# ── 配置块开始/结束）"
-    }
 } else {
-    Write-Host "==> 检查现有配置 → $HermesCfg（不覆盖）"
-    $cfgText = Get-Content $HermesCfg -Raw
-    $missing = @()
-    foreach ($k in $DefaultKeys) {
-        if ($cfgText -notmatch "(?m)^[[:space:]]+$k:") { $missing += $k }
-    }
-    if ($missing.Count -gt 0) {
-        Write-Host "    缺失键（当前走 engine 内置默认，如需显式配齐请并入 $DefaultBlock 配置块）:"
-        $missing | ForEach-Object { Write-Host "      $_" }
-    } else {
-        Write-Host "    全部键已就位"
+    Process-Config -Cfg $HermesCfg
+
+    # ── 多 profile 面：-AllProfiles 时扫 profiles\*（含 multiplex 各 profile）──
+    if ($AllProfiles) {
+        Write-Host ""
+        Write-Host "==> -AllProfiles：扫描多 profile 目录"
+        $RootDir = "$HOME\.hermes"   # 固定数据根（-AllProfiles 语义 = 全 profile，不随 HERMES_HOME 带偏）
+        $ProfDir = Join-Path $RootDir "profiles"
+        $n = 0
+        if (Test-Path $ProfDir) {
+            foreach ($pdir in Get-ChildItem -Path $ProfDir -Directory) {
+                $n++
+                Write-Host "── profile: $($pdir.Name)"
+                if ((Resolve-Path $pdir).Path -eq (Resolve-Path (Split-Path $HermesCfg)).Path) {
+                    Write-Host "   （= 上方已定位的份，跳过）"
+                    continue
+                }
+                Process-Config -Cfg (Join-Path $pdir.FullName "config.yaml")
+            }
+            if ($n -eq 0) {
+                Write-Host "   $ProfDir 下无 profile 子目录（单机单 profile 形态，无事可做）"
+            } else {
+                Write-Host "   共处理 $n 个 profile（缺失项见上方逐 profile 报告）"
+            }
+        } else {
+            Write-Host "   未找到 $ProfDir（非多 profile 安装形态，无事可做）"
+        }
     }
 }
 

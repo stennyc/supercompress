@@ -28,7 +28,9 @@ public，默认分支 master，v2.0.1+）。它不是 pip 包，是源码树插�
      选 bundled 与现网部署一致。
 
 ### 第 3 步：运行安装脚本（自动配齐 config.yaml）
-  bash install.sh    # Windows: powershell -ExecutionPolicy Bypass -File install.ps1
+  bash install.sh          # Windows: powershell -ExecutionPolicy Bypass -File install.ps1
+  多 profile / multiplex gateway：bash install.sh --all-profiles
+                            （Windows: -AllProfiles；逐个配齐 profiles/*/config.yaml，已有不覆盖）
   脚本 4 步：探测 Python 3.9+ → 建 .venv → 装 pytest → 跑全量测试（验证代码面）
   第 5 步（cefb752+ 起）自动定位 Hermes config.yaml 并配齐 26 键默认值：
     - 定位序：$HERMES_HOME（已设=profile 数据根锚定，缺失也写这里）
@@ -36,6 +38,16 @@ public，默认分支 master，v2.0.1+）。它不是 pip 包，是源码树插�
               > ~/.hermes/config.yaml（bundled 形态）
     - config 缺失 → 写 config.default.yaml 完整块
     - config 已有 → 不覆盖，仅逐键报告缺失项（0 写入，安全）
+
+### 多 profile / multiplex mode 面（必读）
+  - 代码面：bundled 位置一份 clone 服务所有 profile（宿主发现链全局共享），clone 只做一次。
+  - 配置面：multiplex gateway 每个 profile turn 把 HERMES_HOME 切到该 profile 目录，
+    load_config() 读"当前 profile 自己的 config.yaml"（宿主实码 hermes_constants ContextVar 链）。
+    各 profile 要走 supercompress，各自的 config.yaml 都要有 context.engine +
+    compression.supercompress → 一次 --all-profiles 配齐全部。
+  - 数据面：supercompress_store/ 随 HERMES_HOME per-profile 落盘，天然隔离，零额外配置。
+  - 生效面：改完各 profile config.yaml 后，重启 gateway（或新开 session）才加载新引擎；
+    已存在的旧 session 不回溯切换。
 
 ### 第 4 步：调参（按需，非必须）
   所有键缺失 = 走 engine 内置默认（config.default.yaml 列出值即默认本身）。
@@ -53,6 +65,7 @@ public，默认分支 master，v2.0.1+）。它不是 pip 包，是源码树插�
   4) 生效面：重启 gateway 后跑一段对话到触发 compact，
      grep ~/.hermes/logs/agent.log 'supercompress' 看 marker（turn cache hit / select_context 等），
      并查 <HERMES_HOME>/supercompress_store/ 是否生成 <sid>.jsonl + <sid>.compact.json
+     （多 profile：每个 profile 查各自目录；旧 session 不回溯，验证要开新 session）
 
 ### 红线
   - 宿主 agent/ 目录零 diff（改动只在 supercompress 壳内）
