@@ -60,8 +60,10 @@ supercompress is a **plain source tree** (no packaging, no `pip install .`) — 
 | macOS / Linux / WSL / MSYS | `bash install.sh` |
 | Windows PowerShell | `powershell -ExecutionPolicy Bypass -File install.ps1` |
 
-两个脚本都做三件事 / both scripts do three things: 创建 `.venv` → 装 `pytest` → 跑全量测试套件验证。
-create `.venv` → install `pytest` → run the full test suite to verify.
+两个脚本都做四件事 / both scripts do four things: 创建 `.venv` → 装 `pytest` → 跑全量测试套件验证 → 自动配齐 Hermes `config.yaml`（定位 `~/.hermes` 或 `$HERMES_HOME`，缺失写全键默认块、已有不覆盖仅报缺键）。
+create `.venv` → install `pytest` → run the full test suite → auto-populate Hermes `config.yaml` (locates `~/.hermes` or `$HERMES_HOME`; writes the full default block when missing, never overwrites an existing file — reports missing keys only).
+
+> 给目标 agent 的完整安装/配置提示词（5 步 + 红线）见 [`docs/AGENT-INSTALL.md`](docs/AGENT-INSTALL.md) — full agent-facing install/config prompt: see [`docs/AGENT-INSTALL.md`](docs/AGENT-INSTALL.md).
 
 ### 手动 / manual
 
