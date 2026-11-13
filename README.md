@@ -166,3 +166,9 @@ install.sh          # POSIX 安装脚本 / installer
 install.ps1         # Windows 安装脚本 / installer
 requirements.txt    # 开发/测试依赖（仅 pytest）/ dev deps only
 ```
+
+## 许可 / License
+
+GPL-3.0-or-later（见 `LICENSE`；`plugin.yaml` 的 `license: GPL-3.0-or-later`）。copyleft：衍生作品需同许可。
+
+**附加约束：禁止商用（No Commercial Use）。** 本代码仅限个人、学习、内部工具等非商业使用；商用（嵌入商业产品、对外收费服务、转售）需向作者 stennyc 另行购买授权。该条款为 GPL-3.0-or-later 之上的非标准附加约束，与 GPL 正文冲突时以禁商用条款为准。
