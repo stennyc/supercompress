@@ -1,0 +1,58 @@
+# supercompress 默认配置块 — 单一事实源（默认值与 engine.py _get() 实码逐项对齐，v2.0.1/d8fecf1）
+#
+# install.sh / install.ps1 以本文件为源：
+#   - config.yaml 缺失 → 写入下方完整块
+#   - config.yaml 已有 → 不覆盖，仅报告缺失键
+#
+# 用法：把本文件「配置块」部分并入 Hermes config.yaml
+#   （bundled 安装：~/.hermes/config.yaml；profile 安装：~/.hermes/profiles/<p>/config.yaml）
+# 所有键缺失 = 走 engine 内置默认（本文件列出即默认值本身），故本块可整段省略。
+#
+# ── 配置块开始（并入 config.yaml）────────────────────────────────────
+context:
+  engine: supercompress
+compression:
+  supercompress:
+    # ── 模型/窗口面 ──
+    context_length: 256000              # 模型上下文窗口（tokens），按实际模型调
+    max_tail_turns: 15                 # 尾部保留轮数
+    max_tail_tokens: 32000             # 尾部保留 token 上限
+    # ── 压缩水位面 ──
+    compact_ratio: 0.5                 # 压缩触发水位（× context_length）
+    force_compact_ratio: 0.75          # 强制压缩水位（逃生门）
+    # ── 预折面（fail-safe 默认关；显式开才走预折路径）──
+    prefold_enabled: false
+    prefold_water_frac: 0.45
+    # ── aux 端点两级路由面 ──
+    aux_timeout: 10.0                 # aux 短超时（秒），超时走主模型兜底
+    main_fallback_timeout: 30.0       # 主模型兜底超时（秒）
+    digest_max_tokens: 256            # digest 上限
+    digest_fail_cooldown: 60.0        # digest 失败冷却（秒）
+    boundary_fail_cooldown: 30.0      # 边界 LLM 失败冷却（秒）
+    # ── model 旁路 store 面（默认开）──
+    model_store_enabled: true
+    model_min_chars: 200
+    # ── 召回面（auto_recall 默认关 = A1 止血态）──
+    auto_recall: false
+    recall_decay_lambda: 0.0          # 时间衰减（0 = 不衰减，钉死面）
+    recall_cache_threshold: 0.92      # 召回缓存命中阈值
+    recall_budget_frac: 0.3
+    recall_budget_cap_frac: 0.05
+    recall_staging_max_segs: 32       # 暂存区段数上限
+    # ── rerank 面 ──
+    rerank_low_score_threshold: 3.0   # BM25 top1 低于此值触发 LLM 重排
+    drop_model_on_gate: true
+    # ── cache-aware 决策面（默认关 = 零变化 fail-safe）──
+    cache_aware_compress:
+      enabled: false
+      hit_min: 0.5
+      delay_frac: 0.10
+      recall_k: 1
+    # ── 账本帽面 ──
+    compact_ledger_max_tokens: 65536
+    compact_ledger_max_entries: 16
+    # ── 观测面 ──
+    cache_stuck_detect: 3             # 连续 N 轮 read 不变且 prompt 涨 → WARNING（0 = 关）
+    # ── 数据根面（可选，缺失 = HERMES_HOME-aware 自动解析）──
+    # external_store_path: ~/.hermes
+# ── 配置块结束 ─────────────────────────────────────────────────────────

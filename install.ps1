@@ -60,9 +60,64 @@ try {
     Pop-Location
 }
 
+# ── 5. 配齐 config.yaml（supercompress 配置面；与 install.sh 第 5 步同语义）──
+# 定位顺序：$env:HERMES_HOME > ~/.hermes/profiles/$env:HERMES_ACTIVE_PROFILE > ~/.hermes\config.yaml
+# 缺失 → 写入 config.default.yaml 完整配置块；已有 → 不覆盖，仅报告缺键。
+$HermesCfg = $null
+if ($env:HERMES_HOME) {
+    # profile 安装形态：HERMES_HOME 已设 = 数据根锚定（缺失也写这里，不 fallback）
+    if (-not (Test-Path $env:HERMES_HOME)) { New-Item -ItemType Directory -Path $env:HERMES_HOME | Out-Null }
+    $HermesCfg = Join-Path $env:HERMES_HOME "config.yaml"
+} elseif ($env:HERMES_ACTIVE_PROFILE -and (Test-Path (Join-Path "$HOME\.hermes\profiles\$($env:HERMES_ACTIVE_PROFILE)" "config.yaml"))) {
+    $HermesCfg = Join-Path "$HOME\.hermes\profiles\$($env:HERMES_ACTIVE_PROFILE)" "config.yaml"
+} elseif (Test-Path "$HOME\.hermes\config.yaml") {
+    $HermesCfg = "$HOME\.hermes\config.yaml"
+} elseif (Test-Path "$HOME\.hermes") {
+    $HermesCfg = "$HOME\.hermes\config.yaml"   # 不存在也写入（bundled 形态新建）
+}
+
+$DefaultBlock = Join-Path $PSScriptRoot "config.default.yaml"
+# 键清单 = config.default.yaml 里 4 空格缩进的超压缩子键（排除顶层 context/engine）
+$DefaultKeys = Select-String -Path $DefaultBlock -Pattern '^\s{4}[a-z_]+:' |
+    ForEach-Object { ($_.Line -replace '^\s+([a-z_]+):.*','$1') } |
+    Where-Object { $_ -ne "context" -and $_ -ne "engine" }
+
+if (-not $HermesCfg) {
+    Write-Host "WARN: 未定位 Hermes config.yaml（设 \$env:HERMES_HOME）"
+} elseif (-not (Test-Path $HermesCfg)) {
+    Write-Host "==> 写入完整默认配置块 → $HermesCfg"
+    $block = Select-String -Path $DefaultBlock -Pattern '# ── 配置块开始|# ── 配置块结束'
+    if ($block.Count -eq 2) {
+        $lines = Get-Content $DefaultBlock
+        $start = [int]$block[0].LineNumber + 1
+        $end   = [int]$block[1].LineNumber
+        # 区段内的注释行（# 开头非标记）保留为配置说明
+        $lines[($start-1)..($end-1)] | Where-Object { $_ -notmatch '^#' -or $_ -match '配置块' } |
+            Out-File -FilePath $HermesCfg -Encoding utf8
+        Write-Host "    已写入（context.engine + compression.supercompress 全键默认值）"
+    } else {
+        throw "config.default.yaml 配置块标记缺失（# ── 配置块开始/结束）"
+    }
+} else {
+    Write-Host "==> 检查现有配置 → $HermesCfg（不覆盖）"
+    $cfgText = Get-Content $HermesCfg -Raw
+    $missing = @()
+    foreach ($k in $DefaultKeys) {
+        if ($cfgText -notmatch "(?m)^[[:space:]]+$k:") { $missing += $k }
+    }
+    if ($missing.Count -gt 0) {
+        Write-Host "    缺失键（当前走 engine 内置默认，如需显式配齐请并入 $DefaultBlock 配置块）:"
+        $missing | ForEach-Object { Write-Host "      $_" }
+    } else {
+        Write-Host "    全部键已就位"
+    }
+}
+
 Write-Host ""
 Write-Host "Install complete. Quick start:"
-Write-Host "  \$env:PYTHONPATH = \"<repo root>\"      # or run python from the repo root"
-Write-Host "  .venv\Scripts\python.exe -c \"from sc import Segment, JsonlStore; print('supercompress import OK')\""
+Write-Host "  \$env:PYTHONPATH = `"<repo root>`"      # or run python from the repo root"
+Write-Host "  .venv\Scripts\python.exe -c `"from sc import Segment, JsonlStore; print('supercompress import OK')`""
 Write-Host ""
 Write-Host "Run tests any time:  .venv\Scripts\python.exe -m pytest"
+Write-Host ""
+Write-Host "Config:  默认块见 config.default.yaml（缺失键 = 走 engine 内置默认，可整段省略）"
