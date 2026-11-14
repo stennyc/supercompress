@@ -160,6 +160,77 @@ else
   fi
 fi
 
+# ── 6. 注册可发现布局（宿主实码发现根；嵌套 plugins/context_engine/<name> 是死布局）──
+# 宿主实码（plugins/context_engine/__init__.py::_iter_engine_dirs +
+# plugin_loader.iter_plugin_dirs）——context engine 只有两条合法发现根：
+#   根 A（bundled）= <宿主仓>/plugins/context_engine/<name>/   （直接子目录）
+#   根 B（user）   = $HERMES_HOME/plugins/<name>/             （直接子目录）
+# iter_plugin_dirs 只列直接子目录、绝不 descend：
+#   $HERMES_HOME/plugins/context_engine/<name>/（多套一层 context_engine/ 包裹）永远不可见
+#   → dashboard plugins 界面下拉菜单无该选项 + 运行时静默回退内置 compressor
+#   （2026-11-14 Windows host 事故根因：部署时误放了嵌套布局）。
+#   另：根 A 若落在宿主 git 仓的 untracked 目录里，`hermes update` 的 autostash 会把它清掉
+#   （残留空壳 → "loaded but no engine instance found"）→ 自动更新的宿主优先用根 B。
+# 本步：对每个目标 home 保证 直接子目录 plugins/supercompress 可发现
+#   （symlink 指向本 repo；无 symlink 权限时退回复制交付面；已存在则绝不覆盖）。
+REG_TARGETS=""
+if [ "$ALL_PROFILES" -eq 1 ]; then
+  REG_TARGETS="$HOME/.hermes"
+  if [ -d "$HOME/.hermes/profiles" ]; then
+    for q in "$HOME/.hermes/profiles"/*/; do
+      [ -d "$q" ] && REG_TARGETS="$REG_TARGETS
+$(cd "$q" && pwd)"
+    done
+  fi
+elif [ -n "${HERMES_HOME:-}" ]; then
+  REG_TARGETS="$HERMES_HOME"
+elif [ -n "$HERMES_CFG" ]; then
+  REG_TARGETS="$(cd "$(dirname "$HERMES_CFG")" && pwd)"
+fi
+SELF="$(pwd)"
+echo
+echo "==> 第 6 步：注册可发现布局（user 根 直接子目录 plugins/supercompress）"
+for H in $REG_TARGETS; do
+  [ -n "$H" ] || continue
+  PLUG="$H/plugins"; LINK="$PLUG/supercompress"
+  mkdir -p "$PLUG"
+  if [ -e "$PLUG/context_engine" ]; then
+    echo "   WARN: $PLUG/context_engine/ 是 inert 嵌套布局（宿主 loader 不 descend，引擎不会被发现）"
+    echo "         正确布局是 直接子目录 $LINK（下方处理）；嵌套目录可安全删除"
+  fi
+  if [ -L "$LINK" ] || [ -d "$LINK" ]; then
+    RESOLVED="$(cd "$LINK" 2>/dev/null && pwd)" || RESOLVED=""
+    if [ "$RESOLVED" = "$SELF" ]; then
+      echo "   $H: 可发现布局已就位（$LINK -> 本 repo）"
+    else
+      echo "   $H: $LINK 已存在（指向 ${RESOLVED:-<不可解析>}），不覆盖；如需指向本 repo 请手工重建"
+    fi
+    continue
+  fi
+  if ln -s "$SELF" "$LINK" 2>/dev/null && { test -L "$LINK" || fsutil reparsepoint query "$LINK" >/dev/null 2>&1; }; then
+    echo "   $H: 已建链接 $LINK -> $SELF（reparse 已验证，user 根直接子目录，可发现）"
+  else
+    # MSYS/GNU-ln 陷阱（2026-11-14 实测）：ln -s 可能 rc=0 却静默降级为"整目录复制"
+    # （连 .git 一起复制 = 代码分叉）→ 必须 reparse 验证；不通过则清掉假目录。
+    rm -rf "$LINK" 2>/dev/null
+    LINK_NATIVE="$(cygpath -w "$LINK" 2>/dev/null || echo "$LINK")"
+    SELF_NATIVE="$(cygpath -w "$SELF" 2>/dev/null || echo "$SELF")"
+    if command -v powershell >/dev/null 2>&1 && [ -n "$(command -v fsutil 2>/dev/null || true)" ] \
+      && powershell -NoProfile -Command "New-Item -ItemType Junction -Path '$LINK_NATIVE' -Target '$SELF_NATIVE' | Out-Null" >/dev/null 2>&1 \
+      && fsutil reparsepoint query "$LINK_NATIVE" >/dev/null 2>&1; then
+      echo "   $H: 已建 junction $LINK -> $SELF（Windows 目录 junction 无需特权，reparse 已验证）"
+    else
+      echo "   WARN: symlink/junction 不可用，退回复制交付面（升级需重跑本步；复制形态无自动跟随）"
+      mkdir -p "$LINK"
+      ( tar --exclude='.git' --exclude='.venv' --exclude='__pycache__' \
+          --exclude='.pytest_cache' --exclude='bench' --exclude='tests' \
+          --exclude='integration' --exclude='specs' -cf - . ) \
+        | ( cd "$LINK" && tar -xf - )
+      echo "   $H: 已复制交付面（壳 __init__/engine/plugin.yaml + sc/ + scdata）到 $LINK"
+    fi
+  fi
+done
+
 echo
 echo "Install complete. Quick start:"
 echo "  export PYTHONPATH=\"$(pwd)\""
@@ -168,3 +239,9 @@ echo
 echo "Run tests any time:  .venv/bin/python -m pytest"
 echo
 echo "Config:  默认块见 config.default.yaml（缺失键 = 走 engine 内置默认，可整段省略）"
+echo
+echo "发现面验证（宿主实码链，离线不重启；宿主仓根入 sys.path + HERMES_HOME=<目标 home>）:"
+echo "  python -c 'from plugins.context_engine import discover_context_engines; print(discover_context_engines())'"
+echo "  期望出现 ('supercompress', '<desc>', True)。注意：宿主若经 launcher 注入 venv generation"
+echo "  （如 pm-runtime），探针须把该 venv 的 site-packages 一并挂上 sys.path——"
+echo "  宿主 hermes_yaml 硬依赖 ruamel.yaml，裸解释器缺它会误报 engine unavailable"
