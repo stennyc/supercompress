@@ -60,8 +60,10 @@ supercompress is a **plain source tree** (no packaging, no `pip install .`) — 
 | macOS / Linux / WSL / MSYS | `bash install.sh` |
 | Windows PowerShell | `powershell -ExecutionPolicy Bypass -File install.ps1` |
 
-两个脚本都做四件事 / both scripts do four things: 创建 `.venv` → 装 `pytest` → 跑全量测试套件验证 → 自动配齐 Hermes `config.yaml`（定位 `~/.hermes` 或 `$HERMES_HOME`，缺失写全键默认块、已有不覆盖仅报缺键）。
-create `.venv` → install `pytest` → run the full test suite → auto-populate Hermes `config.yaml` (locates `~/.hermes` or `$HERMES_HOME`; writes the full default block when missing, never overwrites an existing file — reports missing keys only).
+两个脚本都做五件事 / both scripts do five things: 创建 `.venv` → 装 `pytest` → 跑全量测试套件验证 → 自动配齐 Hermes `config.yaml`（定位 `~/.hermes` 或 `$HERMES_HOME`，缺失写全键默认块、已有不覆盖仅报缺键）→ **注册可发现布局**（对每个目标 home 保证直接子目录 `plugins/supercompress`；嵌套 `plugins/context_engine/` 是 inert 死布局，loader 绝不 descend——引擎不会出现在 dashboard 下拉菜单且静默回退内置 compressor）。
+create `.venv` → install `pytest` → run the full test suite → auto-populate Hermes `config.yaml` (locates `~/.hermes` or `$HERMES_HOME`; writes the full default block when missing, never overwrites an existing file — reports missing keys only) → **register the discoverable layout** (ensures a direct `plugins/supercompress` child in every target home; the nested `plugins/context_engine/` wrapper is an inert dead layout the host loader never descends into — the engine silently falls back to the built-in compressor).
+
+> ⚠ **发现根（宿主实码）** / discovery roots: context engines are discovered ONLY as **direct children** — bundled `<HERMES_LIB>/plugins/context_engine/<name>/` or user `$HERMES_HOME/plugins/<name>/`. A nested `plugins/context_engine/<name>` under a user home is invisible to the loader. Bundled trees that are untracked in a host git checkout get wiped by `hermes update` autostashes — on auto-updating hosts, prefer the user root (the installer's step 6 handles registration for you). Windows 注册首选 **junction**（无需特权）；MSYS/GNU `ln -s` 可能静默降级为整目录复制，脚本已做 reparse 验证。/ On Windows, registration prefers **junctions** (no elevation); MSYS/GNU `ln -s` can silently degrade to a full directory copy — the installer verifies the reparse point.
 
 > 给目标 agent 的完整安装/配置提示词（5 步 + 红线）见 [`docs/AGENT-INSTALL.md`](docs/AGENT-INSTALL.md) — full agent-facing install/config prompt: see [`docs/AGENT-INSTALL.md`](docs/AGENT-INSTALL.md).
 
