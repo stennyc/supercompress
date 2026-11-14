@@ -1,29 +1,25 @@
 Copyright (c) 2026 stennyc
 
 This program is free software: you can redistribute it and/or modify it
-under the terms of the GNU General Public License as published by the
-Free Software Foundation, either version 3 of the License, or (at your
-option) any later version.
+under the terms of the GNU Affero General Public License as published by
+the Free Software Foundation, either version 3 of the License, or (at
+your option) any later version.
 
 This program is distributed in the hope that it will be useful, but
 WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Affero
 General Public License for more details.
 
-You should have received a copy of the GNU General Public License along
-with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-SPDX-License-Identifier: GPL-3.0-or-later
+SPDX-License-Identifier: AGPL-3.0-or-later
 
 ---
 
-NON-STANDARD ADDON — No Commercial Use
-
-NOTWITHSTANDING the GPL terms above, this code is licensed for PERSONAL,
-EDUCATIONAL, and internal tooling use ONLY. Commercial use — embedding it
-in commercial products, offering it as a paid service, or reselling it —
-is NOT permitted without a separate paid license from the author
-(stennyc). This addon is a non-standard addition layered on top of
-GPL-3.0-or-later; where it conflicts with the GPL text, the
-No-Commercial-Use constraint governs and a commercial license must be
-purchased from the author.
+Commercial use
+This code is AGPL-3.0-or-later. Commercial use (embedding it in a
+commercial product, offering it as a paid service, or reselling it)
+requires a separate commercial license from the author (stennyc).
+See LICENSE-COMMERCIAL.md for terms. Dual license: AGPL-3.0-or-later
+(free / open source / non-commercial use) or a paid commercial license.
