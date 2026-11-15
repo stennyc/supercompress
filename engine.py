@@ -238,13 +238,50 @@ class _CallLlmEndpoint:
         raise RuntimeError(f"call_llm failed (aux+main routes): {last_err}")
 
 
-def _load_config() -> Dict[str, Any]:
-    """宿主配置读取（宿主环境有 hermes_cli；测试环境无 → 空 dict 默认值，壳永不因配置缺失炸）。"""
-    try:
-        from hermes_cli.config import cfg_get, load_config
-    except Exception:
+def _plugin_local_config_path() -> Optional[str]:
+    """插件仓自带 config 路径（supercompress 安装目录下 config.yaml）。
+
+    含义 A（owner 2026-11-15 拍板）：30 键读源优先走插件仓自带 config.yaml，
+    归属权从宿主 config.yaml 移到插件安装目录——hermes update 只覆盖宿主
+    config.yaml，不碰插件安装目录，故 30 键配置 update 安全。
+    解析：engine.py 所在目录（安装目录）/config.yaml；缺失 → None（走宿主段回退）。
+    """
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    cand = os.path.join(here, "config.yaml")
+    return cand if os.path.isfile(cand) else None
+
+
+def _load_plugin_local_config() -> Dict[str, Any]:
+    """读插件仓自带 config.yaml 的 compression.supercompress 段（YAML 优先，缺则 {}）。
+
+    文件不存在 / 解析失败 → {}（fail-soft，壳永不因配置缺失炸）。
+    """
+    path = _plugin_local_config_path()
+    if not path:
         return {}
     try:
+        import yaml as _py
+        data = _py.safe_load(open(path, encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    return ((data.get("compression") or {}).get("supercompress") or {})
+
+
+def _load_config() -> Dict[str, Any]:
+    """配置读取（两级回退，owner 含义 A）：
+
+    1. 插件仓自带 config.yaml（supercompress 安装目录）— 归属插件，update 安全
+    2. 宿主 config.yaml 的 compression.supercompress 段 — 兼容旧安装 / bundled 形态
+    3. 引擎内置默认（config.default.yaml 单一事实源）— 缺失键兜底
+
+    两级都不到 → 空 dict（默认值兜底）。测试环境无宿主 → 直接默认。
+    """
+    local = _load_plugin_local_config()
+    if local:
+        return local
+    try:
+        from hermes_cli.config import cfg_get, load_config
         return cfg_get(load_config(), "compression", "supercompress") or {}
     except Exception:
         return {}

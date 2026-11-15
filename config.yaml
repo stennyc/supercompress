@@ -1,0 +1,35 @@
+# supercompress 插件仓自带 config（含义 A：30 键读源首选此处，update 安全）
+# 用户改此文件即改 supercompress 行为；宿主 config.yaml 的 compression.supercompress 段作回退（兼容旧安装）。
+# 单一事实源 = config.default.yaml；本文件 = 安装时由 install.sh 写入的初始模板。
+compression:
+  supercompress:
+    context_length: 256000
+    max_tail_turns: 15
+    max_tail_tokens: 32000
+    compact_ratio: 0.5
+    force_compact_ratio: 0.75
+    prefold_enabled: false
+    prefold_water_frac: 0.45
+    aux_timeout: 10.0
+    main_fallback_timeout: 30.0
+    digest_max_tokens: 256
+    digest_fail_cooldown: 60.0
+    boundary_fail_cooldown: 30.0
+    model_store_enabled: true
+    model_min_chars: 200
+    auto_recall: false
+    recall_decay_lambda: 0.0
+    recall_cache_threshold: 0.92
+    recall_budget_frac: 0.3
+    recall_budget_cap_frac: 0.05
+    recall_staging_max_segs: 32
+    rerank_low_score_threshold: 3.0
+    drop_model_on_gate: true
+    cache_aware_compress:
+      enabled: false
+      hit_min: 0.5
+      delay_frac: 0.1
+      recall_k: 1
+    compact_ledger_max_tokens: 65536
+    compact_ledger_max_entries: 16
+    cache_stuck_detect: 3

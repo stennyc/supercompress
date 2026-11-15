@@ -228,6 +228,25 @@ for H in $REG_TARGETS; do
         | ( cd "$LINK" && tar -xf - )
       echo "   $H: 已复制交付面（壳 __init__/engine/plugin.yaml + sc/ + scdata）到 $LINK"
     fi
+    # ── 含义 A：插件仓自带 config.yaml 写源（安装目录，update 安全）──
+    # 引擎 _load_config() 首选读 <安装目录>/config.yaml；宿主 config.yaml 的
+    # compression.supercompress 段作回退。symlink 形态安装目录 = $SELF（本仓），
+    # 直接确认仓内 config.yaml 存在；复制形态安装目录 = $LINK，把仓 config.yaml
+    # 复制过去（已存在则不覆盖，保留用户改动）。
+    if [ -e "$SELF/config.yaml" ]; then
+      if [ -L "$LINK" ]; then
+        echo "   $H: 插件仓自带 config.yaml 就位（symlink -> 仓内 $SELF/config.yaml）"
+      else
+        if [ -f "$LINK/config.yaml" ]; then
+          echo "   $H: $LINK/config.yaml 已存在（保留用户改动，不覆盖）"
+        else
+          cp "$SELF/config.yaml" "$LINK/config.yaml"
+          echo "   $H: 已复制插件仓 config.yaml -> $LINK/config.yaml（30 键读源首选，update 安全）"
+        fi
+      fi
+    else
+      echo "   WARN: 仓内无 config.yaml（30 键回退宿主 compression.supercompress 段）"
+    fi
   fi
 done
 
