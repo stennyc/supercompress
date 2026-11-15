@@ -52,6 +52,14 @@ TASK_CONTEXT_CHARS = 256
 # 全 0 → 冷却窗恒关，fail-safe「单事件自愈」语义不变）
 DEFAULT_COOLDOWN_LADDER: tuple[float, ...] = (30.0, 180.0)
 
+# Strip <thinking>...</thinking> / <reasoning>...</reasoning> blocks that
+# reasoning models (e.g. agnes-2.5-flash) embed — those blocks may contain
+# { or } characters that would break downstream greedy JSON extraction.
+_THINK_RE = re.compile(
+    r"<thinking[^>]*>.*?</thinking>|<reasoning[^>]*>.*?</reasoning>",
+    re.DOTALL | re.IGNORECASE,
+)
+
 
 def _boundary_instruction(seed_terms: List[str], candidates: List, task_text: str) -> str:
     """P4 边界 LLM 提示词（确定性：纯字面，同输入同输出；宿主主模型文进文出，零向量）。
@@ -98,6 +106,9 @@ def parse_boundary_response(raw: "str | None", candidate_ids: List[str]):
     t = str(raw).strip()
     if not t:
         return None
+    # Reasoning models embed <thinking>/<reasoning> blocks containing { } —
+    # strip them first so the greedy \{.*\} below can't swallow them.
+    t = _THINK_RE.sub("", t).strip()
     cands: list = [t]
     m = re.search(r"```(?:json)?\s*(.*?)```", t, re.DOTALL)
     if m:

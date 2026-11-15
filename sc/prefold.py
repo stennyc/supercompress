@@ -38,6 +38,14 @@ DETERMINISTIC_SLOTS: frozenset[str] = frozenset(
     {SLOT_FILES_CHANGED, SLOT_OPEN, SLOT_USER_DECISIONS})
 LLM_SLOTS: frozenset[str] = frozenset({SLOT_WHY, SLOT_NEXT, SLOT_DONE})
 
+# Strip <thinking>...</thinking> / <reasoning>...</reasoning> blocks that
+# reasoning models (e.g. agnes-2.5-flash) embed — those blocks may contain
+# { or } characters that would break downstream greedy JSON extraction.
+_THINK_RE = re.compile(
+    r"<thinking[^>]*>.*?</thinking>|<reasoning[^>]*>.*?</reasoning>",
+    re.DOTALL | re.IGNORECASE,
+)
+
 SLOT_VALUE_MAX = 120          # 单串槽值上限（LLM 自报字段限长兜底，+ '…' 截断标记）
 SLOT_LIST_MAX_ITEMS = 8      # list 槽项数上限（防爆无界）
 
@@ -371,6 +379,9 @@ def parse_prefold_llm_response(text) -> dict:
     if not text or not str(text).strip():
         return {}
     t = str(text).strip()
+    # Reasoning models embed <thinking>/<reasoning> blocks containing { } —
+    # strip them first so the greedy \{.*\} below can't swallow them.
+    t = _THINK_RE.sub("", t).strip()
     candidates = [t]
     m = _re.search(r'```(?:json)?\s*(.*?)```', t, _re.DOTALL)
     if m:
