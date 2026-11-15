@@ -60,19 +60,71 @@ DIGEST_INSTRUCTION = (
 )
 
 
+def _balanced_json_candidates(t: str) -> list:
+    """括号平衡法：从 t 里依次提取所有「首个 { 起、配平 } 结束」的候选片段。
+
+    正确处理字符串内的 { } 和转义引号，避免简单正则误抓散文里自带的片段。
+    """
+    out = []
+    i = 0
+    n = len(t)
+    while i < n:
+        if t[i] != "{":
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escaped = False
+        j = i
+        while j < n:
+            ch = t[j]
+            if in_str:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        out.append(t[i:j + 1])
+                        i = j + 1
+                        break
+            j += 1
+        else:
+            break  # 配不平（截断）：剩余部分不作为候选
+    return out
+
+
 def parse_digest_response(text: str | None) -> tuple[str, str]:
     """digest LLM 响应 → (key_fact, summary)。容忍裸 JSON / code fence / 纯文本 / None；
     空响应 → ("", "")（调用方回退 head 摘录占位，bench 空响应不变量保持）。"""
     if not text or not str(text).strip():
         return "", ""
     t = str(text).strip()
+    # Strip thinking/reasoning blocks BEFORE any JSON extraction.
+    # agnes-2.5-flash (and other reasoning models) embed <thinking>...</thinking>
+    # or <reasoning>...</reasoning> tags in response content. If these tags
+    # contain { or } characters, the greedy r"\{.*\}" regex below would swallow
+    # the thinking block + the real JSON into one giant invalid string.
+    t = re.sub(r"<thinking[^>]*>.*?</thinking>", "", t, flags=re.DOTALL).strip()
+    t = re.sub(r"<reasoning[^>]*>.*?</reasoning>", "", t, flags=re.DOTALL).strip()
     candidates = [t]
     m = re.search(r"```(?:json)?\s*(.*?)```", t, re.DOTALL)
     if m:
         candidates.insert(0, m.group(1).strip())
-    m = re.search(r"\{.*\}", t, re.DOTALL)
-    if m:
-        candidates.append(m.group(0))
+    # Use balanced-brace matching instead of greedy \{.*\} to avoid
+    # swallowing prose text that contains { or } characters.
+    for m in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", t):
+        candidates.insert(1, m.group(0))
+        break
+    candidates.extend(_balanced_json_candidates(t))
     for c in candidates:
         try:
             d = json.loads(c)

@@ -168,16 +168,19 @@ def parse_rerank_response(text: str, valid_ids: list) -> "list[str] | None":
     if not text or not str(text).strip():
         return None
     t = str(text).strip()
+    # Strip thinking/reasoning blocks BEFORE any JSON extraction.
+    t = re.sub(r"<thinking[^>]*>.*?</thinking>", "", t, flags=re.DOTALL).strip()
+    t = re.sub(r"<reasoning[^>]*>.*?</reasoning>", "", t, flags=re.DOTALL).strip()
     candidates = [t]
     m = re.search(r"```(?:json)?\s*(.*?)```", t, re.DOTALL)
     if m:
         candidates.insert(0, m.group(1).strip())
-    m = re.search(r"\{.*\}", t, re.DOTALL)
-    if m:
+    # Balanced-brace JSON extractor (same fix as semantic.py / aux_provider.py).
+    # The greedy r"\{.*\}" would swallow thinking text containing { or }.
+    for m in re.finditer(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", t):
         candidates.insert(1, m.group(0))
-    # thinking/散文前缀混入（reasoning 被并进 message.content，可能自带 { } 和 " 字符串），
-    # 贪婪正则 \{.*\} 会误抓散文里第一个 { 起的片段 → 额外用括号平衡法从首个 { 提取
-    # 第一个「平衡」JSON 对象，作为独立候选（json.loads 失败则走原 fail-safe，语义不变）
+        break
+    # Also use _balanced_json_candidates for edge cases (nested strings with braces).
     candidates.extend(_balanced_json_candidates(t))
     for c in candidates:
         try:
