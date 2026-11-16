@@ -113,7 +113,7 @@ def parse_boundary_response(raw: "str | None", candidate_ids: List[str]):
     m = re.search(r"```(?:json)?\s*(.*?)```", t, re.DOTALL)
     if m:
         cands.insert(0, m.group(1).strip())
-    m = re.search(r"\{.*\}", t, re.DOTALL)
+    m = re.search(r"\{.*?\}", t, re.DOTALL)
     if m:
         cands.insert(1, m.group(0))
     for c in cands:

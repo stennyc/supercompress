@@ -21,11 +21,21 @@ from .aux_provider import AuxProvider
 # Strip thinking/reasoning blocks that reasoning models embed in content.
 _THINK_RE = re.compile(r"<thinking[^>]*>.*?</thinking>|<reasoning[^>]*>.*?</reasoning>",
                        re.DOTALL | re.IGNORECASE)
+# Strip code-fence wrappers (````json ... ````) that some models add around JSON.
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.+?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_code_fences(text: str) -> str:
+    """First fenced code block body, or the stripped text when unfenced."""
+    text = _THINK_RE.sub("", text or "").strip()
+    match = _FENCE_RE.search(text)
+    return match.group(1).strip() if match else text
 
 
 def _parse_llm_json(text: str):
-    """Parse LLM response text as JSON, stripping <thinking>/<reasoning> blocks first."""
-    return json.loads(_THINK_RE.sub("", text).strip())
+    """Parse LLM response text as JSON, stripping <thinking>/<reasoning> blocks
+    and optional code fences first."""
+    return json.loads(_strip_code_fences(text))
 
 TIERS = ("P0", "P1", "P2")
 _TIERS_BY_TIER = {t: i for i, t in enumerate(TIERS)}
