@@ -27,13 +27,27 @@ STORE_SUBDIR: str = "supercompress_store"
 
 
 def hermes_home() -> str:
-    """数据根（HERMES_HOME）：进程 env 优先（per-profile），缺省 ``~/.hermes``。
+    """数据根（HERMES_HOME）：进程 env 优先（per-profile），缺省平台默认。
 
     与宿主 ``hermes_constants.get_hermes_home()`` 同源语义（override → env → 平台默认）；
     本模块不 import 宿主（保持插件独立可运行），仅约定同一个 env 名 ``HERMES_HOME``。
+
+    Priority:
+      1. ``HERMES_HOME`` env var (set by multiplex gateway per-profile)
+      2. Windows: ``%LOCALAPPDATA%\\hermes`` (desktop app default on Win)
+      3. Fallback: ``~/.hermes`` (POSIX / legacy)
     """
+    import sys
     hh = os.environ.get("HERMES_HOME", "").strip()
-    return hh if hh else os.path.expanduser("~/.hermes")
+    if hh:
+        return hh
+    if sys.platform == "win32":
+        localapp = os.environ.get("LOCALAPPDATA", "").strip()
+        if localapp:
+            candidate = os.path.join(localapp, "hermes")
+            if os.path.isdir(candidate):
+                return candidate
+    return os.path.expanduser("~/.hermes")
 
 
 def config_path() -> str:
