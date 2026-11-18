@@ -58,7 +58,7 @@ class TestL1LineTsRendering:
 def test_ledger_message_header_single_source():
     """engine.py 消息头不再双渲染 generation/seals（单源 = ledger.text() 首行 MARK）。"""
     import pathlib
-    p = pathlib.Path("/usr/local/lib/hermes-agent/plugins/context_engine/supercompress/engine.py")
+    p = pathlib.Path(__file__).resolve().parents[1] / "engine.py"  # 安装可移植（原 /usr/local 字面量为 POSIX 部署假设）
     src = p.read_text(encoding="utf-8")
     # #4 修复的锚点：账本消息 content = 前缀 + section（首行 MARK 已含 generation/seals）
     assert '"content": _COMPACT_LEDGER_PREFIX + "\\n" + section' in src, \

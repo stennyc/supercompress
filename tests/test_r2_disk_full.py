@@ -342,6 +342,8 @@ class TestStore_StatvfsRealDisk:
         if pct >= 0:
             assert free_b >= 0
 
+    @pytest.mark.skipif(not hasattr(os, "statvfs"),
+                       reason="statvfs 面 POSIX-only（win32 disk_water_level 走 shutil.disk_usage）")
     def test_disk_water_level_oserror_returns_unknown(self, store, monkeypatch):
         """statvfs 自身失败（盘消失/只读挂载异常）→ (0, -1.0)，观测面绝不反向上抛。"""
         def _raise(*a, **k):

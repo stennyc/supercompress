@@ -17,6 +17,14 @@ import json
 from helpers import mkseg
 from sc.tagger import is_reasoning_monologue
 
+# 层级校验面：sc/retag.py 模块级 require_install_root()——独立部署（非 repo
+# plugins/context_engine/supercompress 层级）下 import 即 RuntimeError → 整文件 skip。
+import pytest
+try:
+    from sc import retag as _sc_retag  # noqa: F401  触发层级校验
+except RuntimeError as _e:
+    pytest.skip(f"安装层级校验不适用（独立部署）: {_e}", allow_module_level=True)
+
 
 class TestRetagMonologue:
     def test_demotes_monologue_p0_model_to_p2(self, store, tmp_path):

@@ -62,10 +62,20 @@ class JsonlStore:
         statvfs 自身失败（只读挂载 / 盘消失 / 容器异常）→ (0, -1.0)：
         调用方按「水位未知」处理，观测面绝不反向上抛（不能成为新的宿主炸点）。"""
         try:
-            st = os.statvfs(os.path.dirname(os.path.abspath(self.path)) or "/")
-            free_b = st.f_bavail * st.f_frsize
-            total_b = st.f_blocks * st.f_frsize
-            pct = (1.0 - st.f_bavail / st.f_blocks) if st.f_blocks else 0.0
+            target = os.path.dirname(os.path.abspath(self.path)) or "/"
+            if hasattr(os, "statvfs"):
+                st = os.statvfs(target)
+                free_b = st.f_bavail * st.f_frsize
+                total_b = st.f_blocks * st.f_frsize
+                pct = (1.0 - st.f_bavail / st.f_blocks) if st.f_blocks else 0.0
+            else:
+                # Windows: no statvfs — shutil.disk_usage gives the same
+                # (free_bytes, used_fraction) surface; fail-soft contract unchanged.
+                import shutil
+                du = shutil.disk_usage(target)
+                free_b = du.free
+                total_b = du.total
+                pct = (1.0 - du.free / du.total) if du.total else 0.0
             return int(free_b), float(pct)
         except OSError:
             return 0, -1.0

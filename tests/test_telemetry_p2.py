@@ -19,6 +19,7 @@ DoD（plan P2）：三指标可观测 + bench/telemetry_report.py 出 before/aft
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from fakes import FakeEndpoint
 from helpers import mkseg, mk_window
@@ -284,5 +285,5 @@ def test_engine_reports_path_hermes_home_aware(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hhome"))
     e = _engine(tmp_path)
     p = e.telemetry_report_path()
-    assert str(p).endswith("supercompress_store/telemetry.jsonl")
+    assert Path(p).name == "telemetry.jsonl" and Path(p).parent.name == "supercompress_store"  # OS-neutral（win32 分隔符面）
     assert str(p).startswith(str(tmp_path / "hhome"))

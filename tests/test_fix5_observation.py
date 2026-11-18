@@ -73,7 +73,8 @@ class TestAuditWritePrimitive:
     def test_append_single_line_0600(self, tmp_path):
         p = str(tmp_path / "s.audit.jsonl")
         assert audit.write_audit_record(p, {"ts": 1.0, "sid": "s", "dropped": {}, "ts_zero_ratio": 0.0}) is True
-        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600, "新文件 0600"
+        if os.name == "posix":  # win32 stat mode bits 恒定 0666：0600 收紧面 POSIX-only
+            assert stat.S_IMODE(os.stat(p).st_mode) == 0o600, "新文件 0600"
         lines = open(p).read().splitlines()
         assert len(lines) == 1 and json.loads(lines[0])["sid"] == "s"
         # 追加第二条（O_APPEND 同 inode，两条）
@@ -91,7 +92,8 @@ class TestAuditWritePrimitive:
             f.write('{"prev":1}\n')
         os.chmod(p, 0o644)
         audit.write_audit_record(p, {"ts": 1.0, "sid": "s", "dropped": {}, "ts_zero_ratio": 0.0})
-        assert stat.S_IMODE(os.stat(p).st_mode) == 0o600, "fchmod 收紧到 0600"
+        if os.name == "posix":  # win32 stat mode bits 恒定 0666：fchmod 收紧面 POSIX-only
+            assert stat.S_IMODE(os.stat(p).st_mode) == 0o600, "fchmod 收紧到 0600"
         lines = open(p).read().splitlines()
         assert len(lines) == 2 and json.loads(lines[0]) == {"prev": 1}, "原行保留（append，非 os.replace 换 inode）"
 

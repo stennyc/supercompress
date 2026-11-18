@@ -221,7 +221,7 @@ class TestGCPrimitives:
         store_dir = Path(dp.pool_path_for_session("s1", hermes_home=hh)).parent
         store_dir.mkdir(parents=True, exist_ok=True)
         jsonl = store_dir / "s1.jsonl"
-        jsonl.write_text('{"a": 1}\n', encoding="utf-8")
+        jsonl.write_bytes(b'{"a": 1}\n')  # 字节面直写（win32 text-mode 会把 \n CRLF 化，byte-diff 面分叉）
         dp.gc_session_pool("s1", hermes_home=hh)
         assert jsonl.read_bytes() == b'{"a": 1}\n', "GC 只删池文件，jsonl 源层 diff=0"
 

@@ -101,9 +101,10 @@ def test_render_line_shape():
     assert "open=" not in line and "why=" not in line and "next=" not in line   # 空槽省略
 
 
-def test_prefold_path_independent_of_digest_pool():
-    p = prefold_tmp_path_for_jsonl("/h/supercompress_store/abc.jsonl")
-    assert p == "/h/supercompress_store/abc.prefold.tmp"
+def test_prefold_path_independent_of_digest_pool(tmp_path):
+    src = str(tmp_path / "abc.jsonl")                        # OS-native 输入（原 /h POSIX 字面量在 win32 下 abspath 面分叉）
+    p = prefold_tmp_path_for_jsonl(src)
+    assert p == os.path.join(str(tmp_path), "abc.prefold.tmp")
     assert ".digests.json" not in p                          # 与 durable 池物理正交
 
 

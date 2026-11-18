@@ -17,10 +17,21 @@ DoD（references/supercompress-session-redesign.md S-Phase 1）：
 """
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
+import pytest
+
 from engine import SupercompressContextEngine
+from sc import _bootstrap as _sc_bootstrap
 from sc.schema import Segment
+
+# 层级校验面（reviewer Minor②）：marker 仅在 repo plugins/context_engine/supercompress
+# 层级下存在；独立部署（如 hermes/plugins/supercompress）下层级校验不适用 → 对应 2 测 skip。
+_BOOTSTRAP_HIERARCHY_OK = (
+    Path(_sc_bootstrap.INSTALL_ROOT) / "plugins" / "context_engine"
+    / "supercompress" / "sc" / "_bootstrap.py").is_file()
 
 
 def _mkengine(tmp_path: Path, context_length: int = 256000) -> SupercompressContextEngine:
@@ -244,22 +255,28 @@ class TestStoreRoot_EnvAware:
     def test_default_store_root_env_wins(self, monkeypatch):
         from engine import _default_store_root
         monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/profB")
-        assert _default_store_root() == "/opt/hermes/profiles/profB/supercompress_store"
+        assert _default_store_root() == os.path.join("/opt/hermes/profiles/profB", "supercompress_store")
 
     def test_default_store_root_env_absent_falls_back_home(self, monkeypatch, tmp_path):
         """env 缺省 → ~/.hermes 平台默认（conftest 已 delenv）：无 /root 写死。"""
         from engine import _default_store_root
         monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
         monkeypatch.setenv("HERMES_HOME", "")  # 空串视同未设
-        assert _default_store_root() == str(tmp_path / "fakehome" / ".hermes" / "supercompress_store")
+        if sys.platform == "win32":
+            # win32 平台默认面：LOCALAPPDATA\hermes 存在则取之，否则 ~/.hermes（与 sc._bootstrap.hermes_home 优先级同源）
+            _la = os.environ.get("LOCALAPPDATA", "").strip()
+            _root = os.path.join(_la, "hermes") if (_la and os.path.isdir(os.path.join(_la, "hermes"))) else os.path.expanduser("~/.hermes")
+        else:
+            _root = str(tmp_path / "fakehome" / ".hermes")
+        assert _default_store_root() == os.path.join(_root, "supercompress_store")
 
     def test_engine_no_kwargs_resolves_env_root(self, monkeypatch):
         """无 external_store_path 配置 + 无 hermes_home kwarg → env 回退（生产轮转 Major#1 场景）。"""
         from engine import SupercompressContextEngine
         monkeypatch.setenv("HERMES_HOME", "/opt/hermes/profiles/profA")
         e = SupercompressContextEngine()
-        assert e._legacy_store_dir == "/opt/hermes/profiles/profA/supercompress_store"
-        assert e.store_path == "/opt/hermes/profiles/profA/supercompress_store/active.jsonl"
+        assert e._legacy_store_dir == os.path.join("/opt/hermes/profiles/profA", "supercompress_store")
+        assert e.store_path == os.path.join("/opt/hermes/profiles/profA", "supercompress_store", "active.jsonl")
 
     def test_session_start_without_kwarg_uses_env_dir(self, monkeypatch, tmp_path):
         """轮转 rebind 缺 hermes_home kwarg → 经 env 回退落 <HERMES_HOME>/supercompress_store/<sid>.jsonl。"""
@@ -279,6 +296,8 @@ class TestStoreRoot_EnvAware:
         assert e._legacy_store_dir == str(tmp_path / "explicit")
         assert e.store.path == str(tmp_path / "explicit" / "active.jsonl")
 
+    @pytest.mark.skipif(not _BOOTSTRAP_HIERARCHY_OK,
+                       reason="独立部署（非 repo plugins/context_engine/supercompress 层级）：层级校验面不适用")
     def test_bootstrap_module_paths_env_driven(self, monkeypatch, tmp_path):
         """sc/_bootstrap 单一事实源：config/store/setup 全部 env 驱动，零 /root、零 profile 名。"""
         from sc import _bootstrap
@@ -292,6 +311,8 @@ class TestStoreRoot_EnvAware:
         root = Path(_bootstrap.INSTALL_ROOT)
         assert (root / "plugins" / "context_engine" / "supercompress" / "sc" / "_bootstrap.py").exists()
 
+    @pytest.mark.skipif(not _BOOTSTRAP_HIERARCHY_OK,
+                       reason="独立部署（非 repo plugins/context_engine/supercompress 层级）：层级校验面不适用")
     def test_require_install_root_passes_and_fails_readably(self, monkeypatch):
         """reviewer Minor②（安装层级校验）：深度假设失败时报可读 RuntimeError，非裸 ImportError。"""
         import pytest
